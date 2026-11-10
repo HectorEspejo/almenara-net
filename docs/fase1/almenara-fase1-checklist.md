@@ -125,3 +125,10 @@ es la clave de trazabilidad con el informe de fase y el informe de implementaci�
 | 9. Capacidades y modo degradado | 4 | 4 |
 | 10. Accesibilidad, calidad y requisitos no funcionales | 7 | 7 |
 | **Total** | **67** | **67** |
+
+---
+
+## Notas de cierre (informe de implementación procesado el 2026-11-10)
+
+- **Verificación pendiente:** F1-24, F1-25 y F1-64 están marcadas según el informe de implementación, pero su comprobación real (ARP/ICMP con `CAP_NET_RAW` y medición de rendimiento) no se pudo ejecutar en el entorno del agente; conviene hacer una pasada manual con `sudo`/`setcap` y una prueba de carga con 256 equipos antes de dar la fase por verificada al 100 %.
+- **Trazabilidad:** los textos de F1-05, F1-08, F1-10, F1-27, F1-36 y F1-51 se conservan literales como clave de trazabilidad; su interpretación vigente es la de la v1.1 del informe de fase (`docs/fase1/almenara-fase1-informe.md`).
