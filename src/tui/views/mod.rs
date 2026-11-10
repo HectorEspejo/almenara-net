@@ -1,13 +1,16 @@
 //! Composición de la pantalla y utilidades comunes de las vistas.
 //!
 //! Layout de la TUI: barra de pestañas, contenido, notificación no bloqueante,
-//! barra de estado y pie con los atajos. Si el terminal es menor de 80x24 se
-//! muestra un mensaje claro en lugar de la interfaz.
+//! barra de estado (2 líneas en terminales estrechas, 3 en anchos) y pie con los
+//! atajos. Si el terminal es menor de 80x24 se muestra un mensaje claro.
 
 pub mod config_view;
+pub mod connections;
+pub mod device_detail;
 pub mod devices;
 pub mod help;
 pub mod placeholder;
+pub mod traffic;
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -15,7 +18,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Tabs};
 use ratatui::Frame;
 
+use crate::traffic::formatear_bytes_por_segundo;
 use crate::tui::app::{App, InputMode, Tab, MIN_HEIGHT, MIN_WIDTH};
+
+/// Ancho a partir del cual la barra de estado usa tres líneas.
+pub const STATUS_WIDTH_ANCHO: u16 = 100;
 
 /// Dibuja la interfaz completa.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -25,12 +32,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    let alto_estado = if area.width >= STATUS_WIDTH_ANCHO {
+        3
+    } else {
+        2
+    };
     let layout = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(1),
-        // La barra de estado ocupa dos líneas: resumen/modo y fuentes activas.
-        Constraint::Length(2),
+        Constraint::Length(alto_estado),
         Constraint::Length(2),
     ])
     .split(area);
@@ -64,6 +75,8 @@ fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
 
     match app.tab {
         Tab::Equipos => devices::draw(frame, app, area),
+        Tab::Trafico => traffic::draw(frame, app, area),
+        Tab::Conexiones => connections::draw(frame, app, area),
         Tab::Config => config_view::draw(frame, app, area),
         Tab::Ayuda => help::draw(frame, app, area),
         otro if otro.is_placeholder() => placeholder::draw(frame, app, area),
@@ -122,9 +135,21 @@ fn draw_notification(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let filas = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-    draw_status_summary(frame, app, filas[0]);
-    draw_status_sources(frame, app, filas[1]);
+    if area.height >= 3 {
+        let filas = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        draw_status_summary(frame, app, filas[0]);
+        draw_status_capture(frame, app, filas[1]);
+        draw_status_visibility(frame, app, filas[2]);
+    } else {
+        let filas = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+        draw_status_summary(frame, app, filas[0]);
+        draw_status_capture(frame, app, filas[1]);
+    }
 }
 
 fn draw_status_summary(frame: &mut Frame, app: &App, area: Rect) {
@@ -152,13 +177,92 @@ fn draw_status_summary(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_status_sources(frame: &mut Frame, app: &App, area: Rect) {
-    // En terminales de 80 columnas la lista completa no cabe con separadores
-    // legibles: solo entonces se abrevian los nombres largos.
-    let etiqueta = "Fuentes: ";
+/// Línea de estado de la captura (izquierda) y tráfico global (derecha).
+fn draw_status_capture(frame: &mut Frame, app: &App, area: Rect) {
+    let mut captura = app.capture_status_line();
+    if !app.theme.color {
+        captura = format!("{} {captura}", app.traffic.capture.no_color_prefix());
+    }
+    let estilo = if app.traffic.capture.active {
+        app.theme.online
+    } else {
+        app.theme.warning
+    };
+
+    // En terminales estrechos la segunda línea muestra la captura y la
+    // visibilidad (no caben además los totales globales).
+    if area.width < STATUS_WIDTH_ANCHO {
+        let visibilidad = app.visibility_line();
+        let ancho_vis = (visibilidad.chars().count() as u16 + 2).min(area.width);
+        let columnas =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(ancho_vis)]).split(area);
+        frame.render_widget(Paragraph::new(Span::styled(captura, estilo)), columnas[0]);
+        frame.render_widget(
+            Paragraph::new(visibilidad)
+                .alignment(Alignment::Right)
+                .style(app.theme.accent),
+            columnas[1],
+        );
+        return;
+    }
+
+    let (entrada, salida) = app.traffic.global_rates();
+    let hay_datos = app.traffic.has_live_data()
+        || !app.traffic.ranked_devices().is_empty()
+        || app.traffic.connections_total > 0;
+    let global = if hay_datos {
+        format!(
+            "↓ {}/s · ↑ {}/s · {} conexiones",
+            formatear_bytes_por_segundo(entrada),
+            formatear_bytes_por_segundo(salida),
+            app.traffic.connections_total
+        )
+    } else {
+        String::new()
+    };
+    let ancho_global = if global.is_empty() {
+        0
+    } else {
+        (global.chars().count() as u16 + 2).min(area.width)
+    };
+    let columnas =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(ancho_global)]).split(area);
+    frame.render_widget(Paragraph::new(Span::styled(captura, estilo)), columnas[0]);
+    if !global.is_empty() {
+        frame.render_widget(
+            Paragraph::new(global)
+                .alignment(Alignment::Right)
+                .style(app.theme.dim),
+            columnas[1],
+        );
+    }
+}
+
+/// Línea de visibilidad honesta (izquierda) y fuentes de descubrimiento (derecha).
+fn draw_status_visibility(frame: &mut Frame, app: &App, area: Rect) {
+    let visibilidad = app.visibility_line();
+    let ancho_vis = (visibilidad.chars().count() as u16 + 2).min(area.width);
+    let columnas =
+        Layout::horizontal([Constraint::Length(ancho_vis), Constraint::Min(0)]).split(area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(visibilidad, app.theme.accent)),
+        columnas[0],
+    );
+    let texto = texto_fuentes(app, columnas[1].width);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Fuentes: ", app.theme.accent),
+            Span::styled(texto, app.theme.dim),
+        ])),
+        columnas[1],
+    );
+}
+
+/// Texto de las fuentes de descubrimiento activas, abreviado si no cabe.
+fn texto_fuentes(app: &App, ancho: u16) -> String {
     let fuentes = app.active_sources();
     let completas = fuentes.join(" · ");
-    let texto = if etiqueta.chars().count() + completas.chars().count() <= usize::from(area.width) {
+    if completas.chars().count() <= usize::from(ancho) {
         completas
     } else {
         fuentes
@@ -166,12 +270,7 @@ fn draw_status_sources(frame: &mut Frame, app: &App, area: Rect) {
             .map(|fuente| etiqueta_fuente(fuente))
             .collect::<Vec<_>>()
             .join(" · ")
-    };
-    let linea = Line::from(vec![
-        Span::styled(etiqueta, app.theme.accent),
-        Span::styled(texto, app.theme.dim),
-    ]);
-    frame.render_widget(Paragraph::new(linea), area);
+    }
 }
 
 /// Abreviaturas de las fuentes con nombre largo en la barra de estado.
@@ -183,11 +282,7 @@ fn etiqueta_fuente(fuente: &str) -> &str {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let atajos = if app.tab == Tab::Equipos {
-        crate::tui::keys::FOOTER_EQUIPOS
-    } else {
-        crate::tui::keys::FOOTER_OTROS
-    };
+    let atajos = crate::tui::keys::footer_para(app.tab, app.detail_open());
     let lineas: Vec<Line> = atajos
         .iter()
         .map(|linea| Line::from(Span::styled(*linea, app.theme.dim)))
@@ -228,8 +323,8 @@ fn draw_too_small(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Fill(1),
         Constraint::Length(3),
         Constraint::Fill(1),
-    ])
-    .split(interior);
+    ]);
+    let vertical = vertical.split(interior);
     frame.render_widget(parrafo, vertical[1]);
 }
 
@@ -237,8 +332,11 @@ fn draw_too_small(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::capabilities::Capabilities;
+    use crate::capture::aggregate::DeviceTraffic;
     use crate::config::Config;
     use crate::repo::devices::Device;
+    use crate::traffic::CaptureStatus;
+    use crate::tui::app::Tab;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -276,6 +374,24 @@ mod tests {
         }
     }
 
+    fn estadisticas(device_id: i64) -> DeviceTraffic {
+        DeviceTraffic {
+            device_id,
+            bytes_in: 1000,
+            bytes_out: 500,
+            packets_in: 10,
+            packets_out: 5,
+            rate_in: 100,
+            rate_out: 50,
+            peak_bps: 1200,
+            series_60s_in: [1; 60],
+            series_60s_out: [0; 60],
+            series_5min_in: [1; 60],
+            series_5min_out: [0; 60],
+            top_ports: Vec::new(),
+        }
+    }
+
     fn buffer_texto(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -284,44 +400,6 @@ mod tests {
             .iter()
             .map(|celda| celda.symbol())
             .collect()
-    }
-
-    #[test]
-    fn terminal_pequeno_muestra_aviso() {
-        let backend = TestBackend::new(60, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = app_vacia();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let texto = buffer_texto(&terminal);
-        assert!(texto.contains("demasiado"));
-        assert!(texto.contains("80×24"));
-    }
-
-    #[test]
-    fn terminal_normal_dibuja_pestanas_y_estado() {
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = app_vacia();
-        app.set_data(vec![dispositivo(true), dispositivo(false)], Vec::new());
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let texto = buffer_texto(&terminal);
-        assert!(texto.contains("Equipos"));
-        assert!(texto.contains("Config"));
-        assert!(texto.contains("Ayuda"));
-        assert!(texto.contains("10.0.0.2"));
-        assert!(texto.contains("modo: degradado"));
-        assert!(texto.contains("equipos"));
-    }
-
-    #[test]
-    fn pestana_placeholder_muestra_no_disponible() {
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = app_vacia();
-        app.tab = Tab::Trafico;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let texto = buffer_texto(&terminal);
-        assert!(texto.contains("no disponible"));
     }
 
     fn dibujar(app: &mut App, ancho: u16, alto: u16) -> String {
@@ -350,14 +428,55 @@ mod tests {
         )
     }
 
+    fn app_con_trafico() -> App {
+        let mut app = app_con_capacidades(Config::default(), true);
+        app.set_data(vec![dispositivo(true)], Vec::new());
+        app.traffic.devices = vec![estadisticas(1)];
+        app.traffic.capture = CaptureStatus {
+            active: true,
+            pps: 2400,
+            interfaces: vec!["eth0".to_string()],
+            ..CaptureStatus::default()
+        };
+        app
+    }
+
+    #[test]
+    fn terminal_pequeno_muestra_aviso() {
+        let mut app = app_vacia();
+        let texto = dibujar(&mut app, 60, 20);
+        assert!(texto.contains("demasiado"));
+        assert!(texto.contains("80×24"));
+    }
+
+    #[test]
+    fn terminal_normal_dibuja_pestanas_y_estado() {
+        let mut app = app_vacia();
+        app.set_data(vec![dispositivo(true), dispositivo(false)], Vec::new());
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("Equipos"));
+        assert!(texto.contains("Config"));
+        assert!(texto.contains("Ayuda"));
+        assert!(texto.contains("10.0.0.2"));
+        assert!(texto.contains("modo: degradado"));
+        assert!(texto.contains("equipos"));
+        assert!(texto.contains("visibilidad: propia + broadcast"));
+    }
+
+    #[test]
+    fn pestana_placeholder_muestra_no_disponible() {
+        let mut app = app_vacia();
+        app.tab = Tab::Historico;
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("no disponible"));
+        assert!(texto.contains("Histórico"));
+    }
+
     #[test]
     fn notificacion_visible_en_barra() {
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app_vacia();
         app.push_notification(crate::notifier::Level::Warn, "modo degradado");
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let texto = buffer_texto(&terminal);
+        let texto = dibujar(&mut app, 100, 30);
         assert!(texto.contains("aviso: modo degradado"));
     }
 
@@ -366,7 +485,7 @@ mod tests {
         let mut config = Config::default();
         config.scan.passive_only = true;
         let mut app = app_con_capacidades(config, true);
-        let texto = dibujar(&mut app, 100, 30);
+        let texto = dibujar(&mut app, 120, 30);
         assert!(texto.contains("modo: pasivo"));
         assert!(texto.contains("Fuentes:"));
         for fuente in ["/proc", "mDNS", "SSDP", "DHCP", "NetBIOS", "DNS inverso"] {
@@ -379,30 +498,46 @@ mod tests {
     }
 
     #[test]
-    fn barra_en_ochenta_columnas_abrevia_fuentes_largas() {
-        let mut app = app_con_capacidades(Config::default(), true);
+    fn barra_estrecha_muestra_captura_y_visibilidad_sin_fuentes() {
+        let mut app = app_con_trafico();
         let texto = dibujar(&mut app, 80, 24);
         assert!(texto.contains("modo: privilegiado"));
+        assert!(texto.contains("capturando"));
+        assert!(texto.contains("propia + broadcast"));
         assert!(
-            texto.contains("DNS inv."),
-            "a 80 columnas se abrevia la fuente con nombre largo"
+            !texto.contains("Fuentes:"),
+            "a 80 columnas la barra usa dos líneas"
         );
-        assert!(texto.contains("puertos"), "la última fuente debe verse");
     }
 
     #[test]
-    fn barra_pasiva_en_ochenta_columnas_cabe_entera() {
+    fn barra_ancha_muestra_fuentes_y_captura() {
+        let mut app = app_con_trafico();
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("capturando"));
+        assert!(texto.contains("filtro:"));
+        assert!(texto.contains("Fuentes:"));
+        assert!(texto.contains("visibilidad: propia + broadcast"));
+        assert!(texto.contains("conexiones"));
+    }
+
+    #[test]
+    fn sin_color_prefixa_el_estado_de_captura() {
         let mut config = Config::default();
-        config.scan.passive_only = true;
+        config.ui.no_color = true;
         let mut app = app_con_capacidades(config, true);
-        let texto = dibujar(&mut app, 80, 24);
-        assert!(texto.contains("DNS inverso"));
+        app.traffic.capture = CaptureStatus {
+            active: true,
+            ..CaptureStatus::default()
+        };
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("[CAP]"));
     }
 
     #[test]
     fn barra_privilegiada_anuncia_fuentes_activas() {
         let mut app = app_con_capacidades(Config::default(), true);
-        let texto = dibujar(&mut app, 100, 30);
+        let texto = dibujar(&mut app, 120, 30);
         assert!(texto.contains("modo: privilegiado"));
         for fuente in ["/proc", "mDNS", "ARP", "ICMP", "puertos"] {
             assert!(texto.contains(fuente), "falta la fuente {fuente}");
@@ -412,9 +547,43 @@ mod tests {
     #[test]
     fn barra_degradada_anuncia_fuentes_pasivas() {
         let mut app = app_con_capacidades(Config::default(), false);
-        let texto = dibujar(&mut app, 100, 30);
+        let texto = dibujar(&mut app, 120, 30);
         assert!(texto.contains("modo: degradado"));
         assert!(texto.contains("Fuentes:"));
         assert!(!texto.contains("ARP"));
+    }
+
+    #[test]
+    fn pie_cambia_por_pestana_y_con_el_detalle() {
+        let mut app = app_con_trafico();
+        app.tab = Tab::Conexiones;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("[v]cabeceras"));
+        app.tab = Tab::Trafico;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("[Enter]detalle"));
+        app.tab = Tab::Equipos;
+        app.open_detail(1, Vec::new(), false);
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("[Tab]panel"));
+    }
+
+    #[test]
+    fn pestana_trafico_dibuja_ranking() {
+        let mut app = app_con_trafico();
+        app.tab = Tab::Trafico;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("ranking en vivo"));
+        assert!(texto.contains("sparkline 60 s"));
+    }
+
+    #[test]
+    fn pestana_conexiones_dibuja_tabla_vacia() {
+        let mut app = app_con_trafico();
+        app.tab = Tab::Conexiones;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("Conexiones activas"));
+        assert!(texto.contains("Sin conexiones"));
+        assert!(texto.contains("filtro:"));
     }
 }

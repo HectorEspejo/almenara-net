@@ -14,12 +14,15 @@ use tokio::sync::mpsc;
 use crate::capabilities::Capabilities;
 use crate::classify::{group_for, DeviceGroup, DeviceType};
 use crate::config::{Config, ListView};
-use crate::events::ScanCommand;
+use crate::events::{ScanCommand, TrafficCommand};
 use crate::notifier::{Level, Notification, Notifier};
 use crate::repo::devices::Device;
 use crate::repo::interfaces::Interface;
 use crate::scanner::Reconciliation;
 use crate::tui::theme::Theme;
+use crate::tui::traffic_state::{
+    ConnectionFilter, ConnectionSort, DetailState, FocusPanel, HeadersView, TrafficState,
+};
 
 /// Ancho mínimo de terminal soportado.
 pub const MIN_WIDTH: u16 = 80;
@@ -107,12 +110,9 @@ impl Tab {
         Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
 
-    /// Las cuatro pestañas centrales son placeholders en Fase 1.
+    /// Pestañas que todavía son placeholder (Histórico llega en F5 y Alertas en F6).
     pub fn is_placeholder(self) -> bool {
-        matches!(
-            self,
-            Tab::Trafico | Tab::Conexiones | Tab::Historico | Tab::Alertas
-        )
+        matches!(self, Tab::Historico | Tab::Alertas)
     }
 }
 
@@ -287,6 +287,11 @@ pub enum Action {
         /// Tipo forzado por el usuario; None deja la clasificación automática.
         value: Option<DeviceType>,
     },
+    /// Abrir el panel de detalle (master-detail) de un equipo.
+    OpenDetail {
+        /// Id del dispositivo.
+        device_id: i64,
+    },
 }
 
 /// Estado completo de la aplicación.
@@ -338,6 +343,30 @@ pub struct App {
     pub command_tx: Option<mpsc::Sender<ScanCommand>>,
     /// Paleta de colores activa.
     pub theme: Theme,
+    /// Estado del tráfico en vivo (Fase 3).
+    pub traffic: TrafficState,
+    /// Panel de detalle de equipo abierto (master-detail).
+    pub detail: Option<DetailState>,
+    /// Foco del panel master-detail.
+    pub detail_focus: FocusPanel,
+    /// Ordenación de la tabla de conexiones.
+    pub conn_sort: ConnectionSort,
+    /// Filtro de la tabla de conexiones.
+    pub conn_filter: ConnectionFilter,
+    /// Selección de la tabla de conexiones.
+    pub conn_selected: usize,
+    /// Estado de tabla de la pestaña Conexiones.
+    pub conn_table_state: TableState,
+    /// Selección del ranking de la pestaña Tráfico.
+    pub traffic_selected: usize,
+    /// Estado de tabla del ranking de Tráfico.
+    pub traffic_table_state: TableState,
+    /// Panel de cabeceras IP/TCP abierto (tecla v).
+    pub headers: Option<HeadersView>,
+    /// Canal de órdenes hacia la tarea de tráfico (None en tests).
+    pub traffic_command_tx: Option<mpsc::Sender<TrafficCommand>>,
+    /// Marca temporal de la última persistencia de tráfico.
+    pub last_traffic_persist: Option<Instant>,
 }
 
 impl App {
@@ -375,6 +404,18 @@ impl App {
             degraded_warned: false,
             command_tx,
             theme,
+            traffic: TrafficState::default(),
+            detail: None,
+            detail_focus: FocusPanel::Lista,
+            conn_sort: ConnectionSort::default(),
+            conn_filter: ConnectionFilter::Todas,
+            conn_selected: 0,
+            conn_table_state: TableState::default(),
+            traffic_selected: 0,
+            traffic_table_state: TableState::default(),
+            headers: None,
+            traffic_command_tx: None,
+            last_traffic_persist: None,
         }
     }
 
@@ -785,6 +826,31 @@ impl App {
             return self.handle_input_key(key);
         }
 
+        // El panel de cabeceras (no modal) se cierra con Esc sin salir de la pestaña.
+        if self.headers.is_some() && key.code == KeyCode::Esc {
+            self.close_headers();
+            return Action::None;
+        }
+
+        // En el detalle master-detail, Tab alterna el foco y Esc lo cierra.
+        if self.detail.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_detail();
+                    return Action::None;
+                }
+                KeyCode::Tab => {
+                    self.toggle_detail_focus();
+                    return Action::None;
+                }
+                _ => {
+                    if self.detail_focus == FocusPanel::Detalle {
+                        return self.handle_detail_panel_key(key);
+                    }
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char('?') => {
@@ -806,11 +872,11 @@ impl App {
                 Action::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
+                self.move_selection_in_tab(1);
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
+                self.move_selection_in_tab(-1);
                 Action::None
             }
             KeyCode::Right | KeyCode::Char('l') => {
@@ -822,33 +888,36 @@ impl App {
                 Action::None
             }
             KeyCode::Home => {
-                self.select_first();
+                self.select_first_in_tab();
                 Action::None
             }
             KeyCode::End => {
-                self.select_last();
+                self.select_last_in_tab();
                 Action::None
             }
-            KeyCode::Enter => {
-                if let Some(device) = self.selected_device() {
-                    let mensaje = format!(
-                        "Detalle de {} no disponible hasta Fase 3",
-                        device.display_name()
-                    );
-                    self.push_notification(Level::Info, mensaje);
-                }
-                Action::None
-            }
+            KeyCode::Enter => self.open_selected_detail(),
             KeyCode::Char('/') => {
                 self.begin_search();
                 Action::None
             }
             KeyCode::Char('s') => {
-                self.cycle_sort();
+                match self.tab {
+                    Tab::Conexiones => self.cycle_connection_sort(),
+                    _ => self.cycle_sort(),
+                }
                 Action::None
             }
             KeyCode::Char('f') => {
-                self.cycle_filter();
+                match self.tab {
+                    Tab::Conexiones => self.cycle_connection_filter(),
+                    _ => self.cycle_filter(),
+                }
+                Action::None
+            }
+            KeyCode::Char('v') => {
+                if self.tab == Tab::Conexiones {
+                    self.open_headers();
+                }
                 Action::None
             }
             KeyCode::Char('g') => match self.toggle_list_view() {
@@ -873,6 +942,96 @@ impl App {
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// Teclas dentro del panel de detalle cuando tiene el foco.
+    fn handle_detail_panel_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char('?') => {
+                self.tab = Tab::Ayuda;
+                Action::None
+            }
+            KeyCode::Char(c @ '1'..='7') => {
+                if let Some(tab) = Tab::from_number(c as u8 - b'0') {
+                    self.tab = tab;
+                }
+                Action::None
+            }
+            KeyCode::Tab => {
+                self.toggle_detail_focus();
+                Action::None
+            }
+            KeyCode::Esc => {
+                self.close_detail();
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Mueve la selección de la pestaña activa.
+    fn move_selection_in_tab(&mut self, delta: isize) {
+        match self.tab {
+            Tab::Equipos => self.move_selection(delta),
+            Tab::Trafico => self.move_traffic_selection(delta),
+            Tab::Conexiones => self.move_connection_selection(delta),
+            _ => {}
+        }
+    }
+
+    fn select_first_in_tab(&mut self) {
+        match self.tab {
+            Tab::Equipos => self.select_first(),
+            Tab::Trafico => {
+                self.traffic_selected = 0;
+                *self.traffic_table_state.selected_mut() = Some(0);
+            }
+            Tab::Conexiones => {
+                self.conn_selected = 0;
+                *self.conn_table_state.selected_mut() = Some(0);
+            }
+            _ => {}
+        }
+    }
+
+    fn select_last_in_tab(&mut self) {
+        match self.tab {
+            Tab::Equipos => self.select_last(),
+            Tab::Trafico => {
+                let total = self.traffic_rows().len();
+                self.traffic_selected = total.saturating_sub(1);
+                *self.traffic_table_state.selected_mut() = Some(self.traffic_selected);
+            }
+            Tab::Conexiones => {
+                let total = self.filtered_connections().len();
+                self.conn_selected = total.saturating_sub(1);
+                *self.conn_table_state.selected_mut() = Some(self.conn_selected);
+            }
+            _ => {}
+        }
+    }
+
+    /// Abre el detalle del equipo seleccionado (Equipos o drill-down de Tráfico).
+    fn open_selected_detail(&mut self) -> Action {
+        let device_id = match self.tab {
+            Tab::Equipos => self.selected_device().map(|device| device.id),
+            Tab::Trafico => self
+                .selected_traffic_device()
+                .map(|estadisticas| estadisticas.device_id),
+            _ => None,
+        };
+        match device_id {
+            Some(id) if id == crate::traffic::DEVICE_ID_HOST => {
+                self.push_notification(
+                    Level::Info,
+                    "El tráfico del host no tiene detalle de equipo; consulta la pestaña Conexiones",
+                );
+                Action::None
+            }
+            Some(device_id) => Action::OpenDetail { device_id },
+            None => Action::None,
         }
     }
 
@@ -1075,7 +1234,13 @@ mod tests {
         assert_eq!(Tab::from_number(1), Some(Tab::Equipos));
         assert_eq!(Tab::from_number(7), Some(Tab::Ayuda));
         assert_eq!(Tab::from_number(8), None);
-        assert!(Tab::Trafico.is_placeholder());
+        assert!(!Tab::Trafico.is_placeholder(), "Tráfico está activa en F3");
+        assert!(
+            !Tab::Conexiones.is_placeholder(),
+            "Conexiones está activa en F3"
+        );
+        assert!(Tab::Historico.is_placeholder());
+        assert!(Tab::Alertas.is_placeholder());
         assert!(!Tab::Config.is_placeholder());
         assert_eq!(Tab::ALL.len(), 7);
     }
@@ -1308,22 +1473,73 @@ mod tests {
     }
 
     #[test]
-    fn enter_avisa_de_detalle_no_disponible() {
+    fn enter_devuelve_accion_de_detalle() {
         let mut app = app_con(vec![dispositivo(
-            1,
+            7,
             "aa:bb:cc:dd:ee:01",
             "10.0.0.2",
             None,
             None,
             true,
         )]);
-        app.handle_key(tecla(KeyCode::Enter));
-        assert!(app
-            .notifier
-            .current()
-            .unwrap()
-            .message
-            .contains("no disponible"));
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Enter)),
+            Action::OpenDetail { device_id: 7 }
+        );
+    }
+
+    #[test]
+    fn enter_sin_equipo_no_devuelve_accion() {
+        let mut app = app_con(vec![]);
+        assert_eq!(app.handle_key(tecla(KeyCode::Enter)), Action::None);
+    }
+
+    #[test]
+    fn detalle_tab_alterna_foco_y_esc_cierra() {
+        let mut app = app_con(vec![dispositivo(
+            3,
+            "aa:bb:cc:dd:ee:01",
+            "10.0.0.2",
+            None,
+            None,
+            true,
+        )]);
+        app.open_detail(3, Vec::new(), true);
+        assert!(app.detail_open());
+        assert_eq!(app.detail_focus, FocusPanel::Detalle);
+        app.handle_key(tecla(KeyCode::Tab));
+        assert_eq!(app.detail_focus, FocusPanel::Lista);
+        app.handle_key(tecla(KeyCode::Tab));
+        assert_eq!(app.detail_focus, FocusPanel::Detalle);
+        app.handle_key(tecla(KeyCode::Esc));
+        assert!(!app.detail_open(), "Esc cierra el detalle");
+        assert_eq!(app.tab, Tab::Equipos);
+    }
+
+    #[test]
+    fn tab_en_detalle_no_cambia_de_pestana() {
+        let mut app = app_con(vec![]);
+        app.open_detail(1, Vec::new(), false);
+        app.handle_key(tecla(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Equipos);
+        assert_eq!(app.detail_focus, FocusPanel::Detalle);
+    }
+
+    #[test]
+    fn escaleras_de_detalle_se_cierran_sin_panico_en_tests() {
+        let mut app = app_con(vec![]);
+        app.detail = Some(DetailState {
+            device_id: 1,
+            services: Vec::new(),
+        });
+        app.handle_key(tecla(KeyCode::Esc));
+        assert!(app.detail.is_none());
+        app.detail = Some(DetailState {
+            device_id: 1,
+            services: Vec::new(),
+        });
+        app.close_detail();
+        assert!(app.detail.is_none());
     }
 
     #[test]

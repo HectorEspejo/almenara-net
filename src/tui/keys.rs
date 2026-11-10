@@ -30,7 +30,19 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "Enter",
-        description: "detalle del equipo (llegará en Fase 3)",
+        description: "abrir el detalle del equipo seleccionado (master-detail)",
+    },
+    KeyHelp {
+        keys: "Tab (detalle)",
+        description: "alternar el foco entre la lista y el panel de detalle",
+    },
+    KeyHelp {
+        keys: "v",
+        description: "cabeceras IP/TCP de la conexión seleccionada (pestaña Conexiones)",
+    },
+    KeyHelp {
+        keys: "s / f (Conexiones)",
+        description: "ordenar / filtrar la tabla de conexiones",
     },
     KeyHelp {
         keys: "/",
@@ -74,7 +86,7 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "Esc",
-        description: "cerrar la búsqueda o volver a Equipos",
+        description: "cerrar cabeceras, detalle o búsqueda; volver a Equipos",
     },
 ];
 
@@ -90,6 +102,37 @@ pub const FOOTER_OTROS: [&str; 2] = [
     "[?]ayuda [q]salir",
 ];
 
+/// Pie de teclas de la pestaña Tráfico (ranking top-10).
+pub const FOOTER_TRAFICO: [&str; 2] = [
+    "[hjkl]mover [Enter]detalle [Tab]pestaña [1-7]atajo",
+    "[?]ayuda [q]salir",
+];
+
+/// Pie de teclas de la pestaña Conexiones (tabla plana).
+pub const FOOTER_CONEXIONES: [&str; 2] = [
+    "[hjkl]mover [v]cabeceras [s]orden [f]filtro",
+    "[Tab/Shift-Tab]pestañas [Esc]cerrar [1-7]atajo [?]ayuda",
+];
+
+/// Pie de teclas del panel de detalle master-detail.
+pub const FOOTER_DETALLE: [&str; 2] = [
+    "[hjkl]mover [Tab]panel [Esc]cerrar detalle",
+    "[?]ayuda [q]salir",
+];
+
+/// Pie de teclas que corresponde a una pestaña (y al detalle abierto).
+pub fn footer_para(tab: crate::tui::app::Tab, detalle_abierto: bool) -> &'static [&'static str; 2] {
+    if detalle_abierto {
+        return &FOOTER_DETALLE;
+    }
+    match tab {
+        crate::tui::app::Tab::Equipos => &FOOTER_EQUIPOS,
+        crate::tui::app::Tab::Trafico => &FOOTER_TRAFICO,
+        crate::tui::app::Tab::Conexiones => &FOOTER_CONEXIONES,
+        _ => &FOOTER_OTROS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,7 +140,9 @@ mod tests {
     #[test]
     fn hay_un_atajo_para_cada_accion_requerida() {
         let claves: Vec<&str> = HELP_ROWS.iter().map(|fila| fila.keys).collect();
-        for requerida in ["Tab", "1-7", "/", "s", "f", "r", "g", "t", "?", "q", "Esc"] {
+        for requerida in [
+            "Tab", "1-7", "/", "s", "f", "r", "g", "t", "?", "q", "Esc", "Enter", "v",
+        ] {
             assert!(
                 claves.iter().any(|clave| clave.contains(requerida)),
                 "falta el atajo {requerida}"
@@ -105,11 +150,26 @@ mod tests {
         }
         assert!(FOOTER_EQUIPOS.iter().any(|linea| linea.contains("rescan")));
         assert!(FOOTER_OTROS.iter().any(|linea| linea.contains("pestañas")));
+        for footer in [FOOTER_TRAFICO, FOOTER_CONEXIONES, FOOTER_DETALLE] {
+            assert!(
+                footer.iter().any(|linea| linea.contains("[?]ayuda")),
+                "los pies deben recordar la ayuda"
+            );
+        }
+        assert!(FOOTER_CONEXIONES
+            .iter()
+            .any(|linea| linea.contains("[v]cabeceras")));
     }
 
     #[test]
     fn pies_caben_en_ochenta_columnas() {
-        for linea in FOOTER_EQUIPOS.iter().chain(FOOTER_OTROS.iter()) {
+        let todos = FOOTER_EQUIPOS
+            .iter()
+            .chain(FOOTER_OTROS.iter())
+            .chain(FOOTER_TRAFICO.iter())
+            .chain(FOOTER_CONEXIONES.iter())
+            .chain(FOOTER_DETALLE.iter());
+        for linea in todos {
             assert!(
                 linea.chars().count() <= 80,
                 "el pie no cabe en 80 columnas: {linea}"

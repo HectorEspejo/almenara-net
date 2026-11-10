@@ -15,6 +15,7 @@ dirs = "6"
 futures = "0.3"
 hickory-proto = { version = "0.26", features = ["mdns"] }
 libc = "0.2"
+nix = { version = "0.31", features = ["socket", "poll", "net", "fs", "time"] }
 ouidb = { package = "macaddr-ouidb", version = "0.3.1", default-features = false, features = ["std"] }
 pnet = "0.35"
 ratatui = "0.30"
@@ -28,6 +29,12 @@ toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+# Replay de ficheros pcap (F7). En Fase 3 la feature existe pero está desactivada y
+# solo los tests condicionales de replay la usan; no añade dependencias.
+pcap = []
 
 [dev-dependencies]
 tempfile = "3"

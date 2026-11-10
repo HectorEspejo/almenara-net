@@ -42,6 +42,7 @@ dependencies = [
  "hickory-proto",
  "libc",
  "macaddr-ouidb",
+ "nix 0.31.3",
  "pnet",
  "ratatui",
  "reqwest",
