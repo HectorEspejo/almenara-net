@@ -27,6 +27,12 @@ pub struct Device {
     pub alias: Option<String>,
     /// Notas libres.
     pub notes: Option<String>,
+    /// Familia de SO estimada por fingerprint (NULL si no supera el umbral).
+    pub os_family: Option<String>,
+    /// Tipo de dispositivo forzado por el usuario (NULL = automático).
+    pub device_type_manual: Option<String>,
+    /// Último fingerprint observado en JSON (TTL, opciones TCP, puntuación...).
+    pub last_fingerprint: Option<String>,
 }
 
 impl Device {
@@ -38,9 +44,21 @@ impl Device {
             .unwrap_or("?")
     }
 
+    /// Tipo de dispositivo efectivo: el override manual manda sobre el automático.
+    pub fn effective_device_type(&self) -> &str {
+        self.device_type_manual
+            .as_deref()
+            .filter(|tipo| !tipo.is_empty())
+            .unwrap_or(&self.device_type)
+    }
+
     /// Indica si el dispositivo es el gateway de su interfaz.
+    ///
+    /// La vista usa el icono por tipo efectivo; se conserva como ayuda de dominio
+    /// para el detalle de F3.
+    #[allow(dead_code)]
     pub fn is_gateway(&self) -> bool {
-        self.device_type == "gateway"
+        self.effective_device_type() == "gateway"
     }
 }
 
@@ -57,7 +75,7 @@ pub struct DeviceUpsert {
     pub vendor: Option<String>,
     /// FK a INTERFACES.
     pub interface_id: i64,
-    /// Tipo de dispositivo ("gateway" o "unknown").
+    /// Tipo de dispositivo automático (taxonomía de Fase 2).
     pub device_type: String,
 }
 

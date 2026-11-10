@@ -10,7 +10,9 @@ use std::time::Duration;
 use clap::{ArgAction, Parser};
 
 mod capabilities;
+mod classify;
 mod config;
+mod discovery;
 mod error;
 mod events;
 mod logging;
@@ -151,6 +153,12 @@ async fn ejecutar(cli: Cli) -> Result<()> {
         tracing::warn!(%err, "no se pudo cargar la lista de equipos");
         Vec::new()
     });
+    // Estado inicial del port scan: los equipos ya persistidos no se reescanean
+    // en el primer ciclo (solo los nuevos, los que cambian de IP/MAC o con r).
+    let equipos_conocidos: Vec<(String, String)> = devices
+        .iter()
+        .map(|device| (device.mac.clone(), device.ip.clone()))
+        .collect();
     let interfaces = repo.list_interfaces().unwrap_or_else(|err| {
         tracing::warn!(%err, "no se pudo cargar la lista de interfaces");
         Vec::new()
@@ -181,27 +189,53 @@ async fn ejecutar(cli: Cli) -> Result<()> {
     for aviso in avisos {
         app.push_notification(Level::Warn, aviso);
     }
-    if capabilities.degraded() {
+    if capabilities.degraded() && !config.scan.passive_only {
         app.push_notification(
             Level::Warn,
-            "Modo degradado: sin CAP_NET_RAW. Solo se leerá /proc/net/arp; el ARP scan y el ping sweep están desactivados",
+            "Modo degradado: sin CAP_NET_RAW. Solo se leerá /proc/net/arp; para descubrimiento activo ejecuta: sudo setcap cap_net_raw+ep target/debug/almenara",
         );
         app.degraded_warned = true;
     }
+    if config.scan.passive_only {
+        app.push_notification(
+            Level::Warn,
+            "Modo pasivo: [scan].passive_only = true. Sin ARP scan, ICMP, mDNS browse, M-SEARCH, port scan ni banner grabbing",
+        );
+    }
 
+    // Interfaces con IPv4 para unir los grupos multicast de mDNS/SSDP. Unirse
+    // con INADDR_ANY puede no seleccionar la interfaz correcta en Wi-Fi.
+    let ips_multicast: Vec<std::net::Ipv4Addr> = scanner::interfaces::detect()
+        .iter()
+        .filter_map(|iface| iface.ipv4)
+        .collect();
+
+    tracing::debug!(interfaces = ?ips_multicast, "interfaces para multicast mDNS/SSDP");
     let scan_tx = event_tx.clone();
     let scan_task = tokio::spawn(async move {
         let mut command_rx = command_rx;
+        let mut state = scanner::ScanState::new(&equipos_conocidos);
+        let mut discovery_state = discovery::DiscoveryState::start_on(&ips_multicast);
+        let mut manual = false;
         loop {
             let _ = scan_tx.send(AppEvent::ScanStarted);
-            let informe = scanner::run_scan(scan_options.clone()).await;
+            let informe =
+                scanner::run_scan(&scan_options, &mut state, &mut discovery_state, manual).await;
+            manual = false;
+            // Los avisos no fatales del ciclo también van al log de fichero para
+            // poder diagnosticar problemas de descubrimiento sin la TUI abierta.
+            for error in &informe.errors {
+                tracing::warn!(aviso = %error, "aviso del escaneo");
+            }
             let _ = scan_tx.send(AppEvent::Devices(Box::new(informe)));
 
             tokio::select! {
                 _ = tokio::time::sleep(intervalo) => {}
                 comando = command_rx.recv() => {
                     match comando {
-                        Some(ScanCommand::Rescan) => {}
+                        // Un rescaneo manual fuerza port scan/fingerprint de todos
+                        // los equipos, además de adelantar el ciclo.
+                        Some(ScanCommand::Rescan) => manual = true,
                         Some(ScanCommand::Stop) | None => break,
                     }
                 }

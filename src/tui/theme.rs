@@ -6,6 +6,9 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::classify::DeviceType;
+use crate::repo::devices::Device;
+
 /// Paleta completa de la interfaz.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
@@ -101,6 +104,41 @@ impl Theme {
     }
 }
 
+/// Icono ASCII del tipo de dispositivo (sin tener en cuenta el estado).
+///
+/// La taxonomía de Fase 2 se representa con estos símbolos; es reutilizable por
+/// cualquier vista que necesite identificar el tipo de un equipo.
+pub fn icon_for_type(tipo: DeviceType) -> &'static str {
+    match tipo {
+        DeviceType::Gateway => "[⌂]",
+        DeviceType::Pc | DeviceType::Server | DeviceType::Nas => "[▣]",
+        DeviceType::Mobile | DeviceType::Tablet => "[▯]",
+        DeviceType::Tv | DeviceType::Streaming => "[▶]",
+        DeviceType::Printer => "[P]",
+        DeviceType::Camera => "[C]",
+        DeviceType::Iot => "[●]",
+        DeviceType::Unknown => "[?]",
+    }
+}
+
+/// Icono y estilo de un dispositivo según su tipo efectivo.
+///
+/// Usa [Device::effective_device_type], de modo que el override manual manda
+/// sobre la clasificación automática. Cualquier equipo offline se dibuja como
+/// `○` con el estilo atenuado, independientemente de su tipo.
+pub fn device_icon(device: &Device, theme: &Theme) -> (&'static str, Style) {
+    if !device.is_online {
+        return ("○", theme.offline);
+    }
+    let tipo = DeviceType::from_str(device.effective_device_type()).unwrap_or(DeviceType::Unknown);
+    let estilo = if tipo == DeviceType::Gateway {
+        theme.accent
+    } else {
+        theme.normal
+    };
+    (icon_for_type(tipo), estilo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +168,69 @@ mod tests {
             theme.level_style(crate::notifier::Level::Warn),
             theme.level_style(crate::notifier::Level::Info)
         );
+    }
+
+    fn dispositivo(device_type: &str, online: bool) -> Device {
+        Device {
+            id: 1,
+            mac: "aa:bb:cc:dd:ee:01".to_string(),
+            ip: "10.0.0.2".to_string(),
+            hostname: Some("equipo".to_string()),
+            vendor: None,
+            interface_id: 1,
+            device_type: device_type.to_string(),
+            is_online: online,
+            first_seen: "2026-01-01T00:00:00Z".to_string(),
+            last_seen: "2026-01-01T00:00:00Z".to_string(),
+            alias: None,
+            notes: None,
+            os_family: None,
+            device_type_manual: None,
+            last_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn icono_por_tipo_de_dispositivo() {
+        let theme = Theme::new(false);
+        let casos = [
+            ("gateway", "[⌂]"),
+            ("pc", "[▣]"),
+            ("server", "[▣]"),
+            ("nas", "[▣]"),
+            ("mobile", "[▯]"),
+            ("tablet", "[▯]"),
+            ("tv", "[▶]"),
+            ("streaming", "[▶]"),
+            ("printer", "[P]"),
+            ("camera", "[C]"),
+            ("iot", "[●]"),
+            ("unknown", "[?]"),
+        ];
+        for (device_type, esperado) in casos {
+            let device = dispositivo(device_type, true);
+            assert_eq!(
+                device_icon(&device, &theme).0,
+                esperado,
+                "icono de {device_type}"
+            );
+        }
+        assert_eq!(icon_for_type(DeviceType::Gateway), "[⌂]");
+    }
+
+    #[test]
+    fn offline_siempre_muestra_circulo_y_estilo_atenuado() {
+        let color = Theme::new(true);
+        let mut device = dispositivo("gateway", false);
+        let (icono, estilo) = device_icon(&device, &color);
+        assert_eq!(icono, "○");
+        assert_eq!(estilo, color.offline);
+        // Un tipo inválido cae a desconocido y el override manual manda.
+        let mut desconocido = dispositivo("tipo-invalido", true);
+        assert_eq!(device_icon(&desconocido, &color).0, "[?]");
+        desconocido.device_type_manual = Some("printer".to_string());
+        assert_eq!(device_icon(&desconocido, &color).0, "[P]");
+        device.is_online = true;
+        assert_eq!(device_icon(&device, &color).0, "[⌂]");
     }
 }

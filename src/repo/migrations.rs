@@ -14,8 +14,14 @@ pub struct Migration {
     pub version: u32,
     /// Nombre legible.
     pub name: &'static str,
-    /// SQL idempotente.
+    /// SQL idempotente (o con comprobación previa en already_applied).
     pub sql: &'static str,
+    /// Comprobación opcional de que la migración ya está presente.
+    ///
+    /// SQLite no admite `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, así que las
+    /// migraciones que añaden columnas necesitan comprobar el esquema antes de
+    /// ejecutar el SQL para poder reaplicarse sin error (idempotencia real).
+    pub already_applied: Option<fn(&Connection) -> rusqlite::Result<bool>>,
 }
 
 /// Esquema inicial de la Fase 1 (versión 1).
@@ -64,12 +70,65 @@ CREATE INDEX IF NOT EXISTS idx_device_events_device_created_at
     ON DEVICE_EVENTS(device_id, created_at);
 ";
 
+/// Esquema de la Fase 2 (versión 2): columnas nuevas de DEVICES y tablas de
+/// servicios y fuentes de descubrimiento. Es una migración aditiva: no borra ni
+/// renombra nada de la Fase 1.
+const SQL_ESQUEMA_FASE_2: &str = "\
+ALTER TABLE DEVICES ADD COLUMN os_family TEXT NULL;
+ALTER TABLE DEVICES ADD COLUMN device_type_manual TEXT NULL;
+ALTER TABLE DEVICES ADD COLUMN last_fingerprint TEXT NULL;
+
+CREATE TABLE IF NOT EXISTS DEVICE_SERVICES (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER NOT NULL REFERENCES DEVICES(id) ON DELETE CASCADE,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'tcp',
+    service TEXT NULL,
+    banner TEXT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    UNIQUE (device_id, port, protocol)
+);
+
+CREATE TABLE IF NOT EXISTS DISCOVERY_SOURCES (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER NOT NULL REFERENCES DEVICES(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    UNIQUE (device_id, source)
+);
+
+CREATE INDEX IF NOT EXISTS IDX_SERVICES_DEVICE ON DEVICE_SERVICES(device_id);
+CREATE INDEX IF NOT EXISTS IDX_SOURCES_DEVICE ON DISCOVERY_SOURCES(device_id);
+";
+
 /// Lista ordenada de migraciones.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "esquema_inicial",
-    sql: SQL_ESQUEMA_INICIAL,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "esquema_inicial",
+        sql: SQL_ESQUEMA_INICIAL,
+        already_applied: None,
+    },
+    Migration {
+        version: 2,
+        name: "descubrimiento_avanzado",
+        sql: SQL_ESQUEMA_FASE_2,
+        already_applied: Some(v2_ya_aplicada),
+    },
+];
+
+/// Comprueba si la migración v2 ya está presente (columna os_family de DEVICES).
+fn v2_ya_aplicada(conn: &Connection) -> rusqlite::Result<bool> {
+    let mut sentencia = conn.prepare("SELECT name FROM pragma_table_info('DEVICES')")?;
+    let columnas = sentencia.query_map([], |fila| fila.get::<_, String>(0))?;
+    for columna in columnas {
+        if columna? == "os_family" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// Tabla interna que registra las migraciones ya aplicadas.
 const SQL_CREAR_SCHEMA_MIGRATIONS: &str = "\
@@ -101,7 +160,13 @@ pub fn apply_all(conn: &mut Connection) -> Result<u32> {
             "aplicando migración de esquema"
         );
         let transaccion = conn.transaction()?;
-        transaccion.execute_batch(migracion.sql)?;
+        let ya_presente = match migracion.already_applied {
+            Some(comprobar) => comprobar(&transaccion)?,
+            None => false,
+        };
+        if !ya_presente {
+            transaccion.execute_batch(migracion.sql)?;
+        }
         transaccion.execute(
             "INSERT OR IGNORE INTO SCHEMA_MIGRATIONS (version, applied_at) VALUES (?1, ?2)",
             params![migracion.version, super::ahora_rfc3339()],
@@ -179,43 +244,135 @@ mod tests {
     }
 
     #[test]
-    fn apply_all_es_idempotente_y_llega_a_la_version_1() {
+    fn apply_all_es_idempotente_y_llega_a_la_version_2() {
         let mut conn = conexion_vacia();
 
         let primera = apply_all(&mut conn).expect("aplicar migraciones");
-        assert_eq!(primera, 1);
-        assert_eq!(current_version(&conn).expect("leer versión"), 1);
+        assert_eq!(primera, 2);
+        assert_eq!(current_version(&conn).expect("leer versión"), 2);
 
         // Una segunda aplicación no debe duplicar registros ni fallar.
         let segunda = apply_all(&mut conn).expect("reaplicar migraciones");
-        assert_eq!(segunda, 1);
+        assert_eq!(segunda, 2);
 
         let registros: i64 = conn
             .query_row("SELECT COUNT(*) FROM SCHEMA_MIGRATIONS", [], |fila| {
                 fila.get(0)
             })
             .expect("contar migraciones aplicadas");
-        assert_eq!(registros, 1);
+        assert_eq!(registros, 2);
 
         let (version, aplicada): (u32, String) = conn
             .query_row(
-                "SELECT version, applied_at FROM SCHEMA_MIGRATIONS",
+                "SELECT version, applied_at FROM SCHEMA_MIGRATIONS WHERE version = 2",
                 [],
                 |fila| Ok((fila.get(0)?, fila.get(1)?)),
             )
-            .expect("leer registro de migración");
-        assert_eq!(version, 1);
+            .expect("leer registro de migración v2");
+        assert_eq!(version, 2);
         chrono::DateTime::parse_from_rfc3339(&aplicada)
             .expect("applied_at debe ser RFC 3339 en UTC");
         assert!(aplicada.ends_with('Z'), "applied_at debe estar en UTC");
     }
 
     #[test]
-    fn la_migracion_inicial_es_el_esquema_inicial() {
-        assert_eq!(MIGRATIONS.len(), 1);
+    fn la_migracion_v2_es_idempotente_aunque_se_borre_su_registro() {
+        let mut conn = conexion_vacia();
+        apply_all(&mut conn).expect("aplicar migraciones");
+
+        // Simula una base con el esquema v2 pero sin el registro de la migración:
+        // el SQL no debe reejecutarse (ALTER TABLE fallaría) y la versión se
+        // vuelve a registrar.
+        conn.execute("DELETE FROM SCHEMA_MIGRATIONS WHERE version = 2", [])
+            .expect("borrar registro de v2");
+        assert_eq!(current_version(&conn).expect("leer versión"), 1);
+
+        let version = apply_all(&mut conn).expect("reaplicar migración v2");
+        assert_eq!(version, 2);
+        assert_eq!(current_version(&conn).expect("leer versión"), 2);
+    }
+
+    #[test]
+    fn migracion_v2_conserva_datos_de_una_bd_de_fase_1() {
+        let mut conn = conexion_vacia();
+
+        // Base de datos de Fase 1: esquema v1 y un equipo con datos.
+        conn.execute_batch(SQL_CREAR_SCHEMA_MIGRATIONS)
+            .expect("crear SCHEMA_MIGRATIONS");
+        conn.execute_batch(SQL_ESQUEMA_INICIAL)
+            .expect("aplicar esquema v1");
+        conn.execute(
+            "INSERT INTO SCHEMA_MIGRATIONS (version, applied_at) VALUES (1, ?1)",
+            params!["2026-11-10T10:00:00Z"],
+        )
+        .expect("registrar v1");
+        conn.execute(
+            "INSERT INTO INTERFACES (name, mac, ipv4, netmask, gateway, is_up, last_seen)
+             VALUES ('eth0', 'aa:bb:cc:dd:ee:ff', '192.168.1.10', '255.255.255.0', '192.168.1.1', 1, '2026-11-10T10:00:00Z')",
+            [],
+        )
+        .expect("insertar interfaz de F1");
+        conn.execute(
+            "INSERT INTO DEVICES (mac, ip, hostname, vendor, interface_id, device_type, is_online, first_seen, last_seen)
+             VALUES ('aa:bb:cc:dd:ee:01', '192.168.1.50', 'portatil', 'Apple', 1, 'unknown', 1,
+                     '2026-11-10T10:00:00Z', '2026-11-10T10:05:00Z')",
+            [],
+        )
+        .expect("insertar equipo de F1");
+
+        let version = apply_all(&mut conn).expect("migrar F1 a F2");
+        assert_eq!(version, 2);
+
+        // Los datos de F1 siguen ahí y las columnas nuevas son NULL.
+        let (mac, hostname, os_family, manual): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT mac, hostname, os_family, device_type_manual FROM DEVICES",
+                [],
+                |fila| Ok((fila.get(0)?, fila.get(1)?, fila.get(2)?, fila.get(3)?)),
+            )
+            .expect("leer equipo migrado");
+        assert_eq!(mac, "aa:bb:cc:dd:ee:01");
+        assert_eq!(hostname.as_deref(), Some("portatil"));
+        assert_eq!(os_family, None);
+        assert_eq!(manual, None);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM DEVICES", [], |fila| fila
+                .get::<_, i64>(0))
+                .expect("contar equipos"),
+            1
+        );
+
+        // Las tablas nuevas existen y aceptan filas con FK.
+        conn.execute(
+            "INSERT INTO DEVICE_SERVICES (device_id, port, protocol, service, first_seen, last_seen)
+             VALUES (1, 22, 'tcp', 'ssh', '2026-11-10T10:10:00Z', '2026-11-10T10:10:00Z')",
+            [],
+        )
+        .expect("insertar servicio");
+        conn.execute(
+            "INSERT INTO DISCOVERY_SOURCES (device_id, source, last_seen)
+             VALUES (1, 'arp', '2026-11-10T10:10:00Z')",
+            [],
+        )
+        .expect("insertar fuente");
+    }
+
+    #[test]
+    fn las_migraciones_estan_ordenadas_y_son_validas() {
+        assert_eq!(MIGRATIONS.len(), 2);
         assert_eq!(MIGRATIONS[0].version, 1);
         assert_eq!(MIGRATIONS[0].name, "esquema_inicial");
         assert!(!MIGRATIONS[0].sql.trim().is_empty());
+        assert_eq!(MIGRATIONS[1].version, 2);
+        assert_eq!(MIGRATIONS[1].name, "descubrimiento_avanzado");
+        assert!(!MIGRATIONS[1].sql.trim().is_empty());
+        assert!(MIGRATIONS[0].already_applied.is_none());
+        assert!(MIGRATIONS[1].already_applied.is_some());
     }
 
     #[test]
@@ -227,6 +384,8 @@ mod tests {
         for esperada in [
             "DEVICES",
             "DEVICE_EVENTS",
+            "DEVICE_SERVICES",
+            "DISCOVERY_SOURCES",
             "INTERFACES",
             "SCHEMA_MIGRATIONS",
         ] {
@@ -241,6 +400,8 @@ mod tests {
             "idx_devices_is_online",
             "idx_device_events_created_at",
             "idx_device_events_device_created_at",
+            "IDX_SERVICES_DEVICE",
+            "IDX_SOURCES_DEVICE",
         ] {
             assert!(
                 indices.contains(&esperado.to_string()),
@@ -275,12 +436,32 @@ mod tests {
                 "first_seen",
                 "last_seen",
                 "alias",
-                "notes"
+                "notes",
+                "os_family",
+                "device_type_manual",
+                "last_fingerprint"
             ]
         );
         assert_eq!(
             columnas(&conn, "DEVICE_EVENTS"),
             vec!["id", "device_id", "event_type", "details", "created_at"]
+        );
+        assert_eq!(
+            columnas(&conn, "DEVICE_SERVICES"),
+            vec![
+                "id",
+                "device_id",
+                "port",
+                "protocol",
+                "service",
+                "banner",
+                "first_seen",
+                "last_seen"
+            ]
+        );
+        assert_eq!(
+            columnas(&conn, "DISCOVERY_SOURCES"),
+            vec!["id", "device_id", "source", "last_seen"]
         );
     }
 }

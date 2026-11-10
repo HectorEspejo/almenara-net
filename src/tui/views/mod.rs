@@ -29,7 +29,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(1),
-        Constraint::Length(1),
+        // La barra de estado ocupa dos líneas: resumen/modo y fuentes activas.
+        Constraint::Length(2),
         Constraint::Length(2),
     ])
     .split(area);
@@ -121,7 +122,15 @@ fn draw_notification(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let estilo_modo = if app.is_degraded() {
+    let filas = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    draw_status_summary(frame, app, filas[0]);
+    draw_status_sources(frame, app, filas[1]);
+}
+
+fn draw_status_summary(frame: &mut Frame, app: &App, area: Rect) {
+    // El modo pasivo consciente también se destaca como aviso, igual que el
+    // degradado: en ambos casos hay descubrimiento activo desactivado.
+    let estilo_modo = if app.is_degraded() || app.is_passive() {
         app.theme.warning
     } else {
         app.theme.online
@@ -141,6 +150,36 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             .style(estilo_modo),
         columnas[1],
     );
+}
+
+fn draw_status_sources(frame: &mut Frame, app: &App, area: Rect) {
+    // En terminales de 80 columnas la lista completa no cabe con separadores
+    // legibles: solo entonces se abrevian los nombres largos.
+    let etiqueta = "Fuentes: ";
+    let fuentes = app.active_sources();
+    let completas = fuentes.join(" · ");
+    let texto = if etiqueta.chars().count() + completas.chars().count() <= usize::from(area.width) {
+        completas
+    } else {
+        fuentes
+            .iter()
+            .map(|fuente| etiqueta_fuente(fuente))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let linea = Line::from(vec![
+        Span::styled(etiqueta, app.theme.accent),
+        Span::styled(texto, app.theme.dim),
+    ]);
+    frame.render_widget(Paragraph::new(linea), area);
+}
+
+/// Abreviaturas de las fuentes con nombre largo en la barra de estado.
+fn etiqueta_fuente(fuente: &str) -> &str {
+    match fuente {
+        "DNS inverso" => "DNS inv.",
+        otra => otra,
+    }
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -231,6 +270,9 @@ mod tests {
             last_seen: "2026-01-01T00:00:00Z".to_string(),
             alias: None,
             notes: None,
+            os_family: None,
+            device_type_manual: None,
+            last_fingerprint: None,
         }
     }
 
@@ -282,6 +324,32 @@ mod tests {
         assert!(texto.contains("no disponible"));
     }
 
+    fn dibujar(app: &mut App, ancho: u16, alto: u16) -> String {
+        let backend = TestBackend::new(ancho, alto);
+        let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("dibujado de la interfaz");
+        buffer_texto(&terminal)
+    }
+
+    fn app_con_capacidades(config: Config, raw_sockets: bool) -> App {
+        App::new(
+            config,
+            PathBuf::from("/tmp/config.toml"),
+            PathBuf::from("/tmp/data.db"),
+            Capabilities {
+                raw_sockets,
+                detail: if raw_sockets {
+                    "CAP_NET_RAW detectada".to_string()
+                } else {
+                    "sin CAP_NET_RAW".to_string()
+                },
+            },
+            None,
+        )
+    }
+
     #[test]
     fn notificacion_visible_en_barra() {
         let backend = TestBackend::new(100, 30);
@@ -291,5 +359,62 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let texto = buffer_texto(&terminal);
         assert!(texto.contains("aviso: modo degradado"));
+    }
+
+    #[test]
+    fn barra_muestra_modo_pasivo_y_solo_fuentes_pasivas() {
+        let mut config = Config::default();
+        config.scan.passive_only = true;
+        let mut app = app_con_capacidades(config, true);
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("modo: pasivo"));
+        assert!(texto.contains("Fuentes:"));
+        for fuente in ["/proc", "mDNS", "SSDP", "DHCP", "NetBIOS", "DNS inverso"] {
+            assert!(texto.contains(fuente), "falta la fuente {fuente}");
+        }
+        assert!(
+            !texto.contains("ARP"),
+            "el modo pasivo no debe anunciar fuentes activas"
+        );
+    }
+
+    #[test]
+    fn barra_en_ochenta_columnas_abrevia_fuentes_largas() {
+        let mut app = app_con_capacidades(Config::default(), true);
+        let texto = dibujar(&mut app, 80, 24);
+        assert!(texto.contains("modo: privilegiado"));
+        assert!(
+            texto.contains("DNS inv."),
+            "a 80 columnas se abrevia la fuente con nombre largo"
+        );
+        assert!(texto.contains("puertos"), "la última fuente debe verse");
+    }
+
+    #[test]
+    fn barra_pasiva_en_ochenta_columnas_cabe_entera() {
+        let mut config = Config::default();
+        config.scan.passive_only = true;
+        let mut app = app_con_capacidades(config, true);
+        let texto = dibujar(&mut app, 80, 24);
+        assert!(texto.contains("DNS inverso"));
+    }
+
+    #[test]
+    fn barra_privilegiada_anuncia_fuentes_activas() {
+        let mut app = app_con_capacidades(Config::default(), true);
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("modo: privilegiado"));
+        for fuente in ["/proc", "mDNS", "ARP", "ICMP", "puertos"] {
+            assert!(texto.contains(fuente), "falta la fuente {fuente}");
+        }
+    }
+
+    #[test]
+    fn barra_degradada_anuncia_fuentes_pasivas() {
+        let mut app = app_con_capacidades(Config::default(), false);
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("modo: degradado"));
+        assert!(texto.contains("Fuentes:"));
+        assert!(!texto.contains("ARP"));
     }
 }
