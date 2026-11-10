@@ -2,9 +2,14 @@
 
 ## Especificación Funcional
 
-**Versión:** 1.0
+**Versión:** 1.1
 **Fecha:** 2026-11-10
 **Cliente:** Uso personal (desarrollador)
+
+**Changelog:**
+- 2026-11-10 — v1.1: especificación alineada con la Fase 1 implementada tras procesar su informe de implementación (crate OUI real, MSRV 1.88, rutas reales de la documentación, semántica definitiva de teclas, merge ICMP sin MAC, heurística de `mac_changed`, fechas RFC 3339, APIs adicionales de `Repo`, arranque no bloqueante). v1.0: especificación inicial.
+
+**Nota de trazabilidad:** por la regla de textos estables, el checklist conserva la redacción original de F1-05, F1-08, F1-10, F1-27, F1-36 y F1-51; su interpretación vigente es la de esta v1.1 (primer escaneo en segundo plano, `ranges = []` derivado de la interfaz, merge ICMP solo como liveness, `mac_changed` por heurística y Enter como notificación no bloqueante). Quedan pendientes de verificación manual F1-24, F1-25 y F1-64 (ejecución real con `CAP_NET_RAW` y medición de rendimiento), tal como se registra en el checklist y en el maestro.
 
 ---
 
@@ -30,29 +35,33 @@ Almenara es una aplicación de terminal (TUI) para Linux que monitoriza de forma
 
 | Capa | Tecnología | Motivo |
 |------|-----------|--------|
-| Lenguaje | Rust (edition 2021) | Seguridad memoria, binario único, TUI idiomática |
+| Lenguaje | Rust (edition 2021, MSRV 1.88) | Seguridad memoria, binario único, TUI idiomática |
 | Runtime async | `tokio` | Timers, sockets, canales multi-productor |
 | TUI | `ratatui` + `crossterm` | Estándar actual en Rust, mantenido, 256 colores |
 | CLI | `clap` (derive) | Flags `-c`, `-v`, `-vv`, `--no-color`, `--version` |
 | Config | `serde` + `toml` | Config declarativa legible |
 | Persistencia | `rusqlite` (bundled) | SQLite embebido, sin dependencias del sistema |
 | Red raw | `pnet` | ARP + ICMP raw sockets |
-| OUI | `ouidb` | Base de fabricantes embebida |
-| Logs | `tracing` + `tracing-subscriber` + `tracing-appender` | Logs estructurados con rotación |
+| OUI | `ouidb` (crate real: `macaddr-ouidb`) | Base de fabricantes embebida (40 000+ prefijos IEEE/Wireshark) |
+| Logs | `tracing` + `tracing-subscriber` + `tracing-appender` | Logs estructurados con rotación por tamaño (10 MiB por fichero y 3 rotados, escritor propio) |
 
 ### Estructura de carpetas
 
 ```
 almenara/
 ├── Cargo.toml
+├── Cargo.lock
+├── .gitignore
+├── README.md
 ├── CLAUDE.md
 ├── docs/
-│   ├── almenara-maestro.md
-│   ├── almenara-fase1-informe.md
-│   ├── almenara-fase1-prompt.md
-│   ├── almenara-fase1-checklist.md
-│   └── almenara-fase1-implementacion.md   (lo crea el agente)
-└── src/
+│   └── fase1/
+│       ├── almenara-maestro.md
+│       ├── almenara-fase1-informe.md
+│       ├── almenara-fase1-prompt.md
+│       ├── almenara-fase1-checklist.md
+│       └── almenara-fase1-implementacion.md   (lo crea el agente)
+├── src/
     ├── main.rs                 # arranque, parseo CLI, init servicios
     ├── config.rs               # carga TOML, defaults
     ├── error.rs                # Error central (thiserror)
@@ -84,6 +93,8 @@ almenara/
     │   ├── devices.rs          # DAO devices
     │   └── events.rs           # DAO device_events
     └── notifier.rs             # buffer de notificaciones
+└── tests/
+    └── cli.rs                  # pruebas de integración de la CLI
 ```
 
 ### Diagrama de arquitectura
@@ -139,8 +150,8 @@ almenara/
 ┌────────────────────┐
 │    INTERFACES      │
 ├────────────────────┤
-│ id (PK)            │
-│ name (UNIQUE)      │◄──────┐
+│ id (PK)            │◄──────┐
+│ name (UNIQUE)      │       │
 │ mac                │       │
 │ ipv4               │       │
 │ netmask            │       │
@@ -154,8 +165,8 @@ almenara/
                     ┌────────┴───────────┐
                     │      DEVICES       │
                     ├────────────────────┤
-                    │ id (PK)            │
-                    │ mac (UNIQUE)       │◄──────┐
+                    │ id (PK)            │◄──────┐
+                    │ mac (UNIQUE)       │       │
                     │ ip                 │       │
                     │ hostname (NULL)    │       │
                     │ vendor (NULL)      │       │
@@ -225,6 +236,8 @@ almenara/
 
 **Índices:** `DEVICES(mac)` (implícito por UNIQUE), `DEVICES(is_online)`, `DEVICE_EVENTS(created_at)`, `DEVICE_EVENTS(device_id, created_at)`.
 
+**Fechas:** todas las columnas de fecha (`last_seen`, `first_seen`, `created_at`) se almacenan como TEXT con RFC 3339 en UTC (ej. `2026-11-10T10:47:54Z`).
+
 ### Diagrama de estados — DEVICES
 
 ```
@@ -260,7 +273,7 @@ almenara/
 Transiciones inválidas (no permitidas por diseño):
   · OFFLINE → first_seen reset       (un dispositivo no se "re-descubre")
   · 'new' emitido más de una vez     (el evento new es único por MAC)
-  · Cambio de MAC sin evento         (todo cambio emite ip_changed/mac_changed)
+  · Cambio de MAC sin evento         (si se detecta, emite mac_changed; heurística en §7)
 ```
 
 ---
@@ -300,8 +313,8 @@ Transiciones inválidas (no permitidas por diseño):
 └────┬─────────────┘
      ▼
 ┌──────────────────┐
-│ primer scan      │
-│ (ARP+ICMP+proc)  │
+│ primer scan      │──► en segundo plano (no bloquea el arranque)
+│ (ARP+ICMP+proc)  │    al terminar refresca la lista
 └────┬─────────────┘
      ▼
 ┌──────────────────┐
@@ -315,6 +328,8 @@ Transiciones inválidas (no permitidas por diseño):
      │                             │
      └─── timer scan ──────────────┘
 ```
+
+**Notas de implementación:** si el fichero de configuración no existe, se escribe una plantilla con los valores por defecto (best-effort) y se continúa. El primer escaneo no bloquea la apertura de la TUI: se lanza en segundo plano y, al terminar, se refresca la lista; los equipos ya persistidos se muestran desde SQLite al abrir.
 
 ### Flujo de escaneo periódico
 
@@ -373,6 +388,33 @@ Transiciones inválidas (no permitidas por diseño):
 └────────────────────────┘
 ```
 
+### Diagrama de secuencia — ciclo de escaneo (scanner → BD → TUI)
+
+```
+ Timer/scan task        Scanner (spawn_blocking)        TUI thread + Repo          SQLite
+      │                            │                          │                     │
+      │ tick del timer o tecla r   │                          │                     │
+      ├───────────────────────────►│                          │                     │
+      │                            │ /proc/net/arp (pasivo)   │                     │
+      │                            │ ARP + ICMP (pnet, si CAP)│                     │
+      │                            │ reverse DNS + OUI        │                     │
+      │◄───────────────────────────┤ Vec<Host>                │                     │
+      │ AppEvent::Devices          │                          │                     │
+      ├──────────────────────────────────────────────────────►│                     │
+      │                            │                          │ reconcile:          │
+      │                            │                          │ · upsert/interfaz   │
+      │                            │                          │ · altas y cambios   │
+      │                            │                          │ · offline N ciclos  │
+      │                            │                          │ · eventos JSON      │
+      │                            │                          ├────────────────────►│
+      │                            │                          │◄────────────────────┤
+      │                            │                          │ · prune_events      │
+      │                            │                          │ refresca AppState   │
+      │                            │                          │ (redibuja la TUI)   │
+```
+
+En modo degradado se omiten el ARP scan y el ICMP sweep: el ciclo sigue con `/proc/net/arp` y el resto del pipeline es idéntico.
+
 ### Flujo de búsqueda/orden/filtro (UI)
 
 ```
@@ -394,7 +436,7 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 
 | Operación | Firma | Descripción |
 |-----------|-------|-------------|
-| `detect_interfaces` | `fn() -> Result<Vec<Interface>>` | Enumerar interfaces vía netlink/`pnet` |
+| `detect_interfaces` | `fn() -> Result<Vec<Interface>>` | Enumerar interfaces vía `pnet`; gateway desde `/proc/net/route` |
 | `arp_scan` | `fn(range: Ipv4Net, iface: &str) -> Result<Vec<Host>>` | Barrido ARP en el rango |
 | `icmp_sweep` | `fn(range: Ipv4Net, iface: &str, timeout: Duration) -> Result<Vec<Ipv4Addr>>` | Ping sweep concurrente |
 | `read_proc_arp` | `fn() -> Vec<ArpEntry>` | Lectura pasiva de la tabla ARP |
@@ -417,6 +459,12 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 | `get_device_by_mac` | `fn(mac) -> Result<Option<Device>>` | Búsqueda puntual |
 | `append_event` | `fn(device_id, event_type, details) -> Result<()>` | Registro |
 | `prune_events` | `fn(older_than: Duration) -> Result<usize>` | Retención |
+| `set_device_online` | `fn(mac, online) -> Result<()>` | Marcar un equipo online/offline tras N ciclos |
+| `update_device_mac` | `fn(id, mac) -> Result<()>` | Cambio de identidad (heurística `mac_changed`) |
+| `set_alias` / `set_notes` | `fn(id, texto: Option<&str>) -> Result<()>` | Edición manual desde la TUI |
+| `list_interfaces` | `fn() -> Result<Vec<Interface>>` | Pestaña Config / diagnóstico |
+| `list_events` | `fn(limit) -> Result<Vec<DeviceEvent>>` | Reservado para la pestaña Histórico (F5); cubierto por tests en F1 |
+| `schema_version`, `count_devices`, `path` | `fn(...)` | Diagnóstico y pruebas |
 
 ### Capabilities / Config / Notifier
 
@@ -442,8 +490,8 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
                    └──┬──┬──┬──┬──┘
        /  búsqueda ───┘  │  │  └─── r rescan manual
        f  filtro  ───────┘  └─────── s ordenar
-       Enter  ───────────────────► placeholder "detalle no disponible (F3)"
-       Tab / 1-5 ────────────────► otra pestaña
+       Enter  ───────────────────► notificación "detalle no disponible (F3)"
+       Tab / 1-7 ────────────────► otra pestaña
                                      │
              ┌───────────────────────┼───────────────────────┐
              ▼                       ▼                       ▼
@@ -462,16 +510,16 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 │ Icono  IP              Hostname         Fabricante    Tráfico    Estado │
 ├────────────────────────────────────────────────────────────────────────┤
 │ [⌂]  192.168.1.1     router.lan        TP-Link       ─           online │
-│ [▣]  192.168.1.42    laptop-juan       Apple         ─           online │
-│ [▯]  192.168.1.57    iPhone-Marta      Apple         ─           online │
-│ [●]  192.168.1.103   chromecast-sala   Google        ─           online │
-│ [●]  192.168.1.88    tv-sala           Samsung       ─           online │
-│ [▣]  192.168.1.10    nas-synology      Synology      ─           online │
+│ [?]  192.168.1.42    laptop-juan       Apple         ─           online │
+│ [?]  192.168.1.57    iPhone-Marta      Apple         ─           online │
+│ [?]  192.168.1.103   chromecast-sala   Google        ─           online │
+│ [?]  192.168.1.88    tv-sala           Samsung       ─           online │
+│ [?]  192.168.1.10    nas-synology      Synology      ─           online │
 │ [?]  192.168.1.201   ?                 ?             ─           online │
 │ ○    192.168.1.66    iPad              Apple         ─           offline│
 │                                                                        │
-│ 12 equipos · 11 online · 1 offline · 7 conns   modo: privilegiado     │
-└─[hjkl]mover [Enter]detalle [s]orden [f]filtrar [/]buscar [r]scan [?]──┘
+│ 12 equipos · 11 online · 1 offline   modo: privilegiado                 │
+└─[j/k]mover [h/l]pestaña [Enter]det. [s]orden [f]filtro [/]buscar [?]──┘
 ```
 
 ### Mockup 2 — Equipos con búsqueda activa
@@ -480,12 +528,12 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 ┌ Equipos ┬ Tráfico ┬ Conexiones ┬ Histórico ┬ Alertas ┬ Config ┬ Ayuda ┐
 │ Buscar: apple█                                                         │
 ├────────────────────────────────────────────────────────────────────────┤
-│ [▣]  192.168.1.42    laptop-juan       Apple         ─           online │
-│ [▯]  192.168.1.57    iPhone-Marta      Apple         ─           online │
+│ [?]  192.168.1.42    laptop-juan       Apple         ─           online │
+│ [?]  192.168.1.57    iPhone-Marta      Apple         ─           online │
 │ ○    192.168.1.66    iPad              Apple         ─           offline│
 │                                                                        │
 │ 3 resultados de 12 · [Esc]cerrar búsqueda                              │
-└─[hjkl]mover [Enter]detalle [s]orden [f]filtrar [/]buscar [r]scan [?]──┘
+└─[j/k]mover [h/l]pestaña [Enter]det. [s]orden [f]filtro [/]buscar [?]──┘
 ```
 
 ### Mockup 3 — Config (solo lectura F1)
@@ -498,7 +546,7 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 │                                                                        │
 │ [scan]                                                                 │
 │   interfaces = "auto"                                                  │
-│   ranges     = ["192.168.1.0/24"]                                      │
+│   ranges     = []                # vacío = derivar de la interfaz      │
 │   interval_s = 60                                                      │
 │   icmp_timeout_ms = 500                                                │
 │   offline_after_cycles = 3                                             │
@@ -520,10 +568,12 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 │ Almenara v0.1.0 — Fase 1                                              │
 ├────────────────────────────────────────────────────────────────────────┤
 │ Navegación                                                             │
-│   hjkl / flechas    mover selección                                    │
+│   j/k, ↑/↓          mover selección                                    │
+│   h/l, ←/→          cambiar pestaña                                    │
 │   Tab / Shift-Tab   cambiar pestaña                                    │
 │   1-7               atajo a pestaña                                    │
-│   Enter             abrir detalle (no disponible en F1)                │
+│   a / n             editar alias / notas                               │
+│   Enter             notificación de detalle no disponible (F3)         │
 │   /                 buscar                                             │
 │   s                 ordenar por columna                                │
 │   f                 filtrar (all/online/offline/new/alert)             │
@@ -542,6 +592,10 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 - Tamaño mínimo razonable: **80×24**. Por debajo, mensaje de "terminal demasiado pequeño".
 - Iconos en F1: `[⌂]` gateway, `[?]` cualquier otro (device_type='unknown'), `○` offline.
 - Barra de notificaciones: última notificación abajo a la derecha durante 3 s, buffer circular de 50 en memoria (no persistido en F1).
+- Keybindings finales (v1.1): `j/k` y ↑/↓ mueven la selección; `h/l` y ←/→ cambian de pestaña (además de `Tab`/`Shift-Tab` y `1-7`); `a` y `n` editan alias y notas con entrada inline (Enter guarda, Esc cancela). El pie de la TUI se dibuja en dos líneas para que quepan todos los atajos a 80 columnas.
+- `Enter` sobre un equipo muestra una notificación no bloqueante de "detalle no disponible hasta F3"; el informe no definía pantalla de detalle para F1.
+- La barra de estado muestra equipos/online/offline, filtro, búsqueda, orden y modo (privilegiado/degradado), con el modo degradado resaltado; se omite el contador de conexiones del mockup porque Conexiones es placeholder en F1.
+- Si el fichero de configuración no existe, se escribe una plantilla con los valores por defecto (best-effort) y se continúa.
 
 ---
 
@@ -549,20 +603,24 @@ No hay API HTTP. La aplicación expone los siguientes **servicios internos** (an
 
 ### Merge de resultados ARP + ICMP + `/proc/net/arp`
 
-La misma MAC puede aparecer con IP duplicada por caché desactualizada; el merge debe ser determinista.
+La misma MAC puede aparecer con IP duplicada por caché desactualizada; el merge debe ser determinista. El ping sweep ICMP devuelve solo direcciones IP (no MAC), por lo que se usa como fuente de *liveness* y el merge por MAC se hace entre ARP y `/proc/net/arp`.
 
 ```python
-def merge_hosts(arp, icmp, proc_arp):
+def merge_hosts(arp, proc_arp, icmp_ips):
     by_mac = {}
-    for h in arp + icmp + proc_arp:
+    for h in arp + proc_arp:
         mac = h.mac_normalized()            # minúsculas, ':' como separador
         if mac not in by_mac:
             by_mac[mac] = h
         else:
-            # preferimos la IP que confirma ARP (más fiable que solo ICMP)
+            # preferimos la IP que confirma ARP (más fiable que /proc)
             if h.source == 'arp':
                 by_mac[mac].ip = h.ip
             by_mac[mac].seen_sources.add(h.source)
+    # ICMP solo confirma que la IP responde; no identifica MAC
+    for ip in icmp_ips:
+        if ip in {h.ip for h in by_mac.values()}:
+            mark_alive(ip)
     return list(by_mac.values())
 ```
 
@@ -575,11 +633,13 @@ def diff(prev: Device | None, curr: Host) -> ChangeSet:
     cs = ChangeSet()
     if prev.ip != curr.ip:            cs.ip_changed = (prev.ip, curr.ip)
     if prev.hostname != curr.hostname: cs.hostname_changed = (prev.hostname, curr.hostname)
-    if prev.mac != curr.mac:          cs.mac_changed = (prev.mac, curr.mac)
+    # mac_changed no se detecta aquí: la identidad es la MAC (ver heurística)
     return cs
 ```
 
-`ip_changed` y `mac_changed` emiten eventos. El propio upsert persiste la nueva IP/hostname.
+`ip_changed` y `hostname_changed` emiten eventos; `mac_changed` solo puede emitirse mediante la heurística siguiente. El propio upsert persiste la nueva IP/hostname.
+
+**Heurística de `mac_changed`.** Con identidad por MAC (`UNIQUE`) y merge por MAC, un cambio de MAC no es alcanzable en un upsert normal. Si aparece una MAC desconocida con la IP de un equipo online cuya MAC anterior ha desaparecido de la foto actual del escaneo, se actualiza la identidad de ese equipo y se emite `mac_changed` con `before`/`after`. Limitación conocida: una reasignación real de IP entre dos equipos podría interpretarse como cambio de MAC; se revisará en F2 con fingerprint de dispositivo.
 
 ### Marcado offline
 
@@ -592,14 +652,17 @@ Un equipo `is_online = 1` que **no aparece en el resultado del merge** durante `
 
 ### OUI
 
+- Base embebida `macaddr-ouidb` 0.3.1 (el crate `ouidb` no existe en crates.io; la dependencia se declara como `ouidb` con `package = "macaddr-ouidb"` en Cargo.toml).
 - Normalización de MAC a `aa:bb:cc:dd:ee:ff` antes del lookup.
 - MAC locales/administrativas (`02:...` con bit U/L) no tienen vendor y se muestran como `?`.
 
 ### Validación
 
 - Rango(s) deben ser IPv4 CIDR válidos; máximo 1024 IPs por rango en F1.
-- `scan_interval_s` ≥ 10.
+- `ranges = []` (valor por defecto) significa derivar la red de cada interfaz activa desde su IP y máscara; el rango automático se acota a 1024 direcciones (equivalente a /22 alrededor de la IP local) para evitar escaneos enormes.
+- `interval_s` ≥ 10.
 - `icmp_timeout_ms` entre 100 y 5000.
+- Una configuración inválida no aborta: se avisa por notificación y log y se usan los valores por defecto, sin reescribir el fichero del usuario.
 
 ---
 
@@ -632,6 +695,7 @@ Un equipo `is_online = 1` que **no aparece en el resultado del merge** durante `
 - Escaneo `/24` completo en ≤ 15 s con timeout `500 ms` y concurrencia 64.
 - Ciclo de render objetivo ≤ 16 ms en 80×24.
 - Uso de CPU ≤ 5 % en reposo, ≤ 30 % durante escaneo.
+- *Verificación pendiente:* el entorno de desarrollo de F1 no dispone de `CAP_NET_RAW`, por lo que el escaneo activo completo y estos objetivos de rendimiento no se han medido de extremo a extremo; queda recomendada una prueba manual con `sudo`/`setcap` y una prueba de carga con 256 equipos.
 
 ### Accesibilidad
 
@@ -666,11 +730,20 @@ No aplica en F1. Se reserva la sección para fases posteriores.
 **ADR-05 · Vista de lista (opción B) en F1, no grid**
 La lista escala mejor a decenas de equipos, permite ordenación y filtrado, y encaja con la adición posterior de sparklines. El grid (opción A) queda como vista alternativa opcional en fase posterior. Se elige lista como vista principal de F1.
 
-**ADR-06 · Base OUI embebida (`ouidb`) en el binario**
-Evita descarga en primer arranque y dependencia de red. Tamaño ~1 MB. Actualizaciones se hacen publicando nueva versión. Se elige embebida.
+**ADR-06 · Base OUI embebida en el binario**
+Evita descarga en primer arranque y dependencia de red. El crate `ouidb` no existe en crates.io, así que se usa `macaddr-ouidb` 0.3.1 (40 000+ prefijos IEEE/Wireshark), renombrado `ouidb` en `Cargo.toml` para conservar el nombre acordado. Actualizaciones se hacen publicando nueva versión. Se elige embebida.
 
 **ADR-07 · Modo degradado en lugar de abortar sin CAP_NET_RAW**
 Arrancar en modo degradado permite usar la TUI y aprovechar `/proc/net/arp` si está poblada. Abortar por falta de capabilities penaliza al usuario en entornos donde no puede elevarlas. Se elige modo degradado con aviso visible.
+
+**ADR-08 · Fechas como TEXT RFC 3339 en UTC (vs. TIMESTAMP numérico o feature de fecha de `rusqlite`)**
+Guardar RFC 3339 en UTC permite ordenar lexicográficamente, es legible en SQLite y evita depender de la feature `chrono` de `rusqlite`. Se elige TEXT RFC 3339 UTC.
+
+**ADR-09 · Un único escritor SQLite y reconciliación en la TUI (vs. compartir `Connection` entre tareas)**
+`rusqlite::Connection` no es `Sync`; compartirla exigiría mutex o pool. Se opta por una única conexión de escritura en el hilo de la TUI: el escaneo publica el informe en bruto por `AppEvent::Devices` y la TUI reconcilia (altas, cambios, offline, eventos) antes de refrescar. WAL activo para futuras conexiones de solo lectura.
+
+**ADR-10 · Primer escaneo en segundo plano (vs. bloquear el arranque hasta completarlo)**
+Un escaneo /24 con timeout de 500 ms puede tardar hasta ~15 s. La TUI se abre de inmediato con los equipos ya persistidos y se refresca al terminar el primer ciclo; el flujo funcional (lista poblada tras el primer escaneo) se mantiene.
 
 ---
 
@@ -696,11 +769,11 @@ Arrancar en modo degradado permite usar la TUI y aprovechar `/proc/net/arp` si e
 - `scanner/interfaces.rs`, `scanner/proc_arp.rs`, `scanner/arp.rs`, `scanner/icmp.rs`, `scanner/dns.rs`
 - `oui.rs`
 - Orquestación: merge + diff + emisión de eventos
-- Primer `scan` ejecutado al arrancar
+- Primer `scan` lanzado en segundo plano al arrancar
 
 ### Sprint 1.4 — TUI principal (≈ 14 h)
 - Vista Equipos con la lista detallada
-- Navegación hjkl/flechas, Tab/Shift-Tab, 1-7
+- Navegación j/k (mover), h/l (pestañas), flechas, Tab/Shift-Tab, 1-7
 - Búsqueda `/`, orden `s`, filtro `f`, rescan `r`, ayuda `?`
 - Barra de estado con resumen y modo (privilegiado/degradado)
 - Notificaciones no bloqueantes
@@ -713,9 +786,12 @@ Arrancar en modo degradado permite usar la TUI y aprovechar `/proc/net/arp` si e
 - Ajuste de paleta 256 + `NO_COLOR`
 - Modal bloqueante de error de BD
 - Manual de arranque en README (Linux, capabilities, cómo dar `CAP_NET_RAW`)
+- Tests de integración de la CLI (`tests/cli.rs`)
 - Informe de implementación
 
 **Estimación total F1:** **~54 h → 3–4 semanas**.
+
+**Estado real (2026-11-10):** Fase 1 completada; 135 tests en verde, `cargo fmt --check` y `cargo clippy --all-targets -- -D warnings` limpios. El desarrollo se organizó por ámbitos de escritura disjuntos con contratos de módulo; se añadieron `tests/cli.rs` (4 pruebas de integración de la CLI) y se fijó el MSRV en Rust 1.88.
 
 ---
 

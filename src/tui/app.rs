@@ -12,7 +12,8 @@ use ratatui::widgets::TableState;
 use tokio::sync::mpsc;
 
 use crate::capabilities::Capabilities;
-use crate::config::Config;
+use crate::classify::{group_for, DeviceGroup, DeviceType};
+use crate::config::{Config, ListView};
 use crate::events::ScanCommand;
 use crate::notifier::{Level, Notification, Notifier};
 use crate::repo::devices::Device;
@@ -277,6 +278,15 @@ pub enum Action {
         /// Notas nuevas (None para borrar).
         value: Option<String>,
     },
+    /// Cambiar la vista de la lista de equipos (plana o agrupada).
+    SetListView(ListView),
+    /// Guardar el tipo de dispositivo manual de un equipo (None = automático).
+    SetDeviceTypeManual {
+        /// Id del dispositivo.
+        id: i64,
+        /// Tipo forzado por el usuario; None deja la clasificación automática.
+        value: Option<DeviceType>,
+    },
 }
 
 /// Estado completo de la aplicación.
@@ -302,6 +312,8 @@ pub struct App {
     pub sort: SortState,
     /// Filtro activo.
     pub filter: Filter,
+    /// Vista de la lista de equipos (plana o agrupada por categoría).
+    pub list_view: ListView,
     /// Búsqueda confirmada.
     pub search: String,
     /// Campo de entrada activo.
@@ -338,6 +350,7 @@ impl App {
         command_tx: Option<mpsc::Sender<ScanCommand>>,
     ) -> Self {
         let theme = Theme::from_flags(config.ui.no_color, false);
+        let list_view = config.ui.list_view;
         Self {
             devices: Vec::new(),
             interfaces: Vec::new(),
@@ -349,6 +362,7 @@ impl App {
             selected: 0,
             sort: SortState::default(),
             filter: Filter::All,
+            list_view,
             search: String::new(),
             input: None,
             notifier: Notifier::new(),
@@ -410,13 +424,17 @@ impl App {
     }
 
     /// Índices de los dispositivos visibles según filtro, búsqueda y orden.
+    ///
+    /// En la vista agrupada se ordena primero por categoría ([DeviceGroup::ALL])
+    /// y, dentro de cada grupo, por la ordenación activa. En ambos modos el
+    /// índice devuelto es la posición en la lista visible (sin contar cabeceras).
     pub fn visible_indices(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..self.devices.len())
             .filter(|indice| self.matches(&self.devices[*indice]))
             .collect();
         let ascending = self.sort.ascending;
         let key = self.sort.key;
-        indices.sort_by(|a, b| {
+        let ordenar = |a: &usize, b: &usize| {
             let izquierda = &self.devices[*a];
             let derecha = &self.devices[*b];
             let orden =
@@ -426,7 +444,16 @@ impl App {
             } else {
                 orden.reverse()
             }
-        });
+        };
+        if self.list_view == ListView::Grouped {
+            indices.sort_by(|a, b| {
+                grupo_de(&self.devices[*a])
+                    .cmp(&grupo_de(&self.devices[*b]))
+                    .then_with(|| ordenar(a, b))
+            });
+        } else {
+            indices.sort_by(ordenar);
+        }
         indices
     }
 
@@ -598,6 +625,82 @@ impl App {
         self.clamp_selection();
     }
 
+    /// Alterna la vista de la lista de equipos (plana ↔ agrupada).
+    ///
+    /// Solo tiene efecto en la pestaña Equipos. Devuelve la vista nueva para que
+    /// el bucle principal persista la preferencia `[ui].list_view`.
+    pub fn toggle_list_view(&mut self) -> Option<ListView> {
+        if self.tab != Tab::Equipos {
+            return None;
+        }
+        let seleccionado = self.selected_device().map(|device| device.id);
+        self.list_view = self.list_view.toggle();
+        if let Some(id) = seleccionado {
+            if let Some(posicion) = self
+                .visible_indices()
+                .iter()
+                .position(|indice| self.devices[*indice].id == id)
+            {
+                self.selected = posicion;
+            }
+        }
+        self.clamp_selection();
+        Some(self.list_view)
+    }
+
+    /// Indica si el usuario ha activado el modo pasivo consciente.
+    pub fn is_passive(&self) -> bool {
+        self.config.scan.passive_only
+    }
+
+    /// Cicla el tipo de dispositivo manual del equipo seleccionado.
+    ///
+    /// El ciclo completo es None(auto) → gateway → printer → camera → tv →
+    /// streaming → nas → mobile → tablet → server → pc → iot → unknown → None.
+    /// Cuando el equipo no tiene override se parte de su tipo automático (no de
+    /// None) para que la primera pulsación produzca un cambio visible; por la
+    /// misma razón, si el automático es desconocido y el siguiente valor sería
+    /// volver a automático, se salta a gateway.
+    pub fn cycle_device_type_manual(&mut self) -> Action {
+        if self.tab != Tab::Equipos {
+            return Action::None;
+        }
+        let Some((id, manual, automatico)) = self.selected_device().map(|device| {
+            (
+                device.id,
+                device.device_type_manual.clone(),
+                device.device_type.clone(),
+            )
+        }) else {
+            self.push_notification(Level::Info, "No hay ningún equipo seleccionado");
+            return Action::None;
+        };
+        let manual = manual.as_deref().and_then(DeviceType::from_str);
+        let base = manual
+            .or_else(|| DeviceType::from_str(&automatico))
+            .unwrap_or(DeviceType::Unknown);
+        let mut siguiente = match DeviceType::ALL.iter().position(|tipo| *tipo == base) {
+            Some(posicion) if posicion + 1 < DeviceType::ALL.len() => {
+                Some(DeviceType::ALL[posicion + 1])
+            }
+            _ => None,
+        };
+        // Sin override, volver al automático no cambiaría el icono: se salta a
+        // gateway para que la pulsación siempre tenga un efecto visible.
+        if manual.is_none() && siguiente.is_none() {
+            siguiente = Some(DeviceType::ALL[0]);
+        }
+        let mensaje = match siguiente {
+            Some(tipo) => format!("Tipo manual: {}", tipo.label()),
+            None => "Tipo automático".to_string(),
+        };
+        self.push_notification(Level::Info, mensaje);
+        Action::SetDeviceTypeManual {
+            id,
+            value: siguiente,
+        }
+    }
+
     /// Limpia la búsqueda confirmada.
     pub fn clear_search(&mut self) {
         self.search.clear();
@@ -645,13 +748,32 @@ impl App {
         texto
     }
 
-    /// Etiqueta del modo (privilegiado o degradado).
+    /// Etiqueta del modo de descubrimiento para la barra de estado.
+    ///
+    /// El modo pasivo consciente ([scan].passive_only) tiene prioridad sobre la
+    /// detección de capacidades porque el usuario ha desactivado el tráfico activo;
+    /// si no, se distingue entre privilegiado y degradado según CAP_NET_RAW.
     pub fn mode_label(&self) -> String {
-        if self.capabilities.raw_sockets {
-            "modo: privilegiado".to_string()
-        } else {
+        if self.config.scan.passive_only {
+            "modo: pasivo".to_string()
+        } else if !self.capabilities.raw_sockets {
             "modo: degradado (sin CAP_NET_RAW)".to_string()
+        } else {
+            "modo: privilegiado".to_string()
         }
+    }
+
+    /// Fuentes de descubrimiento activas según el modo actual.
+    ///
+    /// En modo pasivo o degradado solo se usan fuentes pasivas; además, con
+    /// CAP_NET_RAW y sin `passive_only`, se añaden las activas (ARP, ICMP y
+    /// port scan).
+    pub fn active_sources(&self) -> Vec<&'static str> {
+        let mut fuentes = vec!["/proc", "mDNS", "SSDP", "DHCP", "NetBIOS", "DNS inverso"];
+        if !self.config.scan.passive_only && self.capabilities.raw_sockets {
+            fuentes.extend(["ARP", "ICMP", "puertos"]);
+        }
+        fuentes
     }
 
     /// Procesa una tecla y devuelve la acción a ejecutar.
@@ -729,6 +851,11 @@ impl App {
                 self.cycle_filter();
                 Action::None
             }
+            KeyCode::Char('g') => match self.toggle_list_view() {
+                Some(vista) => Action::SetListView(vista),
+                None => Action::None,
+            },
+            KeyCode::Char('t') => self.cycle_device_type_manual(),
             KeyCode::Char('r') => Action::Rescan,
             KeyCode::Char('a') => {
                 self.begin_device_input(InputMode::Alias);
@@ -848,6 +975,15 @@ fn clave_ip(ip: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// Grupo de la vista agrupada al que pertenece un dispositivo.
+///
+/// Se basa en el tipo efectivo: el override manual manda sobre el automático.
+pub(crate) fn grupo_de(device: &Device) -> DeviceGroup {
+    DeviceType::from_str(device.effective_device_type())
+        .map(group_for)
+        .unwrap_or(DeviceGroup::Unknown)
+}
+
 fn valor_opcional(buffer: &str) -> Option<String> {
     let recortado = buffer.trim();
     if recortado.is_empty() {
@@ -883,6 +1019,9 @@ mod tests {
             last_seen: "2026-01-01T00:00:00Z".to_string(),
             alias: None,
             notes: None,
+            os_family: None,
+            device_type_manual: None,
+            last_fingerprint: None,
         }
     }
 
@@ -899,6 +1038,29 @@ mod tests {
         );
         app.set_data(devices, Vec::new());
         app
+    }
+
+    fn app_con_config(config: Config, raw_sockets: bool) -> App {
+        App::new(
+            config,
+            PathBuf::from("/tmp/config.toml"),
+            PathBuf::from("/tmp/data.db"),
+            Capabilities {
+                raw_sockets,
+                detail: if raw_sockets {
+                    "CAP_NET_RAW detectada".to_string()
+                } else {
+                    "sin CAP_NET_RAW".to_string()
+                },
+            },
+            None,
+        )
+    }
+
+    fn dispositivo_de_tipo(id: i64, ip: &str, device_type: &str, online: bool) -> Device {
+        let mut device = dispositivo(id, &format!("aa:bb:cc:dd:ee:0{id}"), ip, None, None, online);
+        device.device_type = device_type.to_string();
+        device
     }
 
     fn tecla(codigo: KeyCode) -> KeyEvent {
@@ -1185,5 +1347,198 @@ mod tests {
             comparar(&offline, &online, SortKey::Estado),
             std::cmp::Ordering::Greater
         );
+    }
+
+    #[test]
+    fn vista_se_inicializa_desde_config_y_alterna_con_g() {
+        let mut config = Config::default();
+        config.ui.list_view = ListView::Grouped;
+        let mut app = app_con_config(config, false);
+        app.set_data(
+            vec![dispositivo_de_tipo(1, "10.0.0.1", "gateway", true)],
+            Vec::new(),
+        );
+        assert_eq!(app.list_view, ListView::Grouped);
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('g'))),
+            Action::SetListView(ListView::Flat)
+        );
+        assert_eq!(app.list_view, ListView::Flat);
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('g'))),
+            Action::SetListView(ListView::Grouped)
+        );
+        app.tab = Tab::Ayuda;
+        assert_eq!(app.handle_key(tecla(KeyCode::Char('g'))), Action::None);
+        assert_eq!(app.list_view, ListView::Grouped, "g solo actúa en Equipos");
+    }
+
+    #[test]
+    fn orden_agrupado_respeta_grupos_y_orden_interno() {
+        let mut app = app_con(vec![
+            dispositivo_de_tipo(1, "10.0.0.201", "unknown", true),
+            dispositivo_de_tipo(2, "10.0.0.20", "printer", true),
+            dispositivo_de_tipo(3, "10.0.0.1", "gateway", true),
+            dispositivo_de_tipo(4, "10.0.0.42", "pc", true),
+            dispositivo_de_tipo(5, "10.0.0.57", "mobile", true),
+            dispositivo_de_tipo(6, "10.0.0.10", "nas", true),
+        ]);
+        app.list_view = ListView::Grouped;
+        let ips: Vec<&str> = app
+            .visible_indices()
+            .iter()
+            .map(|indice| app.devices[*indice].ip.as_str())
+            .collect();
+        assert_eq!(
+            ips,
+            vec![
+                "10.0.0.1",
+                "10.0.0.10",
+                "10.0.0.42",
+                "10.0.0.57",
+                "10.0.0.20",
+                "10.0.0.201"
+            ]
+        );
+    }
+
+    #[test]
+    fn override_manual_manda_en_grupo_y_tipo_efectivo() {
+        let mut desconocido = dispositivo_de_tipo(1, "10.0.0.201", "unknown", true);
+        desconocido.device_type_manual = Some("printer".to_string());
+        let pc = dispositivo_de_tipo(2, "10.0.0.42", "pc", true);
+        let mut app = app_con(vec![desconocido, pc]);
+        app.list_view = ListView::Grouped;
+        let ids: Vec<i64> = app
+            .visible_indices()
+            .iter()
+            .map(|indice| app.devices[*indice].id)
+            .collect();
+        assert_eq!(ids, vec![2, 1], "el override lo mueve a Impresoras");
+        assert_eq!(app.devices[0].effective_device_type(), "printer");
+    }
+
+    #[test]
+    fn alternar_vista_conserva_el_equipo_seleccionado() {
+        let mut app = app_con(vec![
+            dispositivo_de_tipo(1, "10.0.0.10", "printer", true),
+            dispositivo_de_tipo(2, "10.0.0.20", "pc", true),
+        ]);
+        assert_eq!(app.selected_device().map(|device| device.id), Some(1));
+        app.handle_key(tecla(KeyCode::Char('g')));
+        assert_eq!(
+            app.selected_device().map(|device| device.id),
+            Some(1),
+            "la selección sigue al equipo al cambiar de vista"
+        );
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn tecla_t_cicla_tipo_manual_y_avisa() {
+        let mut app = app_con(vec![dispositivo_de_tipo(7, "10.0.0.7", "gateway", true)]);
+        // Sin override parte del tipo automático: gateway -> printer.
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('t'))),
+            Action::SetDeviceTypeManual {
+                id: 7,
+                value: Some(DeviceType::Printer)
+            }
+        );
+        assert!(app
+            .notifier
+            .current()
+            .expect("notificación del tipo")
+            .message
+            .contains("Tipo manual: Impresora"));
+
+        app.devices[0].device_type_manual = Some("printer".to_string());
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('t'))),
+            Action::SetDeviceTypeManual {
+                id: 7,
+                value: Some(DeviceType::Camera)
+            }
+        );
+        app.devices[0].device_type_manual = Some("iot".to_string());
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('t'))),
+            Action::SetDeviceTypeManual {
+                id: 7,
+                value: Some(DeviceType::Unknown)
+            }
+        );
+        app.devices[0].device_type_manual = Some("unknown".to_string());
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('t'))),
+            Action::SetDeviceTypeManual { id: 7, value: None }
+        );
+        assert!(app
+            .notifier
+            .current()
+            .expect("notificación del tipo")
+            .message
+            .contains("Tipo automático"));
+
+        app.tab = Tab::Ayuda;
+        assert_eq!(app.handle_key(tecla(KeyCode::Char('t'))), Action::None);
+    }
+
+    #[test]
+    fn tecla_t_parte_del_automatico_y_salta_el_automatico_sin_override() {
+        // Automático desconocido: volver a automático no cambiaría el icono, así
+        // que la primera pulsación salta a gateway.
+        let mut app = app_con(vec![dispositivo_de_tipo(1, "10.0.0.1", "unknown", true)]);
+        assert_eq!(
+            app.handle_key(tecla(KeyCode::Char('t'))),
+            Action::SetDeviceTypeManual {
+                id: 1,
+                value: Some(DeviceType::Gateway)
+            }
+        );
+
+        // Sin equipos seleccionables avisa y no devuelve acción.
+        let mut vacia = app_con(vec![]);
+        assert_eq!(vacia.handle_key(tecla(KeyCode::Char('t'))), Action::None);
+        assert!(vacia
+            .notifier
+            .current()
+            .expect("notificación sin equipo")
+            .message
+            .contains("No hay ningún equipo"));
+    }
+
+    #[test]
+    fn modo_pasivo_es_prioritario_y_solo_lista_fuentes_pasivas() {
+        let mut config = Config::default();
+        config.scan.passive_only = true;
+        let app = app_con_config(config, true);
+        assert!(app.is_passive());
+        assert_eq!(app.mode_label(), "modo: pasivo");
+        assert_eq!(
+            app.active_sources(),
+            vec!["/proc", "mDNS", "SSDP", "DHCP", "NetBIOS", "DNS inverso"]
+        );
+
+        // El modo pasivo manda también sin CAP_NET_RAW.
+        let mut config = Config::default();
+        config.scan.passive_only = true;
+        let app = app_con_config(config, false);
+        assert_eq!(app.mode_label(), "modo: pasivo");
+    }
+
+    #[test]
+    fn modo_degradado_y_privilegiado_listan_sus_fuentes() {
+        let degradado = app_con_config(Config::default(), false);
+        assert_eq!(degradado.mode_label(), "modo: degradado (sin CAP_NET_RAW)");
+        assert_eq!(degradado.active_sources().len(), 6);
+
+        let privilegiado = app_con_config(Config::default(), true);
+        assert_eq!(privilegiado.mode_label(), "modo: privilegiado");
+        let fuentes = privilegiado.active_sources();
+        assert_eq!(fuentes.len(), 9);
+        assert!(fuentes.contains(&"ARP"));
+        assert!(fuentes.contains(&"ICMP"));
+        assert!(fuentes.contains(&"puertos"));
     }
 }

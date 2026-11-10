@@ -17,7 +17,14 @@
 //! - list_events omite las filas con un event_type desconocido: permite que una
 //!   base de datos escrita por una versión futura no rompa la TUI actual.
 
+// Los DAOs de F2 exponen la API completa exigida por el checklist (incluidas
+// operaciones que la TUI todavía no consume); se permite dead_code en el binario
+// y quedan cubiertos por tests. Se retirará cuando F3/F5 los usen en la interfaz.
+#[allow(dead_code)]
+pub mod device_services;
 pub mod devices;
+#[allow(dead_code)]
+pub mod discovery_sources;
 pub mod events;
 pub mod interfaces;
 pub mod migrations;
@@ -28,9 +35,12 @@ use std::time::Duration;
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::classify::{DeviceType, OsFamily};
 use crate::error::{Error, Result};
 
+pub use device_services::{DeviceService, Protocol, ServiceUpsert};
 pub use devices::{ChangeSet, Device, DeviceUpsert};
+pub use discovery_sources::{DiscoverySource, DiscoverySourceRow};
 pub use events::{DeviceEvent, EventType};
 pub use interfaces::Interface;
 
@@ -44,7 +54,8 @@ const SQL_SELECCION_INTERFAZ: &str =
 /// Columnas de DEVICES en el mismo orden que reconstruye fila_a_dispositivo.
 const SQL_SELECCION_DISPOSITIVO: &str =
     "SELECT id, mac, ip, hostname, vendor, interface_id, device_type, is_online,
-            first_seen, last_seen, alias, notes FROM DEVICES";
+            first_seen, last_seen, alias, notes, os_family, device_type_manual,
+            last_fingerprint FROM DEVICES";
 
 /// Repositorio SQLite de Almenara.
 #[derive(Debug)]
@@ -241,6 +252,61 @@ impl Repo {
         Ok(dispositivo)
     }
 
+    /// Busca un dispositivo por su última IPv4 conocida.
+    ///
+    /// Lo usan las fuentes pasivas de Fase 2 (mDNS, SSDP, DHCP) para asociar un
+    /// anuncio a un equipo ya persistido cuando la MAC no viaja en el anuncio.
+    pub fn get_device_by_ip(&self, ip: &str) -> Result<Option<Device>> {
+        let sql = format!("{SQL_SELECCION_DISPOSITIVO} WHERE ip = ?1 ORDER BY id LIMIT 1");
+        let dispositivo = self
+            .conn
+            .query_row(&sql, params![ip], fila_a_dispositivo)
+            .optional()?;
+        Ok(dispositivo)
+    }
+
+    /// Asigna o limpia el hostname de un dispositivo.
+    ///
+    /// Un hostname vacío o solo con espacios se guarda como NULL.
+    pub fn set_hostname(&mut self, id: i64, hostname: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE DEVICES SET hostname = ?1 WHERE id = ?2",
+            params![normalizar_texto_opcional(hostname), id],
+        )?;
+        Ok(())
+    }
+
+    /// Persiste la familia de SO estimada por fingerprint.
+    pub fn set_os_family(&mut self, id: i64, os_family: Option<OsFamily>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE DEVICES SET os_family = ?1 WHERE id = ?2",
+            params![os_family.map(OsFamily::as_str), id],
+        )?;
+        Ok(())
+    }
+
+    /// Persiste el JSON del último fingerprint observado.
+    pub fn set_last_fingerprint(&mut self, id: i64, fingerprint: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE DEVICES SET last_fingerprint = ?1 WHERE id = ?2",
+            params![normalizar_texto_opcional(fingerprint), id],
+        )?;
+        Ok(())
+    }
+
+    /// Asigna o limpia el override manual de device_type.
+    pub fn set_device_type_manual(
+        &mut self,
+        id: i64,
+        device_type: Option<DeviceType>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE DEVICES SET device_type_manual = ?1 WHERE id = ?2",
+            params![device_type.map(DeviceType::as_str), id],
+        )?;
+        Ok(())
+    }
+
     /// Marca un dispositivo como online u offline.
     ///
     /// Si el id no existe la sentencia no modifica ninguna fila; es un no-op
@@ -349,6 +415,42 @@ impl Repo {
         Ok(eventos)
     }
 
+    /// Inserta o actualiza un servicio detectado y devuelve su id.
+    pub fn upsert_service(&mut self, servicio: &ServiceUpsert) -> Result<i64> {
+        device_services::upsert(&self.conn, servicio)
+    }
+
+    /// Lista los servicios activos de un dispositivo.
+    ///
+    /// La usa la reconciliación para clasificar con los servicios ya
+    /// persistidos; también llegará a la TUI con el detalle de F3.
+    pub fn list_services(&self, device_id: i64) -> Result<Vec<DeviceService>> {
+        device_services::list(&self.conn, device_id)
+    }
+
+    /// Cuenta los servicios de un dispositivo obsoletos desde el corte indicado.
+    pub fn mark_stale_services(&self, device_id: i64, older_than: &str) -> Result<usize> {
+        device_services::mark_stale(&self.conn, device_id, older_than)
+    }
+
+    /// Purga definitivamente los servicios con last_seen anterior al corte.
+    pub fn prune_services(&mut self, older_than: &str) -> Result<usize> {
+        device_services::prune(&self.conn, older_than)
+    }
+
+    /// Marca que una fuente de descubrimiento ha visto a un dispositivo.
+    pub fn upsert_source(&mut self, device_id: i64, source: DiscoverySource) -> Result<()> {
+        discovery_sources::upsert(&self.conn, device_id, source, &ahora_rfc3339())
+    }
+
+    /// Lista las fuentes de descubrimiento que han visto a un dispositivo.
+    ///
+    /// API del checklist de F2; la TUI aún no la consume. Cubierta por tests.
+    #[allow(dead_code)]
+    pub fn list_sources(&self, device_id: i64) -> Result<Vec<DiscoverySourceRow>> {
+        discovery_sources::list(&self.conn, device_id)
+    }
+
     /// Versión actual del esquema aplicado.
     pub fn schema_version(&self) -> Result<u32> {
         migrations::current_version(&self.conn)
@@ -400,6 +502,9 @@ fn fila_a_dispositivo(fila: &Row<'_>) -> rusqlite::Result<Device> {
         last_seen: fila.get(9)?,
         alias: fila.get(10)?,
         notes: fila.get(11)?,
+        os_family: fila.get(12)?,
+        device_type_manual: fila.get(13)?,
+        last_fingerprint: fila.get(14)?,
     })
 }
 
@@ -475,7 +580,7 @@ mod tests {
 
         assert!(ruta.exists(), "debe existir el fichero de base de datos");
         assert_eq!(repo.path(), ruta.as_path());
-        assert_eq!(repo.schema_version().expect("leer versión"), 1);
+        assert_eq!(repo.schema_version().expect("leer versión"), 2);
         assert_eq!(repo.count_devices().expect("contar dispositivos"), 0);
     }
 
@@ -485,11 +590,11 @@ mod tests {
         let ruta = directorio.path().join("data.db");
 
         let primera = Repo::init(&ruta).expect("primer init");
-        assert_eq!(primera.schema_version().expect("leer versión"), 1);
+        assert_eq!(primera.schema_version().expect("leer versión"), 2);
         drop(primera);
 
         let segunda = Repo::init(&ruta).expect("segundo init sobre el mismo fichero");
-        assert_eq!(segunda.schema_version().expect("leer versión"), 1);
+        assert_eq!(segunda.schema_version().expect("leer versión"), 2);
     }
 
     #[test]
@@ -502,12 +607,13 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'table'
-                   AND name IN ('INTERFACES', 'DEVICES', 'DEVICE_EVENTS', 'SCHEMA_MIGRATIONS')",
+                   AND name IN ('INTERFACES', 'DEVICES', 'DEVICE_EVENTS',
+                                 'DEVICE_SERVICES', 'DISCOVERY_SOURCES', 'SCHEMA_MIGRATIONS')",
                 [],
                 |fila| fila.get(0),
             )
             .expect("contar tablas del esquema");
-        assert_eq!(tablas, 4, "deben existir las cuatro tablas del esquema");
+        assert_eq!(tablas, 6, "deben existir las seis tablas del esquema");
 
         let modo: String = repo
             .connection()
@@ -900,7 +1006,7 @@ mod tests {
 
         // El segundo repositorio se abre con el primero aún vivo (modo WAL).
         let mut segundo = Repo::init(&ruta).expect("segundo repositorio sobre el mismo fichero");
-        assert_eq!(segundo.schema_version().expect("leer versión"), 1);
+        assert_eq!(segundo.schema_version().expect("leer versión"), 2);
         assert_eq!(segundo.list_interfaces().expect("listar").len(), 1);
 
         segundo
@@ -927,5 +1033,217 @@ mod tests {
             .expect("actualizar interfaz desde el segundo");
         assert_eq!(id_actualizado, id_interfaz);
         assert_eq!(primero.list_interfaces().expect("listar").len(), 1);
+    }
+
+    /// Crea un repositorio con una interfaz y un dispositivo de prueba.
+    fn repo_con_dispositivo(directorio: &TempDir) -> (Repo, i64) {
+        let (mut repo, id_interfaz) = repo_con_interfaz(directorio);
+        let (id, _) = repo
+            .upsert_device(&upsert(MAC_PRIMERA, "192.168.1.50", id_interfaz))
+            .expect("alta del dispositivo");
+        (repo, id)
+    }
+
+    #[test]
+    fn upsert_service_lista_y_actualiza_por_puerto_y_protocolo() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        let servicio = ServiceUpsert {
+            device_id: id,
+            port: 22,
+            protocol: Protocol::Tcp,
+            service: Some("ssh".to_string()),
+            banner: Some("SSH-2.0-OpenSSH_9.6".to_string()),
+        };
+        let id_servicio = repo.upsert_service(&servicio).expect("insertar servicio");
+        assert!(id_servicio > 0);
+
+        let servicios = repo.list_services(id).expect("listar servicios");
+        assert_eq!(servicios.len(), 1);
+        assert_eq!(servicios[0].port, 22);
+        assert_eq!(servicios[0].protocol, Protocol::Tcp);
+        assert_eq!(servicios[0].service.as_deref(), Some("ssh"));
+        assert!(servicios[0].last_seen.ends_with('Z'));
+
+        // Repetir el upsert no duplica y actualiza last_seen/banner.
+        let mut actualizado = servicio.clone();
+        actualizado.banner = Some("SSH-2.0-OpenSSH_9.7".to_string());
+        repo.upsert_service(&actualizado)
+            .expect("actualizar servicio");
+        let servicios = repo.list_services(id).expect("listar servicios");
+        assert_eq!(servicios.len(), 1);
+        assert_eq!(servicios[0].banner.as_deref(), Some("SSH-2.0-OpenSSH_9.7"));
+
+        // Un None no borra el servicio ni el banner anteriores.
+        let sin_datos = ServiceUpsert {
+            device_id: id,
+            port: 22,
+            protocol: Protocol::Tcp,
+            service: None,
+            banner: None,
+        };
+        repo.upsert_service(&sin_datos).expect("upsert sin datos");
+        let servicios = repo.list_services(id).expect("listar servicios");
+        assert_eq!(servicios[0].service.as_deref(), Some("ssh"));
+        assert!(servicios[0].banner.is_some());
+
+        // Otro protocolo en el mismo puerto es una fila distinta.
+        let udp = ServiceUpsert {
+            device_id: id,
+            port: 22,
+            protocol: Protocol::Udp,
+            service: None,
+            banner: None,
+        };
+        repo.upsert_service(&udp).expect("insertar udp");
+        assert_eq!(repo.list_services(id).expect("listar").len(), 2);
+    }
+
+    #[test]
+    fn mark_stale_y_prune_services_respetan_el_corte() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+        for puerto in [22_u16, 80, 443] {
+            repo.upsert_service(&ServiceUpsert {
+                device_id: id,
+                port: puerto,
+                protocol: Protocol::Tcp,
+                service: None,
+                banner: None,
+            })
+            .expect("insertar servicio");
+        }
+
+        // Un corte en el pasado no marca nada; uno en el futuro los marca todos.
+        assert_eq!(
+            repo.mark_stale_services(id, "2000-01-01T00:00:00Z")
+                .expect("marcar obsoletos"),
+            0
+        );
+        assert_eq!(
+            repo.mark_stale_services(id, "2999-01-01T00:00:00Z")
+                .expect("marcar obsoletos"),
+            3
+        );
+        assert_eq!(repo.list_services(id).expect("listar").len(), 3);
+
+        let borrados = repo
+            .prune_services("2999-01-01T00:00:00Z")
+            .expect("purgar servicios");
+        assert_eq!(borrados, 3);
+        assert!(repo.list_services(id).expect("listar").is_empty());
+        assert_eq!(
+            repo.prune_services("2999-01-01T00:00:00Z")
+                .expect("purgar de nuevo"),
+            0
+        );
+    }
+
+    #[test]
+    fn upsert_source_y_list_sources() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        for fuente in [DiscoverySource::Arp, DiscoverySource::Mdns] {
+            repo.upsert_source(id, fuente).expect("marcar fuente");
+        }
+        // Repetir la misma fuente actualiza last_seen sin duplicar.
+        repo.upsert_source(id, DiscoverySource::Arp)
+            .expect("repetir fuente");
+
+        let fuentes = repo.list_sources(id).expect("listar fuentes");
+        assert_eq!(fuentes.len(), 2);
+        assert_eq!(fuentes[0].source, DiscoverySource::Arp);
+        assert_eq!(fuentes[1].source, DiscoverySource::Mdns);
+        assert!(fuentes.iter().all(|fila| fila.device_id == id));
+    }
+
+    #[test]
+    fn os_family_y_override_manual_se_persisten() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        repo.set_os_family(id, Some(OsFamily::Linux))
+            .expect("guardar os_family");
+        repo.set_last_fingerprint(id, Some("{\"ttl\":64}"))
+            .expect("guardar fingerprint");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.os_family.as_deref(), Some("linux"));
+        assert_eq!(
+            dispositivo.last_fingerprint.as_deref(),
+            Some("{\"ttl\":64}")
+        );
+        assert_eq!(dispositivo.effective_device_type(), "unknown");
+
+        // El override manual manda sobre el tipo automático.
+        repo.set_device_type_manual(id, Some(DeviceType::Pc))
+            .expect("guardar override");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.device_type, "unknown");
+        assert_eq!(dispositivo.effective_device_type(), "pc");
+        assert!(!dispositivo.is_gateway());
+
+        // Limpiar el override devuelve el tipo automático.
+        repo.set_device_type_manual(id, None)
+            .expect("limpiar override");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.effective_device_type(), "unknown");
+        assert_eq!(dispositivo.device_type_manual, None);
+
+        // Limpiar os_family también funciona.
+        repo.set_os_family(id, None).expect("limpiar os_family");
+        assert_eq!(
+            repo.get_device_by_mac(MAC_PRIMERA)
+                .expect("buscar")
+                .expect("existe")
+                .os_family,
+            None
+        );
+    }
+
+    #[test]
+    fn get_device_by_ip_y_set_hostname() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        let dispositivo = repo
+            .get_device_by_ip("192.168.1.50")
+            .expect("buscar por IP")
+            .expect("debe existir");
+        assert_eq!(dispositivo.id, id);
+        assert!(repo
+            .get_device_by_ip("192.168.1.99")
+            .expect("buscar IP inexistente")
+            .is_none());
+
+        repo.set_hostname(id, Some("  impresora.local  "))
+            .expect("guardar hostname");
+        assert_eq!(
+            repo.get_device_by_mac(MAC_PRIMERA)
+                .expect("buscar")
+                .expect("existe")
+                .hostname
+                .as_deref(),
+            Some("impresora.local")
+        );
+        repo.set_hostname(id, Some("   "))
+            .expect("limpiar hostname");
+        assert_eq!(
+            repo.get_device_by_mac(MAC_PRIMERA)
+                .expect("buscar")
+                .expect("existe")
+                .hostname,
+            None
+        );
     }
 }

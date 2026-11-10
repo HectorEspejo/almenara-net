@@ -142,6 +142,38 @@ pub fn scan(
     Ok(por_mac.into_values().collect())
 }
 
+/// Calienta la tabla ARP del núcleo enviando datagramas UDP a los objetivos.
+///
+/// Se usa como respaldo cuando el barrido ARP raw no devuelve hosts: algunas
+/// interfaces Wi-Fi descartan las tramas inyectadas con AF_PACKET. Al enviar un
+/// datagrama UDP a cada IP, el núcleo resuelve la MAC con su propio ARP y deja la
+/// entrada en /proc/net/arp, de donde el escáner la vuelve a leer. Solo abre un
+/// socket UDP (sin privilegios) y es tráfico activo: el llamador debe respetar
+/// passive_only.
+pub fn calentar_tabla_arp(iface: &DetectedInterface, targets: &[Ipv4Addr]) -> Result<()> {
+    let ip_local = iface.ipv4.ok_or_else(|| {
+        Error::Scan(format!(
+            "la interfaz {} no tiene dirección IPv4: no se puede calentar la tabla ARP",
+            iface.name
+        ))
+    })?;
+    let socket = std::net::UdpSocket::bind((ip_local, 0)).map_err(|err| {
+        Error::Scan(format!(
+            "no se pudo abrir el socket UDP para calentar la tabla ARP en {}: {err}",
+            iface.name
+        ))
+    })?;
+    // Dos rondas: la primera provoca la resolución y la segunda cubre pérdidas.
+    for _ in 0..2 {
+        for objetivo in targets {
+            // Puerto 9 (discard): el contenido y el resultado no importan, solo
+            // que el núcleo necesite resolver la MAC de destino.
+            let _ = socket.send_to(&[0u8], (*objetivo, 9));
+        }
+    }
+    Ok(())
+}
+
 /// Devuelve la MAC de la interfaz ya parseada.
 fn mac_de_interfaz(iface: &DetectedInterface) -> Result<MacAddr> {
     let mac = iface.mac.as_deref().ok_or_else(|| {
@@ -374,5 +406,18 @@ mod tests {
         let objetivos = ["192.168.1.1".parse::<Ipv4Addr>().unwrap()];
         let hosts = scan(&detectada, &objetivos, Duration::ZERO).expect("timeout cero no falla");
         assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn calentar_tabla_arp_con_objetivos_locales_no_falla() {
+        let detectada = interfaz(Some("aa:bb:cc:dd:ee:ff"), Some("127.0.0.1"));
+        calentar_tabla_arp(&detectada, &["127.0.0.1".parse().unwrap()])
+            .expect("calentar la tabla ARP local no debe fallar");
+    }
+
+    #[test]
+    fn calentar_tabla_arp_sin_ipv4_devuelve_error() {
+        let detectada = interfaz(Some("aa:bb:cc:dd:ee:ff"), None);
+        assert!(calentar_tabla_arp(&detectada, &[]).is_err());
     }
 }

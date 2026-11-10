@@ -30,7 +30,7 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "Enter",
-        description: "detalle del equipo (no disponible en Fase 1)",
+        description: "detalle del equipo (llegará en Fase 3)",
     },
     KeyHelp {
         keys: "/",
@@ -47,6 +47,14 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     KeyHelp {
         keys: "r",
         description: "rescaneo manual",
+    },
+    KeyHelp {
+        keys: "g",
+        description: "alternar la lista plana / agrupada por categoría (pestaña Equipos)",
+    },
+    KeyHelp {
+        keys: "t",
+        description: "ciclar el tipo de dispositivo del equipo seleccionado (automático o manual)",
     },
     KeyHelp {
         keys: "a",
@@ -72,8 +80,8 @@ pub const HELP_ROWS: &[KeyHelp] = &[
 
 /// Pie de teclas de la pestaña Equipos (dos líneas para que quepa en 80 columnas).
 pub const FOOTER_EQUIPOS: [&str; 2] = [
-    "[hjkl/flechas]mover [Tab/Shift-Tab]pestaña [1-7]atajo [/]buscar",
-    "[s]ordenar [f]filtrar [r]rescan [a]alias [n]notas [?]ayuda [q]salir",
+    "[hjkl]mover [Tab]pestaña [1-7]atajo [/]buscar [s]orden [f]filtro",
+    "[r]rescan [g]vista [t]tipo [a]alias [n]notas [?]ayuda [q]salir",
 ];
 
 /// Pie de teclas del resto de pestañas (dos líneas).
@@ -89,7 +97,7 @@ mod tests {
     #[test]
     fn hay_un_atajo_para_cada_accion_requerida() {
         let claves: Vec<&str> = HELP_ROWS.iter().map(|fila| fila.keys).collect();
-        for requerida in ["Tab", "1-7", "/", "s", "f", "r", "?", "q", "Esc"] {
+        for requerida in ["Tab", "1-7", "/", "s", "f", "r", "g", "t", "?", "q", "Esc"] {
             assert!(
                 claves.iter().any(|clave| clave.contains(requerida)),
                 "falta el atajo {requerida}"
@@ -97,5 +105,19 @@ mod tests {
         }
         assert!(FOOTER_EQUIPOS.iter().any(|linea| linea.contains("rescan")));
         assert!(FOOTER_OTROS.iter().any(|linea| linea.contains("pestañas")));
+    }
+
+    #[test]
+    fn pies_caben_en_ochenta_columnas() {
+        for linea in FOOTER_EQUIPOS.iter().chain(FOOTER_OTROS.iter()) {
+            assert!(
+                linea.chars().count() <= 80,
+                "el pie no cabe en 80 columnas: {linea}"
+            );
+        }
+        assert!(FOOTER_EQUIPOS
+            .iter()
+            .any(|linea| linea.contains("[g]vista")));
+        assert!(FOOTER_EQUIPOS.iter().any(|linea| linea.contains("[t]tipo")));
     }
 }

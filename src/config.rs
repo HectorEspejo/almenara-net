@@ -32,8 +32,28 @@ pub const MIN_ICMP_TIMEOUT_MS: u64 = 100;
 pub const MAX_ICMP_TIMEOUT_MS: u64 = 5000;
 /// Máximo de direcciones por rango en Fase 1.
 pub const MAX_RANGE_HOSTS: u32 = 1024;
-/// Concurrencia usada por el ping sweep.
+/// Concurrencia usada por el ping sweep y por el port scan.
 pub const DEFAULT_SWEEP_CONCURRENCY: usize = 64;
+
+/// Puertos del port scan por defecto (TOP-20 de la especificación).
+///
+/// La lista del checklist repite el puerto 1883 (MQTT); como la validación exige
+/// puertos únicos, aquí se deduplica y quedan 19 puertos. Es una desviación
+/// documentada en el informe de implementación.
+pub const DEFAULT_TOP_PORTS: [u16; 19] = [
+    22, 23, 53, 80, 139, 443, 445, 515, 631, 1883, 3389, 5000, 5353, 5555, 8008, 8080, 8443, 9100,
+    32400,
+];
+/// Número máximo de puertos configurable en [scan].top_ports.
+pub const MAX_TOP_PORTS: usize = 64;
+/// Timeout del port scan por defecto, en milisegundos.
+pub const DEFAULT_PORTSCAN_TIMEOUT_MS: u64 = 500;
+/// Timeout del banner grabbing por defecto, en milisegundos.
+pub const DEFAULT_BANNER_TIMEOUT_MS: u64 = 1000;
+/// Timeout del fetch del XML de descripción SSDP, en milisegundos.
+pub const DEFAULT_SSDP_FETCH_TIMEOUT_MS: u64 = 2000;
+/// Timeout de la consulta NetBIOS, en milisegundos.
+pub const DEFAULT_NETBIOS_TIMEOUT_MS: u64 = 500;
 
 /// Configuración completa de Almenara.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -61,6 +81,12 @@ pub struct ScanConfig {
     pub icmp_timeout_ms: u64,
     /// Ciclos consecutivos sin respuesta antes de marcar offline.
     pub offline_after_cycles: u32,
+    /// Deshabilita todo el tráfico activo (modo pasivo consciente).
+    pub passive_only: bool,
+    /// Puertos del port scan TCP CONNECT (máximo 64, únicos).
+    pub top_ports: Vec<u16>,
+    /// Rutas manuales adicionales de ficheros de leases DHCP.
+    pub dhcp_lease_paths: Vec<String>,
 }
 
 impl Default for ScanConfig {
@@ -71,6 +97,9 @@ impl Default for ScanConfig {
             interval_s: DEFAULT_INTERVAL_S,
             icmp_timeout_ms: DEFAULT_ICMP_TIMEOUT_MS,
             offline_after_cycles: DEFAULT_OFFLINE_CYCLES,
+            passive_only: false,
+            top_ports: DEFAULT_TOP_PORTS.to_vec(),
+            dhcp_lease_paths: Vec::new(),
         }
     }
 }
@@ -102,6 +131,8 @@ pub struct UiConfig {
     pub theme: String,
     /// Desactiva el color aunque el terminal lo soporte.
     pub no_color: bool,
+    /// Vista de la lista de equipos: plana o agrupada por categoría.
+    pub list_view: ListView,
 }
 
 impl Default for UiConfig {
@@ -109,6 +140,45 @@ impl Default for UiConfig {
         Self {
             theme: "default".to_string(),
             no_color: false,
+            list_view: ListView::Flat,
+        }
+    }
+}
+
+/// Vista de la lista de equipos.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListView {
+    /// Lista plana (comportamiento de Fase 1).
+    #[default]
+    Flat,
+    /// Lista agrupada por categoría de dispositivo.
+    Grouped,
+}
+
+impl fmt::Display for ListView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Flat => f.write_str("flat"),
+            Self::Grouped => f.write_str("grouped"),
+        }
+    }
+}
+
+impl ListView {
+    /// Alterna entre vista plana y agrupada.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Flat => Self::Grouped,
+            Self::Grouped => Self::Flat,
+        }
+    }
+
+    /// Etiqueta visible de la vista actual.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "plana",
+            Self::Grouped => "agrupada",
         }
     }
 }
@@ -208,7 +278,10 @@ impl Config {
     /// que debe mostrarse al usuario (por ejemplo en una notificación).
     pub fn load_or_default(path: Option<&Path>) -> (Self, Vec<String>) {
         match Self::load(path) {
-            Ok(config) => (config, Vec::new()),
+            Ok(config) => {
+                let (config, avisos) = config.descartar_lease_paths_inexistentes();
+                (config, avisos)
+            }
             Err(err) => (
                 Self::default(),
                 vec![format!(
@@ -216,6 +289,27 @@ impl Config {
                 )],
             ),
         }
+    }
+
+    /// Descarta las rutas manuales de leases que no existen y devuelve avisos.
+    fn descartar_lease_paths_inexistentes(mut self) -> (Self, Vec<String>) {
+        let mut avisos = Vec::new();
+        let rutas = std::mem::take(&mut self.scan.dhcp_lease_paths);
+        self.scan.dhcp_lease_paths = rutas
+            .into_iter()
+            .filter(|ruta| {
+                let existe = expand_tilde(ruta)
+                    .map(|expandida| expandida.exists())
+                    .unwrap_or(false);
+                if !existe {
+                    avisos.push(format!(
+                        "scan.dhcp_lease_paths: se descarta la ruta inexistente {ruta}"
+                    ));
+                }
+                existe
+            })
+            .collect();
+        (self, avisos)
     }
 
     /// Valida los valores de configuración.
@@ -244,6 +338,27 @@ impl Config {
         }
 
         self.parse_ranges()?;
+
+        if self.scan.top_ports.len() > MAX_TOP_PORTS {
+            return Err(Error::Config(format!(
+                "scan.top_ports admite como máximo {MAX_TOP_PORTS} puertos (valor actual: {})",
+                self.scan.top_ports.len()
+            )));
+        }
+        let mut vistos = std::collections::HashSet::new();
+        for puerto in &self.scan.top_ports {
+            if *puerto == 0 {
+                return Err(Error::Config(
+                    "scan.top_ports no admite el puerto 0; los puertos válidos van de 1 a 65535"
+                        .to_string(),
+                ));
+            }
+            if !vistos.insert(*puerto) {
+                return Err(Error::Config(format!(
+                    "scan.top_ports contiene el puerto duplicado {puerto}"
+                )));
+            }
+        }
 
         if let InterfacesSetting::Names(names) = &self.scan.interfaces {
             if names.iter().any(|name| name.trim().is_empty()) {
@@ -299,6 +414,24 @@ impl Config {
         toml::to_string_pretty(self)
             .unwrap_or_else(|err| format!("# No se pudo serializar la configuración: {err}"))
     }
+
+    /// Guarda la configuración completa en path (la usa el toggle de vista).
+    ///
+    /// El fichero se reescribe completo porque es pequeño; los comentarios
+    /// manuales del usuario se pierden, igual que en la plantilla inicial.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent().filter(|padre| !padre.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                Error::config_at(path, format!("no se pudo crear el directorio: {err}"))
+            })?;
+        }
+        let contenido = format!(
+            "# Configuración de Almenara (Fase 2)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n{}",
+            self.to_toml()
+        );
+        std::fs::write(path, contenido)
+            .map_err(|err| Error::config_at(path, format!("no se pudo escribir: {err}")))
+    }
 }
 
 fn parse_ranges_list(rangos: &[String]) -> Result<Vec<pnet::ipnetwork::Ipv4Network>> {
@@ -327,7 +460,7 @@ fn write_default_file(path: &Path) -> Result<()> {
         })?;
     }
     let mut content = String::from(
-        "# Configuración de Almenara (Fase 1)\n         # Los comentarios se pierden si la aplicación reescribe el fichero.\n\n",
+        "# Configuración de Almenara (Fase 2)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n",
     );
     content.push_str(&Config::default().to_toml());
     std::fs::write(path, content)
@@ -398,6 +531,11 @@ mod tests {
         assert_eq!(config.storage.db_path, "~/.local/share/almenara/data.db");
         assert_eq!(config.storage.events_retention_days, 90);
         assert!(!config.ui.no_color);
+        assert!(!config.scan.passive_only);
+        assert_eq!(config.scan.top_ports, DEFAULT_TOP_PORTS.to_vec());
+        assert_eq!(config.scan.top_ports.len(), 19);
+        assert!(config.scan.dhcp_lease_paths.is_empty());
+        assert_eq!(config.ui.list_view, ListView::Flat);
         assert!(config.validate().is_ok());
     }
 
@@ -549,5 +687,114 @@ no_color = true
         assert!(toml.contains("[scan]"));
         assert!(toml.contains("[storage]"));
         assert!(toml.contains("[ui]"));
+        assert!(toml.contains("passive_only = false"));
+        assert!(toml.contains("top_ports"));
+        assert!(toml.contains("dhcp_lease_paths"));
+        assert!(toml.contains("list_view = \"flat\""));
+    }
+
+    #[test]
+    fn valida_top_ports_unicos_y_limite() {
+        let mut config = Config::default();
+        config.scan.top_ports = vec![22, 22];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicado"), "{err}");
+
+        config.scan.top_ports = vec![0];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("puerto 0"));
+
+        config.scan.top_ports = (1..=65).collect();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("máximo"));
+
+        config.scan.top_ports = (1..=64).collect();
+        assert!(config.validate().is_ok());
+
+        config.scan.top_ports = Vec::new();
+        assert!(config.validate().is_ok(), "una lista vacía es válida");
+    }
+
+    #[test]
+    fn parsea_toml_con_claves_de_fase_2() {
+        let raw = r#"
+[scan]
+passive_only = true
+top_ports = [22, 80, 443]
+dhcp_lease_paths = ["/tmp/leases"]
+
+[ui]
+list_view = "grouped"
+"#;
+        let config: Config = toml::from_str(raw).expect("TOML válido");
+        config.validate().expect("configuración válida");
+        assert!(config.scan.passive_only);
+        assert_eq!(config.scan.top_ports, vec![22, 80, 443]);
+        assert_eq!(
+            config.scan.dhcp_lease_paths,
+            vec!["/tmp/leases".to_string()]
+        );
+        assert_eq!(config.ui.list_view, ListView::Grouped);
+    }
+
+    #[test]
+    fn list_view_invalido_usa_defaults_con_aviso() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\nlist_view = \"cuadricula\"\n").unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(config.ui.list_view, ListView::Flat);
+        assert_eq!(avisos.len(), 1);
+    }
+
+    #[test]
+    fn rutas_de_leases_inexistentes_se_descartan_con_aviso() {
+        let dir = tempfile::tempdir().unwrap();
+        let existente = dir.path().join("leases.txt");
+        std::fs::write(&existente, "1.2.3.4").unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[scan]\ndhcp_lease_paths = [\"{}\", \"/ruta/que/no/existe\"]\n",
+                existente.display()
+            ),
+        )
+        .unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(
+            config.scan.dhcp_lease_paths,
+            vec![existente.display().to_string()]
+        );
+        assert_eq!(avisos.len(), 1);
+        assert!(avisos[0].contains("/ruta/que/no/existe"));
+    }
+
+    #[test]
+    fn save_escribe_y_recarga_la_configuracion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("config.toml");
+        let mut config = Config::default();
+        config.scan.passive_only = true;
+        config.ui.list_view = ListView::Grouped;
+        config.save(&path).expect("guardar configuración");
+        let recargada = Config::load(Some(&path)).expect("recargar configuración");
+        assert_eq!(recargada, config);
+        assert_eq!(recargada.ui.list_view, ListView::Grouped);
+        assert!(recargada.scan.passive_only);
+    }
+
+    #[test]
+    fn list_view_alterna_y_tiene_etiqueta() {
+        assert_eq!(ListView::Flat.toggle(), ListView::Grouped);
+        assert_eq!(ListView::Grouped.toggle(), ListView::Flat);
+        assert_eq!(ListView::Flat.label(), "plana");
+        assert_eq!(ListView::Grouped.to_string(), "grouped");
     }
 }
