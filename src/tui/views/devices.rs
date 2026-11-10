@@ -17,6 +17,9 @@ use crate::config::ListView;
 use crate::repo::devices::Device;
 use crate::tui::app::{grupo_de, App, Filter};
 use crate::tui::theme::{device_icon, Theme};
+use crate::tui::traffic_state::{FocusPanel, DETAIL_MIN_WIDTH};
+
+use super::device_detail;
 
 /// Anchos de las columnas de la lista de equipos.
 #[derive(Debug, Clone, Copy)]
@@ -84,8 +87,32 @@ impl Columnas {
     }
 }
 
-/// Dibuja la pestaña Equipos.
+/// Dibuja la pestaña Equipos, con el panel master-detail si está abierto.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.detail_open() {
+        draw_master_detail(frame, app, area);
+    } else {
+        draw_lista(frame, app, area);
+    }
+}
+
+/// Reparto master-detail: mitad derecha en pantallas anchas, pantalla completa
+/// con foco alternable en pantallas estrechas.
+fn draw_master_detail(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width >= DETAIL_MIN_WIDTH {
+        let columnas = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        draw_lista(frame, app, columnas[0]);
+        device_detail::draw(frame, app, columnas[1]);
+    } else {
+        match app.detail_focus {
+            FocusPanel::Lista => draw_lista(frame, app, area),
+            FocusPanel::Detalle => device_detail::draw(frame, app, area),
+        }
+    }
+}
+
+fn draw_lista(frame: &mut Frame, app: &mut App, area: Rect) {
     let indices = app.visible_indices();
     let total = app.devices.len();
     let visibles = indices.len();
@@ -103,8 +130,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let titulo = format!("{base} · {pista}");
 
+    let estilo_borde = if app.detail_open() && app.detail_focus == FocusPanel::Lista {
+        app.theme.accent
+    } else {
+        app.theme.border
+    };
     let bloque = Block::bordered()
-        .border_style(app.theme.border)
+        .border_style(estilo_borde)
         .title(Span::styled(titulo, app.theme.title));
     let interior = bloque.inner(area);
     frame.render_widget(bloque, area);
@@ -491,6 +523,35 @@ mod tests {
         app.selected = 2;
         dibujar(&mut app, 100, 30);
         assert_eq!(app.table_state.selected(), Some(5));
+    }
+
+    #[test]
+    fn master_detail_ocupa_la_mitad_derecha_en_pantalla_ancha() {
+        let mut app = app_con(vec![dispositivo(1, "10.0.0.1", true, true)]);
+        app.open_detail(1, Vec::new(), false);
+        let contenido = dibujar(&mut app, 120, 30);
+        assert!(contenido.contains("Detalle:"), "falta el panel derecho");
+        assert!(contenido.contains("equipo-1"), "falta la lista izquierda");
+        assert!(contenido.contains("Tráfico"), "falta el bloque de tráfico");
+    }
+
+    #[test]
+    fn master_detail_en_pantalla_estrecha_alterna_con_tab() {
+        let mut app = app_con(vec![dispositivo(1, "10.0.0.1", true, true)]);
+        app.open_detail(1, Vec::new(), true);
+        let contenido = dibujar(&mut app, 80, 24);
+        assert!(
+            contenido.contains("Detalle:"),
+            "con foco en detalle a pantalla completa"
+        );
+        app.toggle_detail_focus();
+        assert_eq!(
+            app.detail_focus,
+            crate::tui::traffic_state::FocusPanel::Lista
+        );
+        let contenido = dibujar(&mut app, 80, 24);
+        assert!(contenido.contains("Equipos"));
+        assert!(!contenido.contains("Detalle: equipo-1"));
     }
 
     #[test]

@@ -61,6 +61,8 @@ pub const DEFAULT_NETBIOS_TIMEOUT_MS: u64 = 500;
 pub struct Config {
     /// Parámetros del escaneo periódico.
     pub scan: ScanConfig,
+    /// Parámetros de captura de tráfico en vivo (Fase 3).
+    pub capture: CaptureConfig,
     /// Parámetros de persistencia.
     pub storage: StorageConfig,
     /// Parámetros de interfaz.
@@ -119,6 +121,56 @@ impl Default for StorageConfig {
         Self {
             db_path: "~/.local/share/almenara/data.db".to_string(),
             events_retention_days: DEFAULT_RETENTION_DAYS,
+        }
+    }
+}
+
+/// Sección [capture] de la configuración: captura de tráfico en vivo (Fase 3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureConfig {
+    /// Activa la captura de paquetes al arrancar.
+    pub enabled: bool,
+    /// Expresión de filtro BPF clásico; vacía = sin filtro.
+    pub filter: String,
+    /// Inspecciona el payload para extraer DNS/SNI. Nunca se persiste ni se copia.
+    pub inspect_payload: bool,
+    /// Límite de paquetes por segundo (0 = sin límite).
+    pub max_pps: u64,
+    /// Extrae el QNAME de las consultas DNS del puerto 53.
+    pub dns_attribution: bool,
+    /// Extrae el SNI de los ClientHello TLS del puerto 443.
+    pub sni_attribution: bool,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            filter: String::new(),
+            inspect_payload: false,
+            max_pps: 0,
+            dns_attribution: true,
+            sni_attribution: true,
+        }
+    }
+}
+
+// Helpers de presentación de la sección [capture] (los usan la barra de estado,
+// los tests y la pestaña Config de fases posteriores).
+#[allow(dead_code)]
+impl CaptureConfig {
+    /// Indica si hay un filtro BPF configurado.
+    pub fn has_filter(&self) -> bool {
+        !self.filter.trim().is_empty()
+    }
+
+    /// Texto del filtro para la barra de estado ("(ninguno)" si está vacío).
+    pub fn filter_label(&self) -> String {
+        if self.has_filter() {
+            self.filter.trim().to_string()
+        } else {
+            "(ninguno)".to_string()
         }
     }
 }
@@ -426,7 +478,7 @@ impl Config {
             })?;
         }
         let contenido = format!(
-            "# Configuración de Almenara (Fase 2)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n{}",
+            "# Configuración de Almenara (Fase 3)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n{}",
             self.to_toml()
         );
         std::fs::write(path, contenido)
@@ -460,7 +512,7 @@ fn write_default_file(path: &Path) -> Result<()> {
         })?;
     }
     let mut content = String::from(
-        "# Configuración de Almenara (Fase 2)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n",
+        "# Configuración de Almenara (Fase 3)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n",
     );
     content.push_str(&Config::default().to_toml());
     std::fs::write(path, content)
@@ -536,6 +588,14 @@ mod tests {
         assert_eq!(config.scan.top_ports.len(), 19);
         assert!(config.scan.dhcp_lease_paths.is_empty());
         assert_eq!(config.ui.list_view, ListView::Flat);
+        assert!(config.capture.enabled);
+        assert_eq!(config.capture.filter, "");
+        assert!(!config.capture.inspect_payload);
+        assert_eq!(config.capture.max_pps, 0);
+        assert!(config.capture.dns_attribution);
+        assert!(config.capture.sni_attribution);
+        assert!(!config.capture.has_filter());
+        assert_eq!(config.capture.filter_label(), "(ninguno)");
         assert!(config.validate().is_ok());
     }
 
@@ -685,8 +745,13 @@ no_color = true
     fn to_toml_contiene_secciones() {
         let toml = Config::default().to_toml();
         assert!(toml.contains("[scan]"));
+        assert!(toml.contains("[capture]"));
         assert!(toml.contains("[storage]"));
         assert!(toml.contains("[ui]"));
+        assert!(toml.contains("inspect_payload = false"));
+        assert!(toml.contains("max_pps = 0"));
+        assert!(toml.contains("dns_attribution = true"));
+        assert!(toml.contains("sni_attribution = true"));
         assert!(toml.contains("passive_only = false"));
         assert!(toml.contains("top_ports"));
         assert!(toml.contains("dhcp_lease_paths"));
@@ -796,5 +861,54 @@ list_view = "grouped"
         assert_eq!(ListView::Grouped.toggle(), ListView::Flat);
         assert_eq!(ListView::Flat.label(), "plana");
         assert_eq!(ListView::Grouped.to_string(), "grouped");
+    }
+
+    #[test]
+    fn parsea_toml_con_claves_de_fase_3() {
+        let raw = r#"
+[capture]
+enabled = false
+filter = "not port 22"
+inspect_payload = true
+max_pps = 5000
+dns_attribution = false
+sni_attribution = false
+"#;
+        let config: Config = toml::from_str(raw).expect("TOML válido");
+        config.validate().expect("configuración válida");
+        assert!(!config.capture.enabled);
+        assert_eq!(config.capture.filter, "not port 22");
+        assert!(config.capture.inspect_payload);
+        assert_eq!(config.capture.max_pps, 5000);
+        assert!(!config.capture.dns_attribution);
+        assert!(!config.capture.sni_attribution);
+        assert!(config.capture.has_filter());
+        assert_eq!(config.capture.filter_label(), "not port 22");
+    }
+
+    #[test]
+    fn capture_max_pps_negativo_usa_defaults_con_aviso() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[capture]\nmax_pps = -1\n").unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(config, Config::default());
+        assert_eq!(avisos.len(), 1);
+        assert!(avisos[0].contains("Configuración no válida"));
+    }
+
+    #[test]
+    fn capture_se_guarda_y_recarga() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.capture.enabled = false;
+        config.capture.filter = "tcp and port 443".to_string();
+        config.capture.inspect_payload = true;
+        config.capture.max_pps = 1000;
+        config.save(&path).expect("guardar configuración");
+        let recargada = Config::load(Some(&path)).expect("recargar configuración");
+        assert_eq!(recargada, config);
+        assert_eq!(recargada.capture.filter_label(), "tcp and port 443");
     }
 }

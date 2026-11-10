@@ -17,9 +17,11 @@
 //! - list_events omite las filas con un event_type desconocido: permite que una
 //!   base de datos escrita por una versión futura no rompa la TUI actual.
 
-// Los DAOs de F2 exponen la API completa exigida por el checklist (incluidas
-// operaciones que la TUI todavía no consume); se permite dead_code en el binario
-// y quedan cubiertos por tests. Se retirará cuando F3/F5 los usen en la interfaz.
+// Los DAOs de F2 y F3 exponen la API completa exigida por el checklist
+// (incluidas operaciones que la TUI todavía no consume); se permite dead_code en
+// el binario y quedan cubiertos por tests.
+#[allow(dead_code)]
+pub mod connections;
 #[allow(dead_code)]
 pub mod device_services;
 pub mod devices;
@@ -28,21 +30,27 @@ pub mod discovery_sources;
 pub mod events;
 pub mod interfaces;
 pub mod migrations;
+#[allow(dead_code)]
+pub mod traffic_snapshot;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+// El alias evita el choque entre rusqlite::Connection y el struct Connection de
+// la tabla CONNECTIONS que reexporta esta capa.
+use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, Row};
 
 use crate::classify::{DeviceType, OsFamily};
 use crate::error::{Error, Result};
 
+pub use connections::{Connection, ConnectionProtocol, ConnectionUpdate};
 pub use device_services::{DeviceService, Protocol, ServiceUpsert};
 pub use devices::{ChangeSet, Device, DeviceUpsert};
 pub use discovery_sources::{DiscoverySource, DiscoverySourceRow};
 pub use events::{DeviceEvent, EventType};
 pub use interfaces::Interface;
+pub use traffic_snapshot::{SnapshotUpdate, TrafficSnapshot};
 
 /// Tiempo máximo que SQLite espera a que se libere un bloqueo (en milisegundos).
 const TIEMPO_ESPERA_BLOQUEO_MS: u64 = 5_000;
@@ -60,7 +68,7 @@ const SQL_SELECCION_DISPOSITIVO: &str =
 /// Repositorio SQLite de Almenara.
 #[derive(Debug)]
 pub struct Repo {
-    conn: Connection,
+    conn: SqliteConnection,
     path: PathBuf,
 }
 
@@ -82,7 +90,8 @@ impl Repo {
             })?;
         }
 
-        let mut conn = Connection::open(path).map_err(|err| Error::database_open(path, &err))?;
+        let mut conn =
+            SqliteConnection::open(path).map_err(|err| Error::database_open(path, &err))?;
 
         conn.busy_timeout(Duration::from_millis(TIEMPO_ESPERA_BLOQUEO_MS))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -111,7 +120,7 @@ impl Repo {
 
     /// Acceso de solo lectura a la conexión (solo para pruebas internas).
     #[cfg(test)]
-    pub fn connection(&self) -> &Connection {
+    pub fn connection(&self) -> &SqliteConnection {
         &self.conn
     }
 
@@ -465,6 +474,56 @@ impl Repo {
     }
 }
 
+// API de persistencia de la Fase 3 (tráfico en vivo). Se permite dead_code
+// hasta que la TUI de F3 la consuma, igual que ocurre con los DAOs de F2.
+#[allow(dead_code)]
+impl Repo {
+    /// Guarda (o sobrescribe) el snapshot de tráfico de un dispositivo.
+    ///
+    /// TRAFFIC_SNAPSHOT es una tabla de estado, no histórica: el upsert es por
+    /// device_id y refresca updated_at en cada ciclo de 5 s.
+    pub fn upsert_snapshot(&mut self, snapshot: &SnapshotUpdate) -> Result<()> {
+        traffic_snapshot::upsert(&self.conn, snapshot)
+    }
+
+    /// Lista los snapshots de tráfico persistidos, ordenados por device_id.
+    ///
+    /// La TUI los usa como semilla de las sparklines al arrancar.
+    pub fn list_snapshots(&self) -> Result<Vec<TrafficSnapshot>> {
+        traffic_snapshot::list(&self.conn)
+    }
+
+    /// Inserta o actualiza una conexión y devuelve su id.
+    ///
+    /// Con id en None el upsert es por 5-tuple canónica; con id en Some actualiza
+    /// esa fila (y la reinserta si un ciclo de purga ya la había borrado).
+    pub fn upsert_connection(&mut self, conexion: &ConnectionUpdate) -> Result<i64> {
+        connections::upsert(&self.conn, conexion)
+    }
+
+    /// Lista las conexiones activas ordenadas por actividad reciente.
+    ///
+    /// Con filtro None devuelve todas; con Some(texto) casa por protocolo,
+    /// estado o IP de origen/destino.
+    pub fn list_connections(&self, filtro: Option<&str>) -> Result<Vec<Connection>> {
+        connections::list(&self.conn, filtro)
+    }
+
+    /// Purga las conexiones que han superado su timeout sin tráfico.
+    ///
+    /// Se pasa `now` explícito (SystemTime en vez del Instant de la
+    /// especificación) porque la purga compara contra fechas RFC 3339
+    /// persistidas; en producción se usa SystemTime::now().
+    pub fn prune_expired_connections(&mut self, now: SystemTime) -> Result<usize> {
+        connections::prune_expired(&self.conn, now)
+    }
+
+    /// Recupera una conexión por id (panel de cabeceras de la tecla v).
+    pub fn get_connection(&self, id: i64) -> Result<Option<Connection>> {
+        connections::get(&self.conn, id)
+    }
+}
+
 /// Marca temporal actual en RFC 3339 UTC con precisión de segundos.
 ///
 /// Es el formato único de la capa de persistencia; lo usan las migraciones y
@@ -580,7 +639,7 @@ mod tests {
 
         assert!(ruta.exists(), "debe existir el fichero de base de datos");
         assert_eq!(repo.path(), ruta.as_path());
-        assert_eq!(repo.schema_version().expect("leer versión"), 2);
+        assert_eq!(repo.schema_version().expect("leer versión"), 3);
         assert_eq!(repo.count_devices().expect("contar dispositivos"), 0);
     }
 
@@ -590,11 +649,11 @@ mod tests {
         let ruta = directorio.path().join("data.db");
 
         let primera = Repo::init(&ruta).expect("primer init");
-        assert_eq!(primera.schema_version().expect("leer versión"), 2);
+        assert_eq!(primera.schema_version().expect("leer versión"), 3);
         drop(primera);
 
         let segunda = Repo::init(&ruta).expect("segundo init sobre el mismo fichero");
-        assert_eq!(segunda.schema_version().expect("leer versión"), 2);
+        assert_eq!(segunda.schema_version().expect("leer versión"), 3);
     }
 
     #[test]
@@ -608,12 +667,13 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'table'
                    AND name IN ('INTERFACES', 'DEVICES', 'DEVICE_EVENTS',
-                                 'DEVICE_SERVICES', 'DISCOVERY_SOURCES', 'SCHEMA_MIGRATIONS')",
+                                 'DEVICE_SERVICES', 'DISCOVERY_SOURCES',
+                                 'SCHEMA_MIGRATIONS', 'TRAFFIC_SNAPSHOT', 'CONNECTIONS')",
                 [],
                 |fila| fila.get(0),
             )
             .expect("contar tablas del esquema");
-        assert_eq!(tablas, 6, "deben existir las seis tablas del esquema");
+        assert_eq!(tablas, 8, "deben existir las ocho tablas del esquema");
 
         let modo: String = repo
             .connection()
@@ -1006,7 +1066,7 @@ mod tests {
 
         // El segundo repositorio se abre con el primero aún vivo (modo WAL).
         let mut segundo = Repo::init(&ruta).expect("segundo repositorio sobre el mismo fichero");
-        assert_eq!(segundo.schema_version().expect("leer versión"), 2);
+        assert_eq!(segundo.schema_version().expect("leer versión"), 3);
         assert_eq!(segundo.list_interfaces().expect("listar").len(), 1);
 
         segundo
@@ -1245,5 +1305,163 @@ mod tests {
                 .hostname,
             None
         );
+    }
+
+    #[test]
+    fn upsert_snapshot_y_list_snapshots_persisten_por_dispositivo() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        let primero = SnapshotUpdate {
+            device_id: id,
+            bytes_in: 1_024,
+            bytes_out: 2_048,
+            packets_in: 10,
+            packets_out: 20,
+            peak_bps: 4_096,
+            window_s: 60,
+        };
+        repo.upsert_snapshot(&primero).expect("guardar snapshot");
+
+        let snapshots = repo.list_snapshots().expect("listar snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].device_id, id);
+        assert_eq!(snapshots[0].bytes_in, 1_024);
+        assert_eq!(snapshots[0].bytes_out, 2_048);
+        assert_eq!(snapshots[0].peak_bps, 4_096);
+        assert_eq!(snapshots[0].window_s, 60);
+        assert!(snapshots[0].updated_at.ends_with('Z'));
+
+        // El siguiente ciclo de 5 s sobrescribe la misma fila.
+        let segundo = SnapshotUpdate {
+            bytes_in: 3_000,
+            peak_bps: 8_192,
+            ..primero
+        };
+        repo.upsert_snapshot(&segundo)
+            .expect("sobrescribir snapshot");
+        let snapshots = repo.list_snapshots().expect("listar snapshots");
+        assert_eq!(snapshots.len(), 1, "un equipo solo tiene un snapshot");
+        assert_eq!(snapshots[0].bytes_in, 3_000);
+        assert_eq!(snapshots[0].peak_bps, 8_192);
+    }
+
+    #[test]
+    fn upsert_connection_por_cinco_tupla_lista_filtra_y_get() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        let conexion = ConnectionUpdate {
+            id: None,
+            device_id: Some(id),
+            protocol: ConnectionProtocol::Tcp,
+            src_ip: "192.168.1.50".to_string(),
+            src_port: Some(40_000),
+            dst_ip: "93.184.216.34".to_string(),
+            dst_port: Some(443),
+            state: Some("ESTABLISHED".to_string()),
+            bytes_in: 100,
+            bytes_out: 200,
+        };
+        let id_conexion = repo
+            .upsert_connection(&conexion)
+            .expect("insertar conexión");
+        assert!(id_conexion > 0);
+
+        let conexiones = repo.list_connections(None).expect("listar conexiones");
+        assert_eq!(conexiones.len(), 1);
+        assert_eq!(conexiones[0].id, id_conexion);
+        assert_eq!(conexiones[0].device_id, Some(id));
+        assert_eq!(conexiones[0].protocol, ConnectionProtocol::Tcp);
+        assert_eq!(conexiones[0].src_port, Some(40_000));
+        assert_eq!(conexiones[0].dst_port, Some(443));
+
+        // El update por 5-tuple conserva el id y first_seen.
+        let mut actualizada = conexion.clone();
+        actualizada.bytes_in = 500;
+        actualizada.state = Some("CLOSE_WAIT".to_string());
+        let id_repetido = repo
+            .upsert_connection(&actualizada)
+            .expect("actualizar conexión");
+        assert_eq!(id_repetido, id_conexion);
+        let conexiones = repo.list_connections(None).expect("listar conexiones");
+        assert_eq!(conexiones.len(), 1, "no debe duplicar por 5-tuple");
+        assert_eq!(conexiones[0].bytes_in, 500);
+        assert_eq!(conexiones[0].state.as_deref(), Some("CLOSE_WAIT"));
+
+        let recuperada = repo
+            .get_connection(id_conexion)
+            .expect("buscar conexión")
+            .expect("debe existir");
+        assert_eq!(recuperada.id, id_conexion);
+        assert!(repo
+            .get_connection(id_conexion + 1_000)
+            .expect("buscar inexistente")
+            .is_none());
+
+        // Filtros de la vista Conexiones.
+        assert_eq!(
+            repo.list_connections(Some("tcp"))
+                .expect("filtrar por protocolo")
+                .len(),
+            1
+        );
+        assert_eq!(
+            repo.list_connections(Some("CLOSE_WAIT"))
+                .expect("filtrar por estado")
+                .len(),
+            1
+        );
+        assert_eq!(
+            repo.list_connections(Some("93.184.216"))
+                .expect("filtrar por IP")
+                .len(),
+            1
+        );
+        assert!(repo
+            .list_connections(Some("udp"))
+            .expect("filtrar sin coincidencias")
+            .is_empty());
+    }
+
+    #[test]
+    fn prune_expired_connections_purga_por_timeout_desde_el_repo() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, _) = repo_con_dispositivo(&directorio);
+
+        // Instante fijo para que el corte sea determinista: 2027-01-15T08:00:00Z.
+        let ahora = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let fecha_hace = |segundos: u64| {
+            let instante: chrono::DateTime<chrono::Utc> = ahora.into();
+            (instante - chrono::Duration::seconds(segundos as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+
+        // TCP de hace 301 s (purga), UDP de hace 59 s (se conserva) e ICMP de
+        // hace 31 s (purga).
+        for (protocolo, estado, segundos) in [
+            ("tcp", Some("ESTABLISHED"), 301_u64),
+            ("udp", None, 59),
+            ("icmp", None, 31),
+        ] {
+            repo.connection()
+                .execute(
+                    "INSERT INTO CONNECTIONS (
+                         device_id, protocol, src_ip, src_port, dst_ip, dst_port,
+                         state, first_seen, last_seen
+                     ) VALUES (NULL, ?1, '10.0.0.1', NULL, '10.0.0.2', NULL, ?2, ?3, ?3)",
+                    params![protocolo, estado, fecha_hace(segundos)],
+                )
+                .expect("insertar conexión antigua");
+        }
+
+        let purgadas = repo
+            .prune_expired_connections(ahora)
+            .expect("purgar conexiones caducadas");
+        assert_eq!(purgadas, 2, "se purgan TCP (300 s) e ICMP (30 s)");
+
+        let restantes = repo.list_connections(None).expect("listar conexiones");
+        assert_eq!(restantes.len(), 1);
+        assert_eq!(restantes[0].protocol, ConnectionProtocol::Udp);
     }
 }

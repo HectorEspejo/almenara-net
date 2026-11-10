@@ -10,6 +10,7 @@ use std::time::Duration;
 use clap::{ArgAction, Parser};
 
 mod capabilities;
+mod capture;
 mod classify;
 mod config;
 mod discovery;
@@ -20,6 +21,7 @@ mod notifier;
 mod oui;
 mod repo;
 mod scanner;
+mod traffic;
 mod tui;
 
 use config::Config;
@@ -38,8 +40,9 @@ use tui::theme::Theme;
     version,
     about = "Monitor de red en TUI para Linux: descubre los equipos de la red local",
     long_about = "Almenara descubre los equipos de la red local (ARP, ICMP, reverse DNS y OUI), \
-                  guarda el inventario en SQLite y los muestra en una TUI. \
-                  Fase 1: fundación y descubrimiento básico.",
+                  guarda el inventario en SQLite y lo muestra en una TUI. \
+                  Fase 3: tráfico en vivo con AF_PACKET + TPACKET_V3, conexiones activas \
+                  y detalle de equipo.",
     disable_help_flag = true,
     disable_version_flag = true,
     help_template = "Ayuda de {name} — versión {version}\n\n{about-with-newline}\nUso: {usage}\n\nOpciones:\n{options}"
@@ -136,6 +139,21 @@ async fn ejecutar(cli: Cli) -> Result<()> {
         "Base de datos abierta y migrada"
     );
 
+    // Semilla de Fase 3: último snapshot de tráfico por dispositivo (para no
+    // arrancar con la TUI vacía) y purga de las conexiones caducadas de la
+    // ejecución anterior.
+    let snapshots_trafico = repo.list_snapshots().unwrap_or_else(|err| {
+        tracing::warn!(%err, "no se pudo leer TRAFFIC_SNAPSHOT");
+        Vec::new()
+    });
+    match repo.prune_expired_connections(std::time::SystemTime::now()) {
+        Ok(borradas) if borradas > 0 => {
+            tracing::info!(borradas, "conexiones caducadas purgadas al arrancar");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "no se pudieron purgar las conexiones caducadas"),
+    }
+
     // 5) Detección y persistencia inicial de interfaces, datos persistidos y poda.
     match scanner::persistir_interfaces_iniciales(&mut repo) {
         Ok(cantidad) => tracing::info!(
@@ -203,14 +221,59 @@ async fn ejecutar(cli: Cli) -> Result<()> {
         );
     }
 
-    // Interfaces con IPv4 para unir los grupos multicast de mDNS/SSDP. Unirse
-    // con INADDR_ANY puede no seleccionar la interfaz correcta en Wi-Fi.
-    let ips_multicast: Vec<std::net::Ipv4Addr> = scanner::interfaces::detect()
+    // Interfaces detectadas: multicast mDNS/SSDP, interfaces de captura y IP
+    // propias del host (para la atribución [host] de las conexiones).
+    let interfaces_detectadas = scanner::interfaces::detect();
+    let ips_multicast: Vec<std::net::Ipv4Addr> = interfaces_detectadas
         .iter()
         .filter_map(|iface| iface.ipv4)
         .collect();
-
+    let interfaces_captura: Vec<capture::CaptureInterface> = match &config.scan.interfaces {
+        config::InterfacesSetting::Auto => interfaces_detectadas
+            .iter()
+            .filter(|iface| iface.is_up && iface.ipv4.is_some())
+            .map(|iface| capture::CaptureInterface::new(iface.name.clone(), iface.ipv4))
+            .collect(),
+        config::InterfacesSetting::Names(nombres) => interfaces_detectadas
+            .iter()
+            .filter(|iface| iface.is_up && iface.ipv4.is_some() && nombres.contains(&iface.name))
+            .map(|iface| capture::CaptureInterface::new(iface.name.clone(), iface.ipv4))
+            .collect(),
+    };
+    let mut ips_propias: std::collections::HashSet<std::net::IpAddr> = interfaces_detectadas
+        .iter()
+        .filter_map(|iface| iface.ipv4.map(std::net::IpAddr::V4))
+        .collect();
+    ips_propias.insert(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    ips_propias.insert(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
     tracing::debug!(interfaces = ?ips_multicast, "interfaces para multicast mDNS/SSDP");
+
+    // 6b) Monitor de tráfico en vivo (Fase 3). La captura de paquetes requiere
+    // CAP_NET_RAW; las conexiones de /proc/net/* y conntrack funcionan igualmente.
+    let dispositivos_trafico: Vec<traffic::DeviceRef> = app
+        .devices
+        .iter()
+        .map(|device| traffic::DeviceRef::new(device.id, device.ip.clone()))
+        .collect();
+    let (traffic_handle, estado_captura, avisos_captura) = traffic::spawn(
+        &config,
+        interfaces_captura,
+        ips_propias,
+        dispositivos_trafico.clone(),
+        capabilities.raw_sockets,
+        event_tx.clone(),
+    );
+    app.traffic.capture = estado_captura;
+    app.set_traffic_seed(snapshots_trafico);
+    app.traffic_command_tx = Some(traffic_handle.command_tx.clone());
+    for (nivel, mensaje) in avisos_captura {
+        app.push_notification(nivel, mensaje);
+    }
+    let _ = traffic_handle
+        .command_tx
+        .try_send(events::TrafficCommand::UpdateDevices(dispositivos_trafico));
+    let traffic_command_tx = traffic_handle.command_tx.clone();
+    let mut traffic_join = traffic_handle.join;
     let scan_tx = event_tx.clone();
     let scan_task = tokio::spawn(async move {
         let mut command_rx = command_rx;
@@ -249,6 +312,13 @@ async fn ejecutar(cli: Cli) -> Result<()> {
     let _ = event_tx.send(AppEvent::Quit);
     scan_task.abort();
     let _ = scan_task.await;
+    let _ = traffic_command_tx.try_send(events::TrafficCommand::Stop);
+    if tokio::time::timeout(Duration::from_secs(2), &mut traffic_join)
+        .await
+        .is_err()
+    {
+        traffic_join.abort();
+    }
     tracing::info!("Almenara finalizado");
     resultado
 }

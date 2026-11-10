@@ -39,8 +39,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
     ];
 
-    // Fingerprint de SO por dispositivo (solo lectura): el detalle completo
-    // llegará con la pestaña de detalle de Fase 3; aquí se muestra la familia.
+    // Fingerprint de SO por dispositivo (solo lectura): el detalle completo se
+    // abre con Enter en la pestaña Equipos (panel master-detail de Fase 3).
     lineas.push(Line::from(Span::styled(
         "Fingerprint de SO por dispositivo",
         app.theme.accent,

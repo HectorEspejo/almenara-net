@@ -42,6 +42,10 @@ pub enum Error {
     #[error("error de escaneo: {0}")]
     Scan(String),
 
+    /// Error del subsistema de captura de tráfico (AF_PACKET/TPACKET_V3).
+    #[error("error de captura: {0}")]
+    Capture(String),
+
     /// Error de terminal (ratatui/crossterm).
     #[error("error de terminal: {0}")]
     Terminal(String),

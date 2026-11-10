@@ -16,13 +16,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bloque, area);
 
     let fase_futura = match app.tab {
-        Tab::Trafico | Tab::Conexiones => "Fase 3",
-        Tab::Historico => "Fase 5",
-        Tab::Alertas => "Fase 6",
+        Tab::Historico => "Fase 5 (histórico, rollups y eventos)",
+        Tab::Alertas => "Fase 6 (alertas locales y de escritorio)",
         _ => "una fase posterior",
     };
     let lineas = vec![
-        Line::from(Span::styled("no disponible en F1", app.theme.warning)),
+        Line::from(Span::styled("no disponible todavía", app.theme.warning)),
         Line::from(""),
         Line::from(Span::styled(
             format!("Esta pestaña llegará en {fase_futura}."),
@@ -77,7 +76,8 @@ mod tests {
             .iter()
             .map(|celda| celda.symbol())
             .collect();
-        assert!(contenido.contains("no disponible en F1"));
+        assert!(contenido.contains("no disponible todavía"));
         assert!(contenido.contains("Histórico"));
+        assert!(contenido.contains("Fase 5"));
     }
 }

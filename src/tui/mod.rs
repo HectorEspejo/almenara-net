@@ -7,6 +7,7 @@
 pub mod app;
 pub mod keys;
 pub mod theme;
+pub mod traffic_state;
 pub mod views;
 
 use std::time::{Duration, Instant};
@@ -19,10 +20,11 @@ use ratatui::DefaultTerminal;
 use tokio::sync::broadcast;
 
 use crate::error::{Error, Result};
-use crate::events::{AppEvent, ScanCommand};
+use crate::events::{AppEvent, ScanCommand, TrafficCommand};
 use crate::notifier::Level;
-use crate::repo::Repo;
+use crate::repo::{ConnectionProtocol, ConnectionUpdate, Repo, SnapshotUpdate};
 use crate::scanner::{self, OnlineTracker, ScanReport};
+use crate::traffic::DeviceRef;
 
 use app::{Action, App};
 
@@ -134,6 +136,9 @@ pub async fn run(
     if let Some(tx) = &app.command_tx {
         let _ = tx.try_send(ScanCommand::Stop);
     }
+    if let Some(tx) = &app.traffic_command_tx {
+        let _ = tx.try_send(TrafficCommand::Stop);
+    }
     restore_terminal();
     resultado
 }
@@ -180,6 +185,15 @@ async fn bucle(
                     Ok(AppEvent::Devices(report)) => {
                         procesar_escaneo(*report, app, repo, tracker);
                     }
+                    Ok(AppEvent::Traffic(update)) => {
+                        app.apply_traffic(*update);
+                        if app.should_persist_traffic() {
+                            persistir_trafico(app, repo);
+                        }
+                    }
+                    Ok(AppEvent::CaptureNotice { level, message }) => {
+                        app.push_notification(level, message);
+                    }
                     Ok(AppEvent::Quit) => app.should_quit = true,
                     Err(broadcast::error::RecvError::Lagged(perdidos)) => {
                         app.push_notification(
@@ -192,6 +206,9 @@ async fn bucle(
             }
             _ = ticker.tick() => {
                 app.tick();
+                if app.traffic.has_live_data() && app.should_persist_traffic() {
+                    persistir_trafico(app, repo);
+                }
             }
         }
     }
@@ -237,6 +254,24 @@ fn aplicar_accion(accion: Action, app: &mut App, repo: &mut Repo) {
                     format!("No se pudo guardar [ui].list_view: {err}"),
                 ),
             }
+        }
+        Action::OpenDetail { device_id } => {
+            let drill_down = app.tab == crate::tui::app::Tab::Trafico;
+            let servicios = match repo.list_services(device_id) {
+                Ok(servicios) => servicios,
+                Err(err) => {
+                    app.push_notification(
+                        Level::Warn,
+                        format!("No se pudieron cargar los servicios del equipo: {err}"),
+                    );
+                    Vec::new()
+                }
+            };
+            if drill_down {
+                app.tab = crate::tui::app::Tab::Equipos;
+                reseleccionar_por_id(app, device_id);
+            }
+            app.open_detail(device_id, servicios, drill_down);
         }
         Action::SetDeviceTypeManual { id, value } => {
             // La recarga puede mover el equipo de grupo en la vista agrupada:
@@ -362,6 +397,7 @@ fn procesar_escaneo(
                 ));
             }
             app.apply_reconciliation(reconciliacion);
+            actualizar_mapa_dispositivos(app);
             app.push_notification(Level::Info, resumen);
             for notification in notificaciones {
                 app.push_notification_obj(notification);
@@ -377,6 +413,78 @@ fn procesar_escaneo(
             );
         }
     }
+}
+
+/// Persiste el snapshot por dispositivo y las conexiones activas cada 5 s.
+///
+/// Es la única escritura de tráfico en SQLite y se ejecuta en el hilo de la TUI,
+/// respetando la regla de una única conexión de escritura.
+fn persistir_trafico(app: &App, repo: &mut Repo) {
+    for estadisticas in &app.traffic.devices {
+        let snapshot = SnapshotUpdate {
+            device_id: estadisticas.device_id,
+            bytes_in: estadisticas.bytes_in.min(i64::MAX as u64) as i64,
+            bytes_out: estadisticas.bytes_out.min(i64::MAX as u64) as i64,
+            packets_in: estadisticas.packets_in.min(i64::MAX as u64) as i64,
+            packets_out: estadisticas.packets_out.min(i64::MAX as u64) as i64,
+            peak_bps: estadisticas.peak_bps.min(i64::MAX as u64) as i64,
+            window_s: 60,
+        };
+        if let Err(err) = repo.upsert_snapshot(&snapshot) {
+            tracing::warn!(%err, "no se pudo guardar el snapshot de tráfico");
+            return;
+        }
+    }
+    for conexion in &app.traffic.connections {
+        let update = ConnectionUpdate {
+            id: None,
+            device_id: conexion.device_id,
+            protocol: protocolo_repo(conexion.protocol()),
+            src_ip: conexion.origin.ip.to_string(),
+            src_port: conexion.origin.port,
+            dst_ip: conexion.destination.ip.to_string(),
+            dst_port: conexion.destination.port,
+            state: conexion.state.clone(),
+            bytes_in: conexion.bytes_in.min(i64::MAX as u64) as i64,
+            bytes_out: conexion.bytes_out.min(i64::MAX as u64) as i64,
+        };
+        if let Err(err) = repo.upsert_connection(&update) {
+            tracing::warn!(%err, "no se pudo guardar la conexión");
+            return;
+        }
+    }
+    match repo.prune_expired_connections(std::time::SystemTime::now()) {
+        Ok(borradas) if borradas > 0 => {
+            tracing::debug!(borradas, "conexiones caducadas purgadas");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "no se pudieron purgar las conexiones"),
+    }
+}
+
+/// Traduce el protocolo de captura al de la capa de persistencia.
+fn protocolo_repo(protocolo: crate::capture::Protocol) -> ConnectionProtocol {
+    match protocolo {
+        crate::capture::Protocol::Tcp => ConnectionProtocol::Tcp,
+        crate::capture::Protocol::Udp => ConnectionProtocol::Udp,
+        crate::capture::Protocol::Icmp | crate::capture::Protocol::Icmpv6 => {
+            ConnectionProtocol::Icmp
+        }
+        crate::capture::Protocol::Other => ConnectionProtocol::Other,
+    }
+}
+
+/// Envía a la tarea de tráfico el mapa actual de dispositivos (id e IP).
+fn actualizar_mapa_dispositivos(app: &App) {
+    let Some(tx) = &app.traffic_command_tx else {
+        return;
+    };
+    let devices: Vec<DeviceRef> = app
+        .devices
+        .iter()
+        .map(|device| DeviceRef::new(device.id, device.ip.clone()))
+        .collect();
+    let _ = tx.try_send(TrafficCommand::UpdateDevices(devices));
 }
 
 #[cfg(test)]
@@ -398,6 +506,103 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[test]
+    fn persistir_trafico_guarda_snapshot_y_conexiones() {
+        use crate::capture::aggregate::DeviceTraffic;
+        use crate::capture::{ConnectionKey, Endpoint, HeaderSnapshot, Protocol};
+        use crate::repo::{DeviceUpsert, Interface};
+        use crate::traffic::{ConnectionView, EndpointView};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("directorio temporal");
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repositorio");
+        let id_interfaz = repo
+            .upsert_interface(&Interface::without_id(
+                "eth0",
+                Some("aa:bb:cc:dd:ee:ff".to_string()),
+                Some("192.168.1.10".to_string()),
+                Some("255.255.255.0".to_string()),
+                Some("192.168.1.1".to_string()),
+                true,
+                "2026-11-10T10:00:00Z",
+            ))
+            .expect("interfaz");
+        let (device_id, _) = repo
+            .upsert_device(&DeviceUpsert {
+                mac: "aa:bb:cc:dd:ee:01".to_string(),
+                ip: "192.168.1.42".to_string(),
+                hostname: Some("laptop".to_string()),
+                vendor: None,
+                interface_id: id_interfaz,
+                device_type: "pc".to_string(),
+            })
+            .expect("dispositivo");
+
+        let mut app = app_prueba();
+        app.traffic.devices = vec![DeviceTraffic {
+            device_id,
+            bytes_in: 1000,
+            bytes_out: 500,
+            packets_in: 10,
+            packets_out: 5,
+            rate_in: 100,
+            rate_out: 50,
+            peak_bps: 1200,
+            series_60s_in: [0; 60],
+            series_60s_out: [0; 60],
+            series_5min_in: [0; 60],
+            series_5min_out: [0; 60],
+            top_ports: Vec::new(),
+        }];
+        app.traffic.connections = vec![ConnectionView {
+            key: ConnectionKey::from_endpoints(
+                Protocol::Tcp,
+                Endpoint::new("192.168.1.42".parse().unwrap(), Some(40000)),
+                Endpoint::new("1.1.1.1".parse().unwrap(), Some(443)),
+            ),
+            state: Some("ESTABLISHED".to_string()),
+            bytes_in: 400,
+            bytes_out: 200,
+            age: Duration::from_secs(30),
+            idle: Duration::from_secs(1),
+            pid: Some(42),
+            comm: Some("firefox".to_string()),
+            device_id: Some(device_id),
+            origin: EndpointView {
+                ip: "192.168.1.42".parse().unwrap(),
+                port: Some(40000),
+                device_id: Some(device_id),
+                tag: None,
+            },
+            destination: EndpointView {
+                ip: "1.1.1.1".parse().unwrap(),
+                port: Some(443),
+                device_id: None,
+                tag: Some("?"),
+            },
+            headers: Some(HeaderSnapshot::default()),
+            seen_capture: true,
+            seen_kernel: true,
+        }];
+
+        persistir_trafico(&app, &mut repo);
+
+        let snapshots = repo.list_snapshots().expect("listar snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].device_id, device_id);
+        assert_eq!(snapshots[0].bytes_in, 1000);
+        assert_eq!(snapshots[0].window_s, 60);
+        let conexiones = repo.list_connections(None).expect("listar conexiones");
+        assert_eq!(conexiones.len(), 1);
+        assert_eq!(conexiones[0].protocol.as_str(), "tcp");
+        assert_eq!(conexiones[0].state.as_deref(), Some("ESTABLISHED"));
+        assert_eq!(conexiones[0].device_id, Some(device_id));
+
+        // Un segundo ciclo no duplica la conexión (upsert por 5-tuple).
+        persistir_trafico(&app, &mut repo);
+        assert_eq!(repo.list_connections(None).expect("listar").len(), 1);
     }
 
     #[test]
