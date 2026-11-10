@@ -1,0 +1,31 @@
+[package]
+name = "almenara"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Monitor de red en TUI para Linux: descubre y lista los equipos de la red local"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+dirs = "6"
+futures = "0.3"
+libc = "0.2"
+ouidb = { package = "macaddr-ouidb", version = "0.3.1", default-features = false, features = ["std"] }
+pnet = "0.35"
+ratatui = "0.30"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
