@@ -5,6 +5,7 @@
 //! una plantilla comentada. Cualquier error de sintaxis o validación hace que se
 //! usen los valores por defecto con un aviso (nunca impide arrancar).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -65,10 +66,14 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// Parámetros de persistencia.
     pub storage: StorageConfig,
+    /// Parámetros del histórico (Fase 5).
+    pub history: HistoryConfig,
     /// Parámetros de interfaz.
     pub ui: UiConfig,
     /// Parámetros del motor de inferencia (Fase 4).
     pub inference: InferenceConfig,
+    /// Parámetros del motor de alertas (Fase 6).
+    pub alerts: AlertsConfig,
 }
 
 /// Sección [scan] de la configuración.
@@ -124,6 +129,120 @@ impl Default for StorageConfig {
             db_path: "~/.local/share/almenara/data.db".to_string(),
             events_retention_days: DEFAULT_RETENTION_DAYS,
         }
+    }
+}
+
+/// Valores por defecto de [history] (§7.12).
+pub const DEFAULT_MINUTE_DAYS: u32 = 2;
+/// Días de retención de las horas.
+pub const DEFAULT_HOUR_DAYS: u32 = 90;
+/// Días de retención de días, inventario y sesiones.
+pub const DEFAULT_DAY_DAYS: u32 = 730;
+/// Días de retención de destinos por hora.
+pub const DEFAULT_DESTINATION_DAYS: u32 = 30;
+/// Claves normales por sujeto, dimensión y cubo.
+pub const DEFAULT_TOP_KEYS: usize = 20;
+/// Tamaño de la base de datos a partir del cual se avisa (MB).
+pub const DEFAULT_MAX_DB_MB: u64 = 1024;
+/// Mínimo aceptado de max_db_mb.
+pub const MIN_MAX_DB_MB: u64 = 64;
+
+/// Sección [history]: retención y límites del histórico de F5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Guardar histórico (rollups e inventario).
+    pub enabled: bool,
+    /// Retención de minutos en días (48 h con el valor por defecto).
+    pub minute_days: u32,
+    /// Retención de horas en días.
+    pub hour_days: u32,
+    /// Retención de días, inventario y sesiones en días.
+    pub day_days: u32,
+    /// Retención de destinos por hora en días (0 = no guardarlos).
+    pub destination_days: u32,
+    /// Claves normales por sujeto, dimensión y cubo; el resto, «otros».
+    pub top_keys: usize,
+    /// Aviso cuando la base de datos supera este tamaño en MB.
+    pub max_db_mb: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minute_days: DEFAULT_MINUTE_DAYS,
+            hour_days: DEFAULT_HOUR_DAYS,
+            day_days: DEFAULT_DAY_DAYS,
+            destination_days: DEFAULT_DESTINATION_DAYS,
+            top_keys: DEFAULT_TOP_KEYS,
+            max_db_mb: DEFAULT_MAX_DB_MB,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// Retención equivalente para el DAO del histórico.
+    pub fn retention(&self) -> crate::history::Retention {
+        crate::history::Retention {
+            minute_days: self.minute_days,
+            hour_days: self.hour_days,
+            day_days: self.day_days,
+            destination_days: self.destination_days,
+        }
+    }
+
+    /// Corrige los valores fuera de rango con el valor por defecto y avisa.
+    ///
+    /// La configuración nunca aborta el arranque: un valor inválido se avisa una
+    /// vez y se sustituye por el valor por defecto (§7.12).
+    pub fn validar(&mut self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if !(1..=7).contains(&self.minute_days) {
+            avisos.push(format!(
+                "[history].minute_days = {} no es válido (1-7); se usa {DEFAULT_MINUTE_DAYS}",
+                self.minute_days
+            ));
+            self.minute_days = DEFAULT_MINUTE_DAYS;
+        }
+        if !(7..=365).contains(&self.hour_days) {
+            avisos.push(format!(
+                "[history].hour_days = {} no es válido (7-365); se usa {DEFAULT_HOUR_DAYS}",
+                self.hour_days
+            ));
+            self.hour_days = DEFAULT_HOUR_DAYS;
+        }
+        if !(30..=3650).contains(&self.day_days) {
+            avisos.push(format!(
+                "[history].day_days = {} no es válido (30-3650); se usa {DEFAULT_DAY_DAYS}",
+                self.day_days
+            ));
+            self.day_days = DEFAULT_DAY_DAYS;
+        }
+        if self.destination_days > self.hour_days {
+            avisos.push(format!(
+                "[history].destination_days = {} no puede superar hour_days = {}; se usa {}",
+                self.destination_days,
+                self.hour_days,
+                DEFAULT_DESTINATION_DAYS.min(self.hour_days)
+            ));
+            self.destination_days = DEFAULT_DESTINATION_DAYS.min(self.hour_days);
+        }
+        if !(5..=100).contains(&self.top_keys) {
+            avisos.push(format!(
+                "[history].top_keys = {} no es válido (5-100); se usa {DEFAULT_TOP_KEYS}",
+                self.top_keys
+            ));
+            self.top_keys = DEFAULT_TOP_KEYS;
+        }
+        if self.max_db_mb < MIN_MAX_DB_MB {
+            avisos.push(format!(
+                "[history].max_db_mb = {} no es válido (mínimo {MIN_MAX_DB_MB}); se usa {DEFAULT_MAX_DB_MB}",
+                self.max_db_mb
+            ));
+            self.max_db_mb = DEFAULT_MAX_DB_MB;
+        }
+        avisos
     }
 }
 
@@ -292,6 +411,554 @@ impl InferenceConfig {
         }
         avisos
     }
+}
+
+/// Valores por defecto de [alerts] (§7.14).
+pub const DEFAULT_ALERT_RETENTION_DAYS: u32 = 90;
+/// Días con datos antes de avisar de lo nuevo (aprendizaje).
+pub const DEFAULT_LEARNING_DAYS: u32 = 7;
+/// Minutos de puesta al día tras arrancar.
+pub const DEFAULT_CATCH_UP_MINUTES: u32 = 10;
+/// Horas de deduplicación de una misma alerta.
+pub const DEFAULT_DEDUP_HOURS: u32 = 24;
+/// Tope de notificaciones de escritorio por minuto.
+pub const DEFAULT_MAX_NOTIFICATIONS_PER_MINUTE: u32 = 3;
+/// Veces la mediana que dispara «más tráfico de lo habitual».
+pub const DEFAULT_TRAFFIC_FACTOR: f64 = 3.0;
+/// Días de muestras de la línea base de tráfico.
+pub const DEFAULT_BASELINE_DAYS: u32 = 14;
+/// Muestras mínimas para evaluar la línea base.
+pub const DEFAULT_MIN_DAYS: u32 = 5;
+/// Mínimo de bajada por hora (MB de 1 000 000 bytes).
+pub const DEFAULT_MIN_MB_DOWN: u64 = 200;
+/// Mínimo de subida por hora (MB de 1 000 000 bytes).
+pub const DEFAULT_MIN_MB_UP: u64 = 50;
+/// Porcentaje de pérdida por minuto que cuenta como malo.
+pub const DEFAULT_CAPTURE_DROPS_PERCENT: f64 = 1.0;
+/// Minutos seguidos por encima del umbral de pérdidas.
+pub const DEFAULT_CAPTURE_DROPS_MINUTES: u32 = 5;
+
+/// Sección [alerts]: motor de alertas de F6 (§7.14).
+///
+/// La validación es tolerante (nunca aborta el arranque): cada valor fuera de
+/// rango se avisa una vez y usa el valor por defecto; las reglas desconocidas se
+/// avisan una vez y se descartan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertsConfig {
+    /// Motor de alertas encendido. Apagado: no se crean alertas, el contador se
+    /// oculta y las guardadas se siguen viendo.
+    pub enabled: bool,
+    /// Retención de alertas en días (7-730).
+    pub retention_days: u32,
+    /// Días con datos antes de avisar de lo nuevo (0-30).
+    pub learning_days: u32,
+    /// Puesta al día al arrancar en minutos (0-60; 0 = sin ella).
+    pub catch_up_minutes: u32,
+    /// Horas de deduplicación (1-168).
+    pub dedup_hours: u32,
+    /// Notificaciones de escritorio (solo importantes).
+    pub desktop_notifications: bool,
+    /// Horario silencioso «HH:MM-HH:MM» en hora local; vacío = sin horario.
+    pub quiet_hours: String,
+    /// Tope de notificaciones de escritorio por minuto (1-20).
+    pub max_notifications_per_minute: u32,
+    /// Parámetros de «más tráfico de lo habitual».
+    pub traffic_high: TrafficHighConfig,
+    /// Parámetros de «pérdidas de captura».
+    pub capture_drops: CaptureDropsConfig,
+    /// Ajuste de las 16 reglas del catálogo.
+    pub rules: RulesConfig,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: DEFAULT_ALERT_RETENTION_DAYS,
+            learning_days: DEFAULT_LEARNING_DAYS,
+            catch_up_minutes: DEFAULT_CATCH_UP_MINUTES,
+            dedup_hours: DEFAULT_DEDUP_HOURS,
+            desktop_notifications: true,
+            quiet_hours: String::new(),
+            max_notifications_per_minute: DEFAULT_MAX_NOTIFICATIONS_PER_MINUTE,
+            traffic_high: TrafficHighConfig::default(),
+            capture_drops: CaptureDropsConfig::default(),
+            rules: RulesConfig::default(),
+        }
+    }
+}
+
+impl AlertsConfig {
+    /// Corrige los valores fuera de rango con el valor por defecto y avisa.
+    ///
+    /// La configuración nunca aborta el arranque (§7.14). También descarta las
+    /// reglas desconocidas (con un aviso) y rellena las que faltan.
+    pub fn validar(&mut self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if !(7..=730).contains(&self.retention_days) {
+            avisos.push(format!(
+                "[alerts].retention_days = {} no es válido (7-730); se usa {DEFAULT_ALERT_RETENTION_DAYS}",
+                self.retention_days
+            ));
+            self.retention_days = DEFAULT_ALERT_RETENTION_DAYS;
+        }
+        if self.learning_days > 30 {
+            avisos.push(format!(
+                "[alerts].learning_days = {} no es válido (0-30); se usa {DEFAULT_LEARNING_DAYS}",
+                self.learning_days
+            ));
+            self.learning_days = DEFAULT_LEARNING_DAYS;
+        }
+        if self.catch_up_minutes > 60 {
+            avisos.push(format!(
+                "[alerts].catch_up_minutes = {} no es válido (0-60); se usa {DEFAULT_CATCH_UP_MINUTES}",
+                self.catch_up_minutes
+            ));
+            self.catch_up_minutes = DEFAULT_CATCH_UP_MINUTES;
+        }
+        if !(1..=168).contains(&self.dedup_hours) {
+            avisos.push(format!(
+                "[alerts].dedup_hours = {} no es válido (1-168); se usa {DEFAULT_DEDUP_HOURS}",
+                self.dedup_hours
+            ));
+            self.dedup_hours = DEFAULT_DEDUP_HOURS;
+        }
+        if !(1..=20).contains(&self.max_notifications_per_minute) {
+            avisos.push(format!(
+                "[alerts].max_notifications_per_minute = {} no es válido (1-20); se usa {DEFAULT_MAX_NOTIFICATIONS_PER_MINUTE}",
+                self.max_notifications_per_minute
+            ));
+            self.max_notifications_per_minute = DEFAULT_MAX_NOTIFICATIONS_PER_MINUTE;
+        }
+        match crate::alerts::QuietHours::parse(&self.quiet_hours) {
+            Ok(_) => {}
+            Err(motivo) => {
+                avisos.push(format!(
+                    "[alerts].quiet_hours = \"{}\" no es válido ({motivo}); se usa sin horario silencioso",
+                    self.quiet_hours
+                ));
+                self.quiet_hours.clear();
+            }
+        }
+        avisos.extend(self.traffic_high.validar(self.max_baseline_days()));
+        avisos.extend(self.capture_drops.validar());
+        avisos.extend(self.rules.validar());
+        avisos
+    }
+
+    /// Días máximos de muestras: los de horas del histórico.
+    fn max_baseline_days(&self) -> u32 {
+        DEFAULT_HOUR_DAYS
+    }
+
+    /// Proyección validada al motor de alertas.
+    ///
+    /// Si la configuración no se ha validado antes, se valida aquí una copia;
+    /// así el motor siempre recibe valores en rango.
+    pub fn params(&self) -> crate::alerts::AlertsParams {
+        let mut copia = self.clone();
+        copia.validar();
+        let mut rules = BTreeMap::new();
+        for regla in crate::alerts::RuleId::ALL {
+            rules.insert(regla, copia.rules.setting(regla));
+        }
+        crate::alerts::AlertsParams {
+            enabled: copia.enabled,
+            retention_days: copia.retention_days,
+            learning_days: copia.learning_days,
+            catch_up_minutes: copia.catch_up_minutes,
+            dedup_hours: copia.dedup_hours,
+            desktop_notifications: copia.desktop_notifications,
+            quiet_hours: crate::alerts::QuietHours::parse(&copia.quiet_hours)
+                .ok()
+                .flatten(),
+            max_notifications_per_minute: copia.max_notifications_per_minute,
+            traffic_high: crate::alerts::TrafficHighParams {
+                factor: copia.traffic_high.factor,
+                baseline_days: copia.traffic_high.baseline_days,
+                min_days: copia.traffic_high.min_days,
+                min_mb_down: copia.traffic_high.min_mb_down,
+                min_mb_up: copia.traffic_high.min_mb_up,
+            },
+            capture_drops: crate::alerts::CaptureDropsParams {
+                percent: copia.capture_drops.percent,
+                minutes: copia.capture_drops.minutes,
+            },
+            rules,
+        }
+    }
+
+    /// Ajuste efectivo de una regla.
+    pub fn rule(&self, rule: crate::alerts::RuleId) -> crate::alerts::RuleSetting {
+        self.rules.setting(rule)
+    }
+
+    /// Guarda en memoria el ajuste de una regla.
+    pub fn set_rule(&mut self, rule: crate::alerts::RuleId, setting: &crate::alerts::RuleSetting) {
+        self.rules.set(rule, setting);
+    }
+}
+
+/// Sección [alerts.traffic_high] (§7.14).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrafficHighConfig {
+    /// Veces la mediana que dispara la alerta (1,5-20).
+    pub factor: f64,
+    /// Días de muestras (7 hasta hour_days del histórico).
+    pub baseline_days: u32,
+    /// Muestras mínimas para evaluar (3 hasta baseline_days).
+    pub min_days: u32,
+    /// Mínimo de bajada por hora (MB de 1 000 000 bytes, ≥ 1).
+    pub min_mb_down: u64,
+    /// Mínimo de subida por hora (MB de 1 000 000 bytes, ≥ 1).
+    pub min_mb_up: u64,
+}
+
+impl Default for TrafficHighConfig {
+    fn default() -> Self {
+        Self {
+            factor: DEFAULT_TRAFFIC_FACTOR,
+            baseline_days: DEFAULT_BASELINE_DAYS,
+            min_days: DEFAULT_MIN_DAYS,
+            min_mb_down: DEFAULT_MIN_MB_DOWN,
+            min_mb_up: DEFAULT_MIN_MB_UP,
+        }
+    }
+}
+
+impl TrafficHighConfig {
+    /// Valida los rangos de la sección y avisa de los valores corregidos.
+    fn validar(&mut self, max_baseline_days: u32) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if !(1.5..=20.0).contains(&self.factor) || !self.factor.is_finite() {
+            avisos.push(format!(
+                "[alerts.traffic_high].factor = {} no es válido (1,5-20); se usa {DEFAULT_TRAFFIC_FACTOR}",
+                self.factor
+            ));
+            self.factor = DEFAULT_TRAFFIC_FACTOR;
+        }
+        if !(7..=max_baseline_days).contains(&self.baseline_days) {
+            avisos.push(format!(
+                "[alerts.traffic_high].baseline_days = {} no es válido (7-{max_baseline_days}); se usa {DEFAULT_BASELINE_DAYS}",
+                self.baseline_days
+            ));
+            self.baseline_days = DEFAULT_BASELINE_DAYS.min(max_baseline_days);
+        }
+        if !(3..=self.baseline_days).contains(&self.min_days) {
+            avisos.push(format!(
+                "[alerts.traffic_high].min_days = {} no es válido (3-{}); se usa {DEFAULT_MIN_DAYS}",
+                self.min_days, self.baseline_days
+            ));
+            self.min_days = DEFAULT_MIN_DAYS.min(self.baseline_days);
+        }
+        if self.min_mb_down < 1 {
+            avisos.push(format!(
+                "[alerts.traffic_high].min_mb_down = {} no es válido (mínimo 1); se usa {DEFAULT_MIN_MB_DOWN}",
+                self.min_mb_down
+            ));
+            self.min_mb_down = DEFAULT_MIN_MB_DOWN;
+        }
+        if self.min_mb_up < 1 {
+            avisos.push(format!(
+                "[alerts.traffic_high].min_mb_up = {} no es válido (mínimo 1); se usa {DEFAULT_MIN_MB_UP}",
+                self.min_mb_up
+            ));
+            self.min_mb_up = DEFAULT_MIN_MB_UP;
+        }
+        avisos
+    }
+}
+
+/// Sección [alerts.capture_drops] (§7.14).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureDropsConfig {
+    /// Porcentaje perdido en un minuto (0,1-50).
+    pub percent: f64,
+    /// Minutos seguidos por encima del umbral (1-60).
+    pub minutes: u32,
+}
+
+impl Default for CaptureDropsConfig {
+    fn default() -> Self {
+        Self {
+            percent: DEFAULT_CAPTURE_DROPS_PERCENT,
+            minutes: DEFAULT_CAPTURE_DROPS_MINUTES,
+        }
+    }
+}
+
+impl CaptureDropsConfig {
+    /// Valida los rangos de la sección y avisa de los valores corregidos.
+    fn validar(&mut self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if !(0.1..=50.0).contains(&self.percent) || !self.percent.is_finite() {
+            avisos.push(format!(
+                "[alerts.capture_drops].percent = {} no es válido (0,1-50); se usa {DEFAULT_CAPTURE_DROPS_PERCENT}",
+                self.percent
+            ));
+            self.percent = DEFAULT_CAPTURE_DROPS_PERCENT;
+        }
+        if !(1..=60).contains(&self.minutes) {
+            avisos.push(format!(
+                "[alerts.capture_drops].minutes = {} no es válido (1-60); se usa {DEFAULT_CAPTURE_DROPS_MINUTES}",
+                self.minutes
+            ));
+            self.minutes = DEFAULT_CAPTURE_DROPS_MINUTES;
+        }
+        avisos
+    }
+}
+
+/// Ajuste de una regla en [alerts.rules].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuleConfig {
+    /// Regla activa.
+    pub enabled: bool,
+    /// Nivel: `important`, `warning` o `info`.
+    pub level: String,
+    /// Nivel de `device_new` con MAC privada (solo `device_new`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level_private_mac: Option<String>,
+}
+
+impl Default for RuleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: String::new(),
+            level_private_mac: None,
+        }
+    }
+}
+
+impl RuleConfig {
+    /// Crea el ajuste por defecto de una regla del catálogo.
+    pub fn default_for(rule: crate::alerts::RuleId) -> Self {
+        let def = crate::alerts::RuleSetting::default_for(rule);
+        Self {
+            enabled: def.enabled,
+            level: def.level.as_str().to_string(),
+            level_private_mac: def
+                .level_private_mac
+                .map(|nivel| nivel.as_str().to_string()),
+        }
+    }
+
+    /// Nivel efectivo, usando el de la regla si el campo falta o no es válido.
+    fn nivel(&self, por_defecto: crate::alerts::Level) -> crate::alerts::Level {
+        if self.level.trim().is_empty() {
+            return por_defecto;
+        }
+        crate::alerts::Level::from_str(self.level.trim()).unwrap_or(por_defecto)
+    }
+}
+
+/// Sección [alerts.rules]: las 16 reglas del catálogo (ADR-67).
+///
+/// Las claves desconocidas se capturan en `desconocidas` para avisarlas una vez y
+/// descartarlas sin romper la carga (configuración tolerante de F4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RulesConfig {
+    /// Equipo nuevo.
+    pub device_new: RuleConfig,
+    /// Puerto nuevo.
+    pub port_new: RuleConfig,
+    /// Cambio de MAC.
+    pub mac_changed: RuleConfig,
+    /// Cambio de nombre.
+    pub name_changed: RuleConfig,
+    /// Cambio de SO.
+    pub os_changed: RuleConfig,
+    /// Cambio de tipo.
+    pub type_changed: RuleConfig,
+    /// App nueva.
+    pub new_app: RuleConfig,
+    /// Categoría nueva.
+    pub new_category: RuleConfig,
+    /// País nuevo.
+    pub new_country: RuleConfig,
+    /// Organización nueva.
+    pub new_org: RuleConfig,
+    /// Huella TLS nueva (JA4).
+    pub new_ja4: RuleConfig,
+    /// Más tráfico de lo habitual.
+    pub traffic_high: RuleConfig,
+    /// Vigilado ausente o de vuelta.
+    pub watched_presence: RuleConfig,
+    /// Captura parada.
+    pub capture_stopped: RuleConfig,
+    /// Pérdidas de captura.
+    pub capture_drops: RuleConfig,
+    /// Base de datos grande.
+    pub db_size: RuleConfig,
+    /// Reglas desconocidas: se avisan una vez y se descartan.
+    #[serde(flatten)]
+    pub desconocidas: BTreeMap<String, toml::Value>,
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            device_new: RuleConfig::default_for(crate::alerts::RuleId::DeviceNew),
+            port_new: RuleConfig::default_for(crate::alerts::RuleId::PortNew),
+            mac_changed: RuleConfig::default_for(crate::alerts::RuleId::MacChanged),
+            name_changed: RuleConfig::default_for(crate::alerts::RuleId::NameChanged),
+            os_changed: RuleConfig::default_for(crate::alerts::RuleId::OsChanged),
+            type_changed: RuleConfig::default_for(crate::alerts::RuleId::TypeChanged),
+            new_app: RuleConfig::default_for(crate::alerts::RuleId::NewApp),
+            new_category: RuleConfig::default_for(crate::alerts::RuleId::NewCategory),
+            new_country: RuleConfig::default_for(crate::alerts::RuleId::NewCountry),
+            new_org: RuleConfig::default_for(crate::alerts::RuleId::NewOrg),
+            new_ja4: RuleConfig::default_for(crate::alerts::RuleId::NewJa4),
+            traffic_high: RuleConfig::default_for(crate::alerts::RuleId::TrafficHigh),
+            watched_presence: RuleConfig::default_for(crate::alerts::RuleId::WatchedPresence),
+            capture_stopped: RuleConfig::default_for(crate::alerts::RuleId::CaptureStopped),
+            capture_drops: RuleConfig::default_for(crate::alerts::RuleId::CaptureDrops),
+            db_size: RuleConfig::default_for(crate::alerts::RuleId::DbSize),
+            desconocidas: BTreeMap::new(),
+        }
+    }
+}
+
+impl RulesConfig {
+    /// Referencia al ajuste de una regla del catálogo.
+    pub fn config(&self, rule: crate::alerts::RuleId) -> &RuleConfig {
+        use crate::alerts::RuleId::*;
+        match rule {
+            DeviceNew => &self.device_new,
+            PortNew => &self.port_new,
+            MacChanged => &self.mac_changed,
+            NameChanged => &self.name_changed,
+            OsChanged => &self.os_changed,
+            TypeChanged => &self.type_changed,
+            NewApp => &self.new_app,
+            NewCategory => &self.new_category,
+            NewCountry => &self.new_country,
+            NewOrg => &self.new_org,
+            NewJa4 => &self.new_ja4,
+            TrafficHigh => &self.traffic_high,
+            WatchedPresence => &self.watched_presence,
+            CaptureStopped => &self.capture_stopped,
+            CaptureDrops => &self.capture_drops,
+            DbSize => &self.db_size,
+        }
+    }
+
+    /// Referencia mutable al ajuste de una regla del catálogo.
+    fn config_mut(&mut self, rule: crate::alerts::RuleId) -> &mut RuleConfig {
+        use crate::alerts::RuleId::*;
+        match rule {
+            DeviceNew => &mut self.device_new,
+            PortNew => &mut self.port_new,
+            MacChanged => &mut self.mac_changed,
+            NameChanged => &mut self.name_changed,
+            OsChanged => &mut self.os_changed,
+            TypeChanged => &mut self.type_changed,
+            NewApp => &mut self.new_app,
+            NewCategory => &mut self.new_category,
+            NewCountry => &mut self.new_country,
+            NewOrg => &mut self.new_org,
+            NewJa4 => &mut self.new_ja4,
+            TrafficHigh => &mut self.traffic_high,
+            WatchedPresence => &mut self.watched_presence,
+            CaptureStopped => &mut self.capture_stopped,
+            CaptureDrops => &mut self.capture_drops,
+            DbSize => &mut self.db_size,
+        }
+    }
+
+    /// Ajuste efectivo de una regla (nivel por defecto si falta).
+    pub fn setting(&self, rule: crate::alerts::RuleId) -> crate::alerts::RuleSetting {
+        let cfg = self.config(rule);
+        let por_defecto = crate::alerts::RuleSetting::default_for(rule);
+        crate::alerts::RuleSetting {
+            enabled: cfg.enabled,
+            level: cfg.nivel(por_defecto.level),
+            level_private_mac: cfg
+                .level_private_mac
+                .as_deref()
+                .and_then(crate::alerts::Level::from_str),
+        }
+    }
+
+    /// Guarda el ajuste de una regla.
+    pub fn set(&mut self, rule: crate::alerts::RuleId, setting: &crate::alerts::RuleSetting) {
+        let cfg = self.config_mut(rule);
+        cfg.enabled = setting.enabled;
+        cfg.level = setting.level.as_str().to_string();
+        cfg.level_private_mac = setting
+            .level_private_mac
+            .map(|nivel| nivel.as_str().to_string());
+    }
+
+    /// Valida niveles y descarta las reglas desconocidas con aviso.
+    fn validar(&mut self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        for nombre in self.desconocidas.keys() {
+            avisos.push(format!(
+                "[alerts.rules] contiene la regla desconocida \"{nombre}\"; se ignora"
+            ));
+        }
+        self.desconocidas.clear();
+
+        for regla in crate::alerts::RuleId::ALL {
+            let por_defecto = crate::alerts::RuleSetting::default_for(regla);
+            let cfg = self.config_mut(regla);
+            if !cfg.level.trim().is_empty()
+                && crate::alerts::Level::from_str(cfg.level.trim()).is_none()
+            {
+                avisos.push(format!(
+                    "[alerts.rules].{} tiene level = \"{}\" no válido; se usa \"{}\"",
+                    regla.as_str(),
+                    cfg.level,
+                    por_defecto.level.as_str()
+                ));
+                cfg.level = por_defecto.level.as_str().to_string();
+            } else if cfg.level.trim().is_empty() {
+                cfg.level = por_defecto.level.as_str().to_string();
+            }
+            if let Some(nivel) = &cfg.level_private_mac {
+                if crate::alerts::Level::from_str(nivel.trim()).is_none() {
+                    let defecto = por_defecto
+                        .level_private_mac
+                        .unwrap_or(crate::alerts::Level::Warning);
+                    avisos.push(format!(
+                        "[alerts.rules].{} tiene level_private_mac = \"{nivel}\" no válido; se usa \"{}\"",
+                        regla.as_str(),
+                        defecto.as_str()
+                    ));
+                    cfg.level_private_mac = Some(defecto.as_str().to_string());
+                }
+            }
+            if regla != crate::alerts::RuleId::DeviceNew && cfg.level_private_mac.is_some() {
+                avisos.push(format!(
+                    "[alerts.rules].{} no admite level_private_mac; se ignora",
+                    regla.as_str()
+                ));
+                cfg.level_private_mac = None;
+            }
+        }
+        avisos
+    }
+}
+
+/// Guarda si una regla está activa y su nivel desde la vista Reglas de la TUI
+/// (§7.14): reescribe `config.toml` completo, como `[ui]` en F2.
+///
+/// Si el fichero no existe o no se puede leer, parte de los valores por defecto.
+pub fn save_rule(
+    path: &Path,
+    rule: crate::alerts::RuleId,
+    setting: &crate::alerts::RuleSetting,
+) -> Result<()> {
+    let mut config = Config::load_or_default(Some(path)).0;
+    config.alerts.set_rule(rule, setting);
+    config.save(path)
 }
 
 /// Agrupación del ranking de la pestaña Tráfico (Fase 4).
@@ -468,6 +1135,12 @@ impl Config {
         match Self::load(path) {
             Ok(config) => {
                 let (mut config, mut avisos) = config.descartar_lease_paths_inexistentes();
+                // [history] se valida campo a campo: un valor inválido se avisa
+                // una vez y usa el valor por defecto, sin abortar el arranque.
+                avisos.extend(config.history.validar());
+                // [alerts] también se valida campo a campo: un valor inválido se
+                // avisa una vez y usa el valor por defecto (§7.14).
+                avisos.extend(config.alerts.validar());
                 avisos.extend(config.warnings());
                 // Las claves obsoletas de F3 se avisan una sola vez y se
                 // descartan: la inferencia se rige por [inference].enabled.
@@ -766,7 +1439,83 @@ mod tests {
         assert_eq!(config.capture.sni_attribution, None);
         assert!(!config.capture.has_filter());
         assert_eq!(config.capture.filter_label(), "(ninguno)");
+        // [history] con los valores por defecto de §7.12.
+        assert!(config.history.enabled);
+        assert_eq!(config.history.minute_days, 2);
+        assert_eq!(config.history.hour_days, 90);
+        assert_eq!(config.history.day_days, 730);
+        assert_eq!(config.history.destination_days, 30);
+        assert_eq!(config.history.top_keys, 20);
+        assert_eq!(config.history.max_db_mb, 1024);
+        assert_eq!(
+            config.history.retention(),
+            crate::history::Retention {
+                minute_days: 2,
+                hour_days: 90,
+                day_days: 730,
+                destination_days: 30,
+            }
+        );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn la_plantilla_incluye_la_seccion_history() {
+        let plantilla = Config::default().to_toml();
+        assert!(
+            plantilla.contains("[history]"),
+            "falta [history]: {plantilla}"
+        );
+        assert!(plantilla.contains("minute_days = 2"));
+        assert!(plantilla.contains("hour_days = 90"));
+        assert!(plantilla.contains("day_days = 730"));
+        assert!(plantilla.contains("destination_days = 30"));
+        assert!(plantilla.contains("top_keys = 20"));
+        assert!(plantilla.contains("max_db_mb = 1024"));
+    }
+
+    #[test]
+    fn los_valores_invalidos_de_history_avisan_y_usan_el_valor_por_defecto() {
+        let mut config = Config::default();
+        config.history.hour_days = 2;
+        config.history.minute_days = 0;
+        config.history.day_days = 10;
+        config.history.top_keys = 1000;
+        config.history.max_db_mb = 1;
+        config.history.destination_days = 500;
+        let avisos = config.history.validar();
+        assert_eq!(avisos.len(), 6, "un aviso por valor inválido: {avisos:?}");
+        assert_eq!(config.history.hour_days, DEFAULT_HOUR_DAYS);
+        assert_eq!(config.history.minute_days, DEFAULT_MINUTE_DAYS);
+        assert_eq!(config.history.day_days, DEFAULT_DAY_DAYS);
+        assert_eq!(config.history.top_keys, DEFAULT_TOP_KEYS);
+        assert_eq!(config.history.max_db_mb, DEFAULT_MAX_DB_MB);
+        assert_eq!(config.history.destination_days, DEFAULT_DESTINATION_DAYS);
+        // La configuración nunca aborta: validate() no falla por [history].
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn destination_days_no_puede_superar_las_horas_validas() {
+        let mut config = Config::default();
+        config.history.hour_days = 7;
+        config.history.destination_days = 30;
+        let avisos = config.history.validar();
+        assert_eq!(avisos.len(), 1);
+        assert_eq!(config.history.destination_days, 7);
+    }
+
+    #[test]
+    fn load_or_default_avisa_de_history_invalido() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[history]\nhour_days = 2\n").unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(config.history.hour_days, DEFAULT_HOUR_DAYS);
+        assert!(
+            avisos.iter().any(|aviso| aviso.contains("hour_days")),
+            "debe avisar una vez: {avisos:?}"
+        );
     }
 
     #[test]
@@ -1154,5 +1903,141 @@ sni_attribution = false
         let avisos = config.warnings();
         assert_eq!(avisos.len(), 1);
         assert!(avisos[0].contains("apps_file"));
+    }
+
+    #[test]
+    fn la_configuracion_por_defecto_incluye_alerts_completa() {
+        let config = Config::default();
+        assert!(config.alerts.enabled);
+        assert_eq!(config.alerts.retention_days, 90);
+        assert_eq!(config.alerts.learning_days, 7);
+        assert_eq!(config.alerts.catch_up_minutes, 10);
+        assert_eq!(config.alerts.dedup_hours, 24);
+        assert!(config.alerts.desktop_notifications);
+        assert_eq!(config.alerts.quiet_hours, "");
+        assert_eq!(config.alerts.max_notifications_per_minute, 3);
+        assert_eq!(config.alerts.traffic_high.factor, 3.0);
+        assert_eq!(config.alerts.traffic_high.baseline_days, 14);
+        assert_eq!(config.alerts.traffic_high.min_days, 5);
+        assert_eq!(config.alerts.capture_drops.percent, 1.0);
+        assert_eq!(config.alerts.capture_drops.minutes, 5);
+        assert!(
+            config
+                .alerts
+                .rules
+                .setting(crate::alerts::RuleId::ALL[0])
+                .enabled
+        );
+        let toml = config.to_toml();
+        assert!(toml.contains("[alerts]"), "{toml}");
+        // El serializador TOML escribe cada regla como tabla propia; es
+        // semánticamente equivalente a la tabla en línea del §7.14 y se recarga igual.
+        assert!(
+            toml.contains("[alerts.rules.device_new]") || toml.contains("device_new"),
+            "{toml}"
+        );
+        assert!(toml.contains("device_new"), "{toml}");
+        assert!(toml.contains("[alerts.traffic_high]"), "{toml}");
+        assert!(toml.contains("[alerts.capture_drops]"), "{toml}");
+    }
+
+    #[test]
+    fn alerts_validacion_tolerante_usa_el_valor_por_defecto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[alerts]\nretention_days = 3\nlearning_days = 99\ndedup_hours = 0\nmax_notifications_per_minute = 500\nquiet_hours = \"25:00-08:00\"\n\n[alerts.traffic_high]\nfactor = 0.0\nmin_days = 99\n",
+        )
+        .unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(config.alerts.retention_days, 90);
+        assert_eq!(config.alerts.learning_days, 7);
+        assert_eq!(config.alerts.dedup_hours, 24);
+        assert_eq!(config.alerts.max_notifications_per_minute, 3);
+        assert_eq!(config.alerts.quiet_hours, "");
+        assert_eq!(config.alerts.traffic_high.factor, 3.0);
+        assert_eq!(config.alerts.traffic_high.min_days, 5);
+        assert!(avisos.iter().any(|aviso| aviso.contains("retention_days")));
+        assert!(avisos.iter().any(|aviso| aviso.contains("factor")));
+        assert!(avisos.iter().any(|aviso| aviso.contains("quiet_hours")));
+    }
+
+    #[test]
+    fn alerts_reglas_desconocidas_se_avisan_y_se_ignoran() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[alerts.rules]\nregla_inventada = { enabled = false }\nport_new = { enabled = false, level = \"warning\" }\n",
+        )
+        .unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert!(!config.alerts.rules.port_new.enabled);
+        assert_eq!(config.alerts.rules.port_new.level, "warning");
+        assert_eq!(
+            config.alerts.rule(crate::alerts::RuleId::PortNew).level,
+            crate::alerts::Level::Warning
+        );
+        // Las reglas que faltan usan sus valores por defecto.
+        assert_eq!(
+            config.alerts.rule(crate::alerts::RuleId::DeviceNew).level,
+            crate::alerts::Level::Important
+        );
+        assert!(avisos.iter().any(|aviso| aviso.contains("regla_inventada")));
+    }
+
+    #[test]
+    fn alerts_params_proyecta_la_configuracion() {
+        let mut config = Config::default();
+        config.alerts.enabled = false;
+        config.alerts.quiet_hours = "23:00-08:00".to_string();
+        config.alerts.rules.new_app.enabled = false;
+        let params = config.alerts.params();
+        assert!(!params.enabled);
+        assert_eq!(params.retention_days, 90);
+        assert_eq!(params.learning_days, 7);
+        assert!(!params.rule(crate::alerts::RuleId::NewApp).enabled);
+        assert_eq!(
+            params
+                .rule(crate::alerts::RuleId::DeviceNew)
+                .level_private_mac,
+            Some(crate::alerts::Level::Warning)
+        );
+        assert_eq!(params.rules.len(), 16);
+    }
+
+    #[test]
+    fn save_rule_reescribe_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut ajuste = crate::alerts::RuleSetting::default_for(crate::alerts::RuleId::NewOrg);
+        ajuste.enabled = false;
+        ajuste.level = crate::alerts::Level::Warning;
+        super::save_rule(&path, crate::alerts::RuleId::NewOrg, &ajuste).expect("guardar regla");
+        let recargada = Config::load(Some(&path)).expect("recargar");
+        assert!(!recargada.alerts.rules.new_org.enabled);
+        assert_eq!(recargada.alerts.rules.new_org.level, "warning");
+        assert_eq!(recargada.alerts.rule(crate::alerts::RuleId::NewOrg), ajuste);
+    }
+
+    #[test]
+    fn save_rule_conserva_el_resto_de_la_configuracion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.scan.passive_only = true;
+        config.alerts.quiet_hours = "23:00-08:00".to_string();
+        config.save(&path).expect("guardar configuración");
+        let mut ajuste = crate::alerts::RuleSetting::default_for(crate::alerts::RuleId::DbSize);
+        ajuste.level = crate::alerts::Level::Important;
+        super::save_rule(&path, crate::alerts::RuleId::DbSize, &ajuste).expect("guardar regla");
+        let recargada = Config::load(Some(&path)).expect("recargar");
+        assert!(recargada.scan.passive_only);
+        assert_eq!(recargada.alerts.quiet_hours, "23:00-08:00");
+        assert_eq!(
+            recargada.alerts.rule(crate::alerts::RuleId::DbSize).level,
+            crate::alerts::Level::Important
+        );
     }
 }

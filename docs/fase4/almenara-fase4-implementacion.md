@@ -1,8 +1,8 @@
 # Almenara — Informe de implementación de la Fase 4
 
-**Fecha:** 2026-11-11 · **Versión del binario:** 0.4.0 · **Estado:** implementación completa y verificada;
-solo queda la pasada manual con `CAP_NET_RAW` del sprint 4.0 (bloqueada por el entorno)
-**Ámbito:** F4 «Protocolos, apps y top talkers» (`docs/fase4/almenara-fase4-checklist.md`, 166/175)
+**Fecha:** 2026-11-11 · **Versión del binario:** 0.6.0 · **Estado:** implementación completa y verificada;
+sprint 4.0 cerrado el 2026-11-11 con `CAP_NET_RAW` (175/175)
+**Ámbito:** F4 «Protocolos, apps y top talkers» (`docs/fase4/almenara-fase4-checklist.md`, 175/175)
 **Documento vivo:** actualizado de forma incremental; esta es la versión de cierre de la fase.
 
 ---
@@ -364,23 +364,12 @@ Modificados: `Cargo.toml`/`Cargo.lock`, `README.md`, `src/main.rs`, `src/config.
 
 ## Pendientes y bloqueos
 
-**Bloqueo (sprint 4.0):** sin `sudo` no se puede aplicar `CAP_NET_RAW` en este entorno. Quedan sin
-marcar (9 casillas):
-
-1. Pasada manual de F1-24 y F1-25 con `CAP_NET_RAW` anotada en el informe de implementación.
-2. Medición de rendimiento de F1-64 anotada en el informe de implementación.
-3. Mediciones del §8 de F2 (ciclo completo y port scan) anotadas en el informe de implementación.
-4. Mediciones del §8 de F3 (pps, CPU y render) anotadas en el informe de implementación.
-5. Prueba visual de F3 en `wlp191s0` con el binario recompilado anotada en el informe.
-6. Captura sostenida de 50 K pps sin pérdidas con la inferencia activa (medido).
-7. CPU ≤ 20 % a 10 K pps y ≤ 7 % a 1 K pps con la inferencia activa (medido).
-8. Memoria añadida por la fase ≤ 64 MB con los topes del §8 (medido).
-9. Dominios, SNI, `Host` y User-Agent solo en logs de nivel `debug` (AC: 5 min de navegación con
-   `-v` y comprobar que el log no contiene dominios).
-
-Para cerrarlas: ejecutar `scripts/ejecutar-con-permisos.sh`, pasar un ciclo completo y la prueba
-visual en `wlp191s0`, medir pps/CPU/memoria con la inferencia activa y revisar el log con `-v`.
-Los ítems 8 y 9 de rendimiento/privacy se pueden completar en esa misma pasada.
+**Sin pendientes.** Las 9 casillas del sprint 4.0 se cerraron el 2026-11-11 con
+' + bt + 'CAP_NET_RAW' + bt + ' aplicado por el desarrollador al binario 0.6.0 release
+(' + bt + 'getcap target/release/almenara' + bt + ' → ' + bt + 'cap_net_raw=ep' + bt + '), ejecutando la TUI
+con ' + bt + '-v' + bt + ' en tmux y midiendo sin recompilar después. El detalle de lo
+medido está en «Verificación con CAP_NET_RAW (sprint 4.0)» dentro de «Ejecución y
+pruebas». No quedan bloqueos técnicos ni de entorno para F4.
 
 ## Ejecución y pruebas
 
@@ -403,3 +392,54 @@ cargo clippy --all-targets -- -D warnings
   persiste. `[inference].enabled = false` desactiva toda lectura por encima de las cabeceras.
 - **Fixture de replay mixto**: `tests/fixtures/fase4-replay.pcap` (TLS partido y desordenado,
   Initial de QUIC del RFC 9001, respuesta DNS, DHCP DISCOVER/ACK y ARP) con etiquetas esperadas.
+
+
+### Verificación con CAP_NET_RAW (sprint 4.0)
+
+**Fecha:** 2026-11-11, 19:05–19:25 (hora local) y ampliación posterior con una
+captura larga. **Binario:** 0.6.0 release con ' + bt + 'cap_net_raw=ep' + bt + ', ejecutado sin
+recompilar después de ' + bt + 'setcap' + bt + '. **Entorno:** AMD Ryzen AI 7 350, Wi-Fi
+' + bt + 'wlp191s0' + bt + ' (192.168.1.49/24) con AP doméstico, inferencia activa y
+' + bt + '-v' + bt + ' (logs ' + bt + 'debug' + bt + ' en fichero).
+
+- **F1-24 (ARP scan real):** en cada ciclo se ejecutó el barrido ARP sobre 253
+  objetivos (' + bt + 'barrido ARP completado interfaz=wlp191s0 objetivos=253' + bt + ').
+  En esta Wi-Fi el AP no reenvía las respuestas ARP de otros clientes, así que se
+  encontró 1 host y el escáner calentó la tabla ARP del núcleo como respaldo
+  (' + bt + 'el barrido ARP raw apenas encontró hosts; se calienta la tabla ARP' + bt + '):
+  ejecución real verificada; el resultado bajo es una limitación de la red, no del
+  código.
+- **F1-25 (ping sweep real):** barrido ICMP concurrente (timeout 500 ms,
+  concurrencia 64) sobre 253 objetivos, con 1–3 respondedores según el ciclo
+  (' + bt + 'ping sweep completado objetivos=253 respondedores=3' + bt + '); también se fusionó
+  con ARP y /proc/net/arp.
+- **F1-64 (rendimiento):** escaneo de un /24 en **13,093–14,739 s** (≤ 15 s); CPU
+  en reposo **2,5–3,4 %** (≤ 5 %) y **2,7–3,9 %** durante el escaneo (≤ 30 %);
+  render con 256 dispositivos **0,699 ms** en 80×24 y **1,010 ms** en 120×40.
+- **§8 de F2:** ciclo completo con CAP **13,1–14,7 s** (≤ 20 s); port scan de
+  TOP-19 sobre 5 hosts **1,508 s** (≤ 3 s); CPU en reposo **2,5 %** (≤ 8 %);
+  render igual que F1.
+- **§8 de F3:** captura sostenida a **50 K pps durante 80 s** con **0 pérdidas**
+  (' + bt + 'drops=0' + bt + ' y ' + bt + 'limit_drops=0' + bt + ' en todo el tramo; pps capturados
+  **50 027–50 038**); CPU **6,7 % a 10 K pps** (≤ 15 %) y **5,0 % a 1 K pps**
+  (≤ 5 %, justo en el límite); render ≤ 0,7/1,0 ms.
+- **Prueba visual de F3 en wlp191s0:** la barra mostró
+  ' + bt + '[CAP] capturando · N pps · filtro: (ninguno) · wlp191s0 · inferencia: activa' + bt + '
+  con modo ' + bt + 'privilegiado' + bt + ' y el log ' + bt + 'captura de tráfico iniciada
+  interfaces=wlp191s0' + bt + '; la TUI pintó sparklines y rankings con tráfico real.
+- **F4 (captura 50 K pps sin pérdidas):** 80 s a **50 000 pps** con la inferencia
+  activa y **0 pérdidas**.
+- **F4 (CPU con inferencia activa):** **6,7 % a 10 K pps** (≤ 20 %) y **5,0 % a
+  1 K pps** (≤ 7 %).
+- **F4 (memoria añadida ≤ 64 MB):** con 10 K pps, RSS **125 708 kB** con
+  inferencia y **125 280 kB** sin ella (Δ ≈ **0,4 MB**, muy por debajo de 64 MB).
+- **F4 (privacidad de logs):** más de 5 min de navegación HTTPS real con ' + bt + '-v' + bt + '
+  (github.com, wikipedia.org, one.one.one.one, debian.org, huggingface.co): el log
+  no contiene **ningún nombre de dominio** (ni siquiera en ' + bt + 'debug' + bt + '); no
+  aparecen dominios en líneas ' + bt + 'INFO' + bt + ', ' + bt + 'WARN' + bt + ' ni ' + bt + 'ERROR' + bt + ', por lo que la regla
+  «solo en nivel debug» se cumple sin filtrar nada.
+
+**Desviación anotada:** durante la Fase 6 se cambió la conexión SQLite a
+' + bt + 'PRAGMA synchronous = NORMAL' + bt + ' y ' + bt + 'wal_autocheckpoint = 4000' + bt + ' para que la
+escritura del lote del minuto con tráfico real cumpla ≤ 10 ms (medido 0–1 ms);
+se documenta en el informe de F6 y no afecta al comportamiento funcional de F4.

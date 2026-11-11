@@ -50,6 +50,10 @@ pub enum Error {
     #[error("error de terminal: {0}")]
     Terminal(String),
 
+    /// Error del histórico (lector de solo lectura, consultas o purga).
+    #[error("error del histórico: {0}")]
+    History(String),
+
     /// Ruta no válida o no expandible.
     #[error("ruta inválida: {0}")]
     InvalidPath(String),

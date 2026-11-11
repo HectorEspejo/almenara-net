@@ -48,6 +48,8 @@ pub struct Device {
     pub user_agent: Option<String>,
     /// Señal que fijó os_family: tcp / dhcp / model / ua.
     pub os_source: Option<String>,
+    /// Equipo vigilado por la persona (§7.7); ninguno por defecto.
+    pub watched: bool,
 }
 
 impl Device {
