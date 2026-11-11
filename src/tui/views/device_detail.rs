@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
+use crate::history::{Inventory, SeenKind};
 use crate::identify::mac::is_private;
 use crate::identify::OsSource;
 use crate::rankings::RankRow;
@@ -19,6 +20,7 @@ use crate::traffic::{formatear_bytes, formatear_bytes_por_segundo, ConnectionVie
 use crate::tui::app::App;
 use crate::tui::theme::device_icon;
 use crate::tui::traffic_state::FocusPanel;
+use crate::tui::views::charts;
 
 /// Dibuja el panel de detalle de un equipo.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -153,6 +155,11 @@ fn construir_lineas(
         ));
     }
     lineas.push(dhcp);
+    lineas.push(Line::from(""));
+
+    // Histórico de F5: tráfico y presencia sobre el mismo eje, rejilla de
+    // presencia de 7 días e inventario de lo visto en el equipo.
+    lineas.extend(bloque_historico(app, ancho));
     lineas.push(Line::from(""));
 
     // Tráfico (F3).
@@ -313,6 +320,240 @@ fn construir_lineas(
     lineas.push(Line::from(Span::styled(texto_servicios, app.theme.dim)));
 
     lineas
+}
+
+/// Bloque «Histórico» del detalle: tráfico y presencia sobre el mismo eje
+/// (24 h ⇄ 7 días con w), rejilla de presencia de 7 días e inventario.
+fn bloque_historico(app: &App, ancho: u16) -> Vec<Line<'static>> {
+    let mut lineas: Vec<Line> = Vec::new();
+    let rango = app.history.detail_range;
+    let etiqueta = rango.label();
+    let ahora = crate::history::localtime::now_unix();
+
+    if !app.config.history.enabled {
+        lineas.push(Line::from(vec![
+            Span::styled("Histórico · ", app.theme.accent),
+            Span::styled("desactivado ([history] enabled = false)", app.theme.warning),
+        ]));
+        lineas.push(Line::from(Span::styled(
+            "  La presencia se calcula con los eventos, que siguen activos",
+            app.theme.dim,
+        )));
+    } else {
+        let (bajada, subida) = app
+            .history
+            .detail_series
+            .as_ref()
+            .map(|serie| (serie.total_down, serie.total_up))
+            .unwrap_or((0, 0));
+        lineas.push(Line::from(vec![
+            Span::styled(format!("Histórico · {etiqueta}"), app.theme.accent),
+            Span::styled(
+                format!(
+                    "   ↓ {} · ↑ {}",
+                    formatear_bytes(bajada),
+                    formatear_bytes(subida)
+                ),
+                app.theme.normal,
+            ),
+            Span::styled("   [w] 24 h ⇄ 7 días", app.theme.dim),
+        ]));
+
+        let ancho_serie = ancho.saturating_sub(14).max(10);
+        let mut fila_trafico = vec![Span::styled("  tráfico    ", app.theme.dim)];
+        match app.history.detail_series.as_ref() {
+            Some(serie) => {
+                fila_trafico.extend(charts::fila_trafico(serie, ancho_serie, &app.theme).spans)
+            }
+            None if app.history.detalle_cargando() => {
+                fila_trafico.push(Span::styled("Cargando…", app.theme.dim))
+            }
+            None => fila_trafico.push(Span::styled("sin datos en el rango", app.theme.dim)),
+        }
+        lineas.push(Line::from(fila_trafico));
+
+        let tramos = app.history.detail_presence.as_deref().unwrap_or(&[]);
+        let mut fila_presencia = vec![Span::styled("  presencia  ", app.theme.dim)];
+        fila_presencia
+            .extend(charts::fila_presencia(tramos, rango, ahora, ancho_serie, &app.theme).spans);
+        lineas.push(Line::from(fila_presencia));
+
+        if let Some(error) = app.history.error_actual() {
+            lineas.push(Line::from(Span::styled(
+                format!("  Error del histórico: {error}"),
+                app.theme.warning,
+            )));
+        }
+
+        if let Some(serie) = app.history.detail_series.as_ref() {
+            let eje = charts::eje_fechas(serie, ancho_serie, &app.theme);
+            let mut spans = vec![Span::styled(" ".repeat(14), app.theme.dim)];
+            spans.extend(eje.spans);
+            lineas.push(Line::from(spans));
+        }
+        lineas.push(Line::from(""));
+    }
+
+    // La presencia no depende de [history].enabled: sale de los eventos de F1.
+    let tramos = app.history.detail_presence.as_deref().unwrap_or(&[]);
+    lineas.push(Line::from(Span::styled(
+        "Presencia · 7 días",
+        app.theme.accent,
+    )));
+    lineas.extend(charts::rejilla_presencia(tramos, ahora, &app.theme));
+    lineas.push(Line::from(Span::styled(
+        charts::LEYENDA_PRESENCIA,
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(""));
+
+    lineas.extend(bloque_inventario(app, rango));
+    lineas
+}
+
+/// Bloque «Visto en este equipo»: recuentos por tipo, lo nuevo de los últimos
+/// 7 días, la fecha de inicio y los puertos abiertos.
+fn bloque_inventario(app: &App, _rango: crate::history::Range) -> Vec<Line<'static>> {
+    let mut lineas: Vec<Line> = Vec::new();
+    let Some(inventario) = app.history.detail_inventory.as_ref() else {
+        let mensaje = if app.config.history.enabled {
+            "Visto en este equipo: Cargando…"
+        } else {
+            "Visto en este equipo: inventario desactivado ([history] enabled = false)"
+        };
+        lineas.push(Line::from(Span::styled(mensaje, app.theme.dim)));
+        return lineas;
+    };
+    let desde = inventario
+        .since
+        .as_deref()
+        .and_then(crate::history::localtime::unix_de_rfc3339)
+        .map(|unix| crate::history::LocalDay::from_unix(unix).label_corto());
+    let titulo = match desde {
+        Some(desde) => format!("Visto en este equipo (desde {desde})"),
+        None => "Visto en este equipo".to_string(),
+    };
+    lineas.push(Line::from(Span::styled(titulo, app.theme.accent)));
+
+    let nuevas = apps_nuevas(inventario, crate::history::localtime::now_unix());
+    let texto_nuevas = if nuevas.is_empty() {
+        "—".to_string()
+    } else {
+        nuevas.join(" · ")
+    };
+    lineas.push(Line::from(vec![
+        Span::styled(
+            format!("  Apps ({})", inventario.count(SeenKind::App)),
+            app.theme.normal,
+        ),
+        Span::styled(" · nuevas en 7 días: ", app.theme.dim),
+        Span::styled(texto_nuevas, app.theme.accent),
+    ]));
+    lineas.push(Line::from(vec![
+        Span::styled(
+            format!("  Organizaciones ({})", inventario.count(SeenKind::Org)),
+            app.theme.normal,
+        ),
+        Span::styled(": ", app.theme.dim),
+        Span::styled(lista_corta(&inventario.orgs, 5), app.theme.normal),
+    ]));
+    let paises = inventario
+        .countries
+        .iter()
+        .map(|pais| pais.key.clone())
+        .collect::<Vec<_>>();
+    let texto_paises = if paises.is_empty() {
+        "—".to_string()
+    } else {
+        paises.join(" ")
+    };
+    lineas.push(Line::from(vec![
+        Span::styled(
+            format!("  Países ({})", inventario.count(SeenKind::Country)),
+            app.theme.normal,
+        ),
+        Span::styled(format!(": {texto_paises}"), app.theme.normal),
+        Span::styled(
+            format!(" · Clientes TLS (JA4): {}", inventario.count(SeenKind::Ja4)),
+            app.theme.dim,
+        ),
+    ]));
+    let puertos = if inventario.ports.is_empty() {
+        "—".to_string()
+    } else {
+        inventario
+            .ports
+            .iter()
+            .take(6)
+            .map(|puerto| {
+                let desde = crate::history::localtime::unix_de_rfc3339(&puerto.first_seen)
+                    .map(|unix| crate::history::LocalDay::from_unix(unix).label_corto());
+                match (puerto.service.as_deref(), desde) {
+                    (Some(servicio), Some(desde)) => {
+                        format!(
+                            "{}/{} {servicio} (desde {desde})",
+                            puerto.port, puerto.protocol
+                        )
+                    }
+                    (Some(servicio), None) => {
+                        format!("{}/{} {servicio}", puerto.port, puerto.protocol)
+                    }
+                    (None, Some(desde)) => {
+                        format!("{}/{} (desde {desde})", puerto.port, puerto.protocol)
+                    }
+                    (None, None) => format!("{}/{}", puerto.port, puerto.protocol),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    lineas.push(Line::from(vec![
+        Span::styled("  Puertos abiertos: ", app.theme.normal),
+        Span::styled(puertos, app.theme.normal),
+    ]));
+    lineas
+}
+
+/// Apps vistas por primera vez en los últimos 7 días («Temu (ayer)»).
+fn apps_nuevas(inventario: &Inventory, ahora: i64) -> Vec<String> {
+    let limite = ahora - 7 * 86_400;
+    inventario
+        .apps
+        .iter()
+        .filter_map(|app| {
+            let unix = crate::history::localtime::unix_de_rfc3339(&app.first_seen)?;
+            (unix >= limite).then(|| format!("{} ({})", app.label, etiqueta_novedad(unix, ahora)))
+        })
+        .take(3)
+        .collect()
+}
+
+/// Etiqueta de una novedad respecto a ahora: hoy, ayer, hace N días o la fecha.
+fn etiqueta_novedad(unix: i64, ahora: i64) -> String {
+    let dias = (ahora - unix).max(0) / 86_400;
+    match dias {
+        0 => "hoy".to_string(),
+        1 => "ayer".to_string(),
+        2..=6 => format!("hace {dias} días"),
+        _ => crate::history::LocalDay::from_unix(unix).label_corto(),
+    }
+}
+
+/// Lista corta de claves («Meta, Apple, Google…»).
+fn lista_corta(filas: &[crate::history::SeenRow], maximo: usize) -> String {
+    if filas.is_empty() {
+        return "—".to_string();
+    }
+    let mut texto = filas
+        .iter()
+        .take(maximo)
+        .map(|fila| fila.label.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if filas.len() > maximo {
+        texto.push('…');
+    }
+    texto
 }
 
 /// Identidad de SO a partir de la señal persistida.
@@ -744,7 +985,7 @@ mod tests {
     #[test]
     fn el_detalle_muestra_top_apps_y_destinos_de_cinco_minutos() {
         let mut app = app_detalle();
-        let texto = dibujar(&mut app, 160, 40);
+        let texto = dibujar(&mut app, 160, 76);
         assert!(texto.contains("Top apps (5 min)"));
         assert!(texto.contains("Top destinos"));
         assert!(texto.contains("Instagram"));
@@ -758,7 +999,7 @@ mod tests {
     fn el_detalle_sin_ranking_usa_las_conexiones_activas() {
         let mut app = app_detalle();
         app.traffic.device_rankings.clear();
-        let texto = dibujar(&mut app, 160, 40);
+        let texto = dibujar(&mut app, 160, 90);
         assert!(texto.contains("Top apps (conexiones activas)"));
         assert!(texto.contains("iCloud"));
         assert!(texto.contains("icloud.com"));
@@ -767,7 +1008,7 @@ mod tests {
     #[test]
     fn el_detalle_muestra_los_clientes_tls_distintos() {
         let mut app = app_detalle();
-        let texto = dibujar(&mut app, 160, 40);
+        let texto = dibujar(&mut app, 160, 90);
         assert!(texto.contains("Clientes TLS (JA4):"));
         assert!(texto.contains("t13d1516h2_8daaf6152771_02713d6af862"));
         assert!(texto.contains("(2 distintos)"));
@@ -776,7 +1017,7 @@ mod tests {
     #[test]
     fn el_detalle_mantiene_el_trafico_las_conexiones_y_los_servicios_de_f3() {
         let mut app = app_detalle();
-        let texto = dibujar(&mut app, 160, 44);
+        let texto = dibujar(&mut app, 160, 110);
         assert!(texto.contains("Tráfico"));
         assert!(texto.contains("60 s:"));
         assert!(texto.contains("5 min:"));
@@ -829,5 +1070,161 @@ mod tests {
         assert_eq!(os_source_label(Some("dhcp")), "DHCP");
         assert_eq!(os_source_label(Some("ua")), "User-Agent");
         assert_eq!(os_source_label(None), "desconocida");
+    }
+
+    fn datos_historicos(app: &mut App) {
+        let ahora = crate::history::localtime::now_unix();
+        let puntos = (0..48)
+            .map(|indice| crate::history::SeriesPoint {
+                at: ahora - 86_400 + indice * 1800,
+                bytes_down: 1_000,
+                bytes_up: 200,
+                gap: (10..=12).contains(&indice),
+                future: indice >= 47,
+            })
+            .collect();
+        app.history.detail_range = crate::history::Range::Hours24;
+        app.history.detail_series = Some(crate::history::Series {
+            range: crate::history::Range::Hours24,
+            points: puntos,
+            total_down: 2_100_000_000,
+            total_up: 340_000_000,
+            max: Some((20, 3_000_000_000)),
+        });
+        app.history.detail_presence = Some(vec![
+            crate::history::PresenceSpan {
+                start: ahora - 7200,
+                end: ahora - 3600,
+                state: crate::history::PresenceState::Present,
+            },
+            crate::history::PresenceSpan {
+                start: ahora - 3600,
+                end: ahora - 1800,
+                state: crate::history::PresenceState::Absent,
+            },
+        ]);
+        app.history.detail_inventory = Some(crate::history::Inventory {
+            device_id: 1,
+            since: Some("2026-10-12T00:00:00Z".to_string()),
+            apps: vec![
+                crate::history::SeenRow {
+                    key: "temu".to_string(),
+                    label: "Temu".to_string(),
+                    first_seen: crate::history::localtime::rfc3339(ahora - 86_400),
+                    last_seen: crate::history::localtime::rfc3339(ahora),
+                },
+                crate::history::SeenRow {
+                    key: "instagram".to_string(),
+                    label: "Instagram".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: crate::history::localtime::rfc3339(ahora),
+                },
+            ],
+            categories: Vec::new(),
+            orgs: vec![
+                crate::history::SeenRow {
+                    key: "meta".to_string(),
+                    label: "Meta".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+                crate::history::SeenRow {
+                    key: "apple".to_string(),
+                    label: "Apple".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+            ],
+            countries: vec![
+                crate::history::SeenRow {
+                    key: "US".to_string(),
+                    label: "US".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+                crate::history::SeenRow {
+                    key: "IE".to_string(),
+                    label: "IE".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+            ],
+            ja4: vec![
+                crate::history::SeenRow {
+                    key: "t13d".to_string(),
+                    label: "t13d".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+                crate::history::SeenRow {
+                    key: "t13e".to_string(),
+                    label: "t13e".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+                crate::history::SeenRow {
+                    key: "t13f".to_string(),
+                    label: "t13f".to_string(),
+                    first_seen: "2026-10-12T00:00:00Z".to_string(),
+                    last_seen: "2026-10-12T00:00:00Z".to_string(),
+                },
+            ],
+            ports: vec![crate::history::InventoryPort {
+                port: 62078,
+                protocol: "tcp".to_string(),
+                service: None,
+                first_seen: "2026-10-03T00:00:00Z".to_string(),
+            }],
+        });
+    }
+
+    #[test]
+    fn el_detalle_muestra_el_historico_y_la_presencia() {
+        let mut app = app_detalle();
+        datos_historicos(&mut app);
+        let texto = dibujar(&mut app, 140, 110);
+        assert!(texto.contains("Histórico · 24 h"));
+        assert!(texto.contains("tráfico"));
+        assert!(texto.contains("presencia"));
+        assert!(texto.contains("[w] 24 h ⇄ 7 días"));
+        assert!(texto.contains("Presencia · 7 días"));
+        assert!(texto.contains("█ presente · · ausente · ░ sin datos"));
+        assert!(texto.contains("↓ 2.1 G"));
+    }
+
+    #[test]
+    fn la_tecla_w_alterna_el_rango_del_historico_del_detalle() {
+        let mut app = app_detalle();
+        datos_historicos(&mut app);
+        assert_eq!(app.history.detail_range, crate::history::Range::Hours24);
+        app.handle_key(tecla(KeyCode::Char('w')));
+        assert_eq!(app.history.detail_range, crate::history::Range::Days7);
+        let texto = dibujar(&mut app, 140, 110);
+        assert!(texto.contains("Histórico · 7 días"));
+        app.handle_key(tecla(KeyCode::Char('w')));
+        assert_eq!(app.history.detail_range, crate::history::Range::Hours24);
+    }
+
+    #[test]
+    fn el_bloque_visto_en_el_equipo_muestra_recuentos_y_puertos() {
+        let mut app = app_detalle();
+        datos_historicos(&mut app);
+        let texto = dibujar(&mut app, 140, 110);
+        assert!(texto.contains("Visto en este equipo (desde 12 oct)"));
+        assert!(texto.contains("Apps (2)"));
+        assert!(texto.contains("nuevas en 7 días: Temu (ayer)"));
+        assert!(texto.contains("Organizaciones (2): Meta, Apple"));
+        assert!(texto.contains("Países (2): US IE"));
+        assert!(texto.contains("Clientes TLS (JA4): 3"));
+        assert!(texto.contains("62078/tcp (desde 3 oct)"));
+    }
+
+    #[test]
+    fn con_el_historico_desactivado_el_detalle_lo_avisa() {
+        let mut app = app_detalle();
+        app.config.history.enabled = false;
+        let texto = dibujar(&mut app, 140, 110);
+        assert!(texto.contains("desactivado ([history] enabled = false)"));
+        assert!(texto.contains("inventario desactivado"));
     }
 }

@@ -46,7 +46,31 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "w (Tráfico)",
-        description: "ventana: 60 s → 5 min → sesión (no se guarda; arranca en 60 s)",
+        description: "ventana: 60 s → 5 min → 1 h → 24 h → sesión (no se guarda)",
+    },
+    KeyHelp {
+        keys: "e (Histórico)",
+        description: "sujeto: toda la red, este equipo o un equipo (con /)",
+    },
+    KeyHelp {
+        keys: "w (Histórico)",
+        description: "rango: 24 h → 7 días → 30 días → 1 año",
+    },
+    KeyHelp {
+        keys: "< > (Histórico)",
+        description: "cursor de la gráfica: fecha, bajada y subida del punto",
+    },
+    KeyHelp {
+        keys: "f (Histórico)",
+        description: "filtro de eventos: todos, altas y presencia, identidad, servicios, Almenara",
+    },
+    KeyHelp {
+        keys: "Tab (Histórico)",
+        description: "foco entre gráfica, «Más tráfico» y Eventos",
+    },
+    KeyHelp {
+        keys: "w (detalle)",
+        description: "histórico del equipo: 24 h ⇄ 7 días",
     },
     KeyHelp {
         keys: "i (Conexiones)",
@@ -132,6 +156,12 @@ pub const FOOTER_CONEXIONES: [&str; 2] = [
     "[/]buscar [Tab]pestañas [Esc]cerrar [1-7]atajo [?]ayuda",
 ];
 
+/// Pie de teclas de la pestaña Histórico (F5).
+pub const FOOTER_HISTORICO: [&str; 2] = [
+    "[e]equipo [w]rango [Tab]panel [<>]cursor [f]filtro",
+    "[/]buscar [Enter]detalle [?]ayuda [q]salir",
+];
+
 /// Pie de teclas del panel de detalle master-detail.
 pub const FOOTER_DETALLE: [&str; 2] = [
     "[hjkl]mover [Tab]panel [Esc]cerrar detalle",
@@ -157,6 +187,7 @@ pub fn footer_para(
             }
         }
         crate::tui::app::Tab::Conexiones => &FOOTER_CONEXIONES,
+        crate::tui::app::Tab::Historico => &FOOTER_HISTORICO,
         _ => &FOOTER_OTROS,
     }
 }
@@ -182,6 +213,7 @@ mod tests {
             FOOTER_TRAFICO,
             FOOTER_TRAFICO_PANEL,
             FOOTER_CONEXIONES,
+            FOOTER_HISTORICO,
             FOOTER_DETALLE,
         ] {
             assert!(
@@ -208,6 +240,7 @@ mod tests {
             .chain(FOOTER_TRAFICO.iter())
             .chain(FOOTER_TRAFICO_PANEL.iter())
             .chain(FOOTER_CONEXIONES.iter())
+            .chain(FOOTER_HISTORICO.iter())
             .chain(FOOTER_DETALLE.iter());
         for linea in todos {
             assert!(

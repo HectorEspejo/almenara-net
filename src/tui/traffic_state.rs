@@ -641,6 +641,29 @@ impl App {
     /// si el ranking aún no ha publicado filas se sintetiza con el agregado de
     /// F3 (comportamiento de la Fase 3 y arranque en frío).
     pub fn ranking_rows(&self) -> Vec<RankRow> {
+        // Las ventanas de 1 h y 24 h salen del histórico: el ranking lo trae el
+        // lector de solo lectura y aquí solo se convierte y se reordena.
+        if self.traffic_window.history().is_some() {
+            let mut filas = self
+                .history
+                .ranking_rows_trafico(self.traffic_window)
+                .unwrap_or_default();
+            for fila in &mut filas {
+                if let Some(id) = fila.device_id {
+                    fila.label = if id == crate::traffic::DEVICE_ID_HOST {
+                        "[host]".to_string()
+                    } else {
+                        self.devices
+                            .iter()
+                            .find(|device| device.id == id)
+                            .map(|device| device.display_name().to_string())
+                            .unwrap_or_else(|| fila.label.clone())
+                    };
+                }
+            }
+            ordenar_ranking(&mut filas, self.rank_sort);
+            return filas;
+        }
         let mut filas = self
             .traffic
             .rank_rows(self.traffic_group, self.traffic_window);
@@ -732,17 +755,49 @@ impl App {
         Some(grupo)
     }
 
-    /// Cicla la ventana del ranking (w): 60 s → 5 min → sesión. No se persiste.
+    /// Cicla la ventana del ranking (w): 60 s → 5 min → 1 h → 24 h → sesión.
+    ///
+    /// Las ventanas de 1 h y 24 h salen del histórico (F5, minutos cerrados); con
+    /// [history].enabled = false se saltan (ADR-63). No se persiste: cada arranque
+    /// empieza en 60 s.
     pub fn cycle_traffic_window(&mut self) {
-        let siguiente = self.traffic_window.index() + 1;
-        self.traffic_window = Window::ALL[siguiente % Window::ALL.len()];
+        let mut siguiente = self.traffic_window.next_ui();
+        if !self.config.history.enabled {
+            while siguiente.history().is_some() {
+                siguiente = siguiente.next_ui();
+            }
+        }
+        self.traffic_window = siguiente;
         self.traffic_selected = 0;
         self.traffic.who_uses = None;
+        self.history.close_history_who_uses();
         self.clamp_traffic_selection();
+        let aviso = if self.traffic_window.history().is_some() {
+            " (histórico, minutos cerrados)"
+        } else {
+            ""
+        };
         self.push_notification(
             crate::notifier::Level::Info,
-            format!("Ventana: {}", self.traffic_window.label()),
+            format!("Ventana: {}{aviso}", self.traffic_window.label()),
         );
+    }
+
+    /// Indica si la ventana del ranking sale del histórico (1 h o 24 h).
+    pub fn ventana_historica(&self) -> Option<crate::history::HistWindow> {
+        self.traffic_window.history()
+    }
+
+    /// Porcentaje sin identificar de la ventana activa.
+    ///
+    /// Las ventanas de 1 h y 24 h lo traen del ranking del histórico; las de
+    /// memoria, del agregador en vivo.
+    pub fn sin_identificar_ventana(&self) -> f32 {
+        if self.traffic_window.history().is_some() {
+            self.history.unidentified_pct_trafico()
+        } else {
+            self.traffic.unidentified_pct(self.traffic_window)
+        }
     }
 
     /// Cicla el criterio de orden del ranking (s).
@@ -842,6 +897,8 @@ impl App {
         let segundos = match window {
             Window::Sixty => 60,
             Window::FiveMin => 300,
+            Window::OneHour => 3600,
+            Window::Day24 => 86_400,
             Window::Session => self.session_elapsed().as_secs().max(1),
         };
         bytes / segundos.max(1)
@@ -1477,17 +1534,75 @@ mod tests {
     }
 
     #[test]
-    fn el_ciclo_de_w_no_se_persiste_y_arranca_en_sesenta_segundos() {
+    fn el_ciclo_de_w_recorre_las_cinco_ventanas_y_no_se_persiste() {
         let mut app = app_prueba();
         assert_eq!(app.traffic_window, Window::Sixty);
+        for esperada in [
+            Window::FiveMin,
+            Window::OneHour,
+            Window::Day24,
+            Window::Session,
+            Window::Sixty,
+        ] {
+            app.cycle_traffic_window();
+            assert_eq!(app.traffic_window, esperada);
+        }
+        // La agrupación persistida no cambia al cambiar la ventana.
+        assert_eq!(app.config.ui.traffic_group, TrafficGroup::Device);
+    }
+
+    #[test]
+    fn con_el_historico_desactivado_w_se_salta_una_hora_y_veinticuatro() {
+        let mut app = app_prueba();
+        app.config.history.enabled = false;
         app.cycle_traffic_window();
         assert_eq!(app.traffic_window, Window::FiveMin);
         app.cycle_traffic_window();
         assert_eq!(app.traffic_window, Window::Session);
         app.cycle_traffic_window();
         assert_eq!(app.traffic_window, Window::Sixty);
-        // La agrupación persistida no cambia al cambiar la ventana.
-        assert_eq!(app.config.ui.traffic_group, TrafficGroup::Device);
+    }
+
+    #[test]
+    fn las_ventanas_historicas_usan_el_ranking_del_lector() {
+        let mut app = app_prueba();
+        app.traffic_group = Dimension::Destination;
+        app.traffic_window = Window::Day24;
+        app.history.set_history_enabled(true);
+        app.history.sync_context(
+            crate::tui::app::Tab::Trafico,
+            None,
+            Dimension::Destination,
+            Window::Day24,
+        );
+        app.history.traffic_ranking = Some(crate::history::RankingResult {
+            window: crate::history::HistWindow::Day24,
+            dimension: crate::history::Dimension::Destination,
+            rows: vec![crate::history::HistRankRow {
+                key: "youtube.com".to_string(),
+                label: "youtube.com".to_string(),
+                subtitle: Some("Google LLC · US".to_string()),
+                device_id: None,
+                bytes_down: 2_000,
+                bytes_up: 100,
+                devices: 2,
+                connections: 6,
+            }],
+            total_down: 2_000,
+            total_up: 100,
+            unidentified_pct: 4.0,
+            closed_until: 1_760_000_040,
+            gap_seconds: 120,
+        });
+        let filas = app.ranking_rows();
+        assert_eq!(filas.len(), 1);
+        assert_eq!(filas[0].key, "youtube.com");
+        assert_eq!(filas[0].connections, 6);
+        assert_eq!(app.sin_identificar_ventana(), 4.0);
+        assert_eq!(
+            app.ventana_historica(),
+            Some(crate::history::HistWindow::Day24)
+        );
     }
 
     #[test]
@@ -1771,6 +1886,8 @@ mod tests {
         let app = app_prueba();
         assert_eq!(app.bytes_por_segundo_en_ventana(600, Window::Sixty), 10);
         assert_eq!(app.bytes_por_segundo_en_ventana(1500, Window::FiveMin), 5);
+        assert_eq!(app.bytes_por_segundo_en_ventana(3600, Window::OneHour), 1);
+        assert_eq!(app.bytes_por_segundo_en_ventana(86_400, Window::Day24), 1);
         assert_eq!(
             app.bytes_por_segundo_en_ventana(0, Window::Session),
             0,

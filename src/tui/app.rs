@@ -113,9 +113,9 @@ impl Tab {
         Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
 
-    /// Pestañas que todavía son placeholder (Histórico llega en F5 y Alertas en F6).
+    /// Pestañas que todavía son placeholder (Alertas llega en F6).
     pub fn is_placeholder(self) -> bool {
-        matches!(self, Tab::Historico | Tab::Alertas)
+        matches!(self, Tab::Alertas)
     }
 }
 
@@ -405,6 +405,28 @@ pub struct App {
     pub ipdb_date: Option<String>,
     /// Inicio de la sesión, para las medias de la ventana «sesión».
     pub session_started: Instant,
+    /// Estado del histórico de F5 (datos del lector y consultas en vuelo).
+    pub history: crate::tui::history_state::HistoryState,
+    /// Lector del histórico de solo lectura (None en pruebas).
+    pub history_reader: Option<crate::history::reader::HistoryHandle>,
+    /// Contadores de lotes del agregador (diagnóstico del histórico).
+    pub rollup_counters: crate::history::RollupCounters,
+    /// Lotes del minuto pendientes de escribir (hasta 10, §4.1).
+    pub pending_rollups: Vec<crate::history::RollupBatch>,
+    /// Id de la sesión abierta en APP_SESSIONS.
+    pub session_id: Option<i64>,
+    /// Último latido de la sesión.
+    pub last_beat: Option<Instant>,
+    /// La tarea de tráfico ha cerrado el minuto parcial al pararse.
+    pub traffic_stopped: bool,
+    /// Última purga del histórico.
+    pub last_purge: Option<Instant>,
+    /// Última consolidación de horas y días.
+    pub last_consolidation: Option<Instant>,
+    /// Ya se ha avisado de que la BD supera [history].max_db_mb.
+    pub db_size_warned: bool,
+    /// Ya se ha avisado del descarte de lotes del histórico.
+    pub rollup_dropped_warned: bool,
 }
 
 impl App {
@@ -465,11 +487,23 @@ impl App {
             catalog_counts: CatalogCounts::default(),
             ipdb_date: None,
             session_started: Instant::now(),
+            history: crate::tui::history_state::HistoryState::new(),
+            history_reader: None,
+            rollup_counters: crate::history::RollupCounters::default(),
+            pending_rollups: Vec::new(),
+            session_id: None,
+            last_beat: None,
+            traffic_stopped: false,
+            last_purge: None,
+            last_consolidation: None,
+            db_size_warned: false,
+            rollup_dropped_warned: false,
         }
     }
 
     /// Sustituye los datos de equipos e interfaces y ajusta la selección.
     pub fn set_data(&mut self, devices: Vec<Device>, interfaces: Vec<Interface>) {
+        self.history.set_devices(&devices);
         self.devices = devices;
         self.interfaces = interfaces;
         self.clamp_selection();
@@ -477,6 +511,7 @@ impl App {
 
     /// Aplica el resultado de reconciliar un escaneo.
     pub fn apply_reconciliation(&mut self, reconciliacion: Reconciliation) {
+        self.history.set_devices(&reconciliacion.devices);
         self.devices = reconciliacion.devices;
         self.interfaces = reconciliacion.interfaces;
         self.scanning = false;
@@ -907,12 +942,22 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
+        // Pestaña Histórico (F5): consume sus propias teclas (e, w, Tab, <, >,
+        // f, /, Enter) antes del manejo general.
+        if self.tab == Tab::Historico {
+            if let Some(accion) = self.history.history_handle_key(key) {
+                return accion;
+            }
+        }
         if self.input.is_some() {
             return self.handle_input_key(key);
         }
 
         // Esc cierra, en orden, los paneles no modales abiertos.
         if key.code == KeyCode::Esc {
+            if self.history.close_history_who_uses() {
+                return Action::None;
+            }
             if self.close_who_uses() {
                 return Action::None;
             }
@@ -938,6 +983,13 @@ impl App {
                         return self.handle_detail_panel_key(key);
                     }
                 }
+            }
+        }
+
+        // Panel «¿Quién lo usa?» del histórico (F5): j/k/Enter/Esc propios.
+        if self.history.history_who_uses_open() {
+            if let Some(accion) = self.history.handle_history_who_uses_key(key) {
+                return accion;
             }
         }
 
@@ -1098,6 +1150,32 @@ impl App {
     /// En equipo abre el detalle (drill-down de F3); en proceso abre Conexiones
     /// filtrada; en destino, app, categoría o protocolo abre el panel.
     fn enter_ranking(&mut self) -> Action {
+        // Ventanas de 1 h y 24 h (F5): el detalle de equipo y «¿Quién lo usa?»
+        // salen del histórico, no de los rankings en memoria.
+        if self.traffic_window.history().is_some() {
+            if self.traffic_group == Dimension::Device {
+                return match self.selected_ranking_row().and_then(|fila| fila.device_id) {
+                    Some(device_id) if device_id == crate::traffic::DEVICE_ID_HOST => {
+                        self.push_notification(
+                            Level::Info,
+                            "El tráfico del host no tiene detalle de equipo; consulta la pestaña Conexiones",
+                        );
+                        Action::None
+                    }
+                    Some(device_id) => Action::OpenDetail { device_id },
+                    None => Action::None,
+                };
+            }
+            if let Some(fila) = self.selected_ranking_row() {
+                self.history.ask_who_uses(
+                    self.traffic_group,
+                    fila.key,
+                    fila.label,
+                    self.traffic_window,
+                );
+            }
+            return Action::None;
+        }
         if self.who_uses_open() {
             return match self.selected_who_uses() {
                 Some(cuota) if cuota.device_id == crate::traffic::DEVICE_ID_HOST => {
@@ -1166,6 +1244,12 @@ impl App {
             }
             KeyCode::Esc => {
                 self.close_detail();
+                Action::None
+            }
+            // Histórico del detalle: w alterna 24 h ⇄ 7 días (F5).
+            KeyCode::Char('w') => {
+                self.history.toggle_detail_history_range();
+                self.history.history_refresh();
                 Action::None
             }
             // Desplazamiento del panel derecho cuando no cabe (F4).
@@ -1464,8 +1548,11 @@ mod tests {
             !Tab::Conexiones.is_placeholder(),
             "Conexiones está activa en F3"
         );
-        assert!(Tab::Historico.is_placeholder());
-        assert!(Tab::Alertas.is_placeholder());
+        assert!(
+            !Tab::Historico.is_placeholder(),
+            "Histórico está activa en F5"
+        );
+        assert!(Tab::Alertas.is_placeholder(), "Alertas llega en F6");
         assert!(!Tab::Config.is_placeholder());
         assert_eq!(Tab::ALL.len(), 7);
     }

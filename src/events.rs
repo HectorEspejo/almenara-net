@@ -6,6 +6,7 @@
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::history::{HistoryResponse, RollupBatch};
 use crate::notifier::Level;
 use crate::rankings::{DeviceShare, Dimension, Window};
 use crate::scanner::ScanReport;
@@ -35,6 +36,17 @@ pub enum AppEvent {
         /// Texto ya formateado en castellano.
         message: String,
     },
+    /// Lote del minuto cerrado por el agregador del histórico (F5).
+    Rollup(Box<RollupBatch>),
+    /// Respuesta del lector del histórico a una consulta con identificador.
+    History {
+        /// Identificador creciente de la petición.
+        id: u64,
+        /// Resultado de la consulta (error ya formateado para la vista).
+        response: std::result::Result<HistoryResponse, String>,
+    },
+    /// El hilo de tráfico ha cerrado el minuto parcial al pararse (F5).
+    TrafficStopped,
     /// Petición de cierre coordinado.
     Quit,
 }

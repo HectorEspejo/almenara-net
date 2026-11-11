@@ -181,6 +181,79 @@ CREATE INDEX IDX_NAME_CACHE_EXPIRES ON NAME_CACHE(expires_at);
 CREATE INDEX IDX_CONN_APP           ON CONNECTIONS(app);
 ";
 
+/// Esquema de la Fase 5 (versión 5): histórico, rollups y eventos.
+///
+/// Migración aditiva: crea las tres resoluciones del histórico (WITHOUT ROWID,
+/// con la clave primaria empezando por bucket), el inventario por equipo y las
+/// sesiones de Almenara. DEVICE_EVENTS no cambia de esquema (sus tipos nuevos se
+/// validan en código). El PRAGMA auto_vacuum = INCREMENTAL y su VACUUM se
+/// aplican en apply_all, fuera de la transacción de la migración y una sola vez.
+const SQL_ESQUEMA_FASE_5: &str = "\
+-- v5 — Fase 5: histórico, rollups y eventos
+
+CREATE TABLE TRAFFIC_ROLLUP_MINUTE (
+    bucket      INTEGER NOT NULL,
+    subject     TEXT    NOT NULL,
+    device_id   INTEGER NOT NULL DEFAULT 0,
+    dimension   TEXT    NOT NULL,
+    key         TEXT    NOT NULL,
+    bytes_down  INTEGER NOT NULL DEFAULT 0,
+    bytes_up    INTEGER NOT NULL DEFAULT 0,
+    connections INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, subject, device_id, dimension, key)
+) WITHOUT ROWID;
+
+CREATE TABLE TRAFFIC_ROLLUP_HOUR (
+    bucket      INTEGER NOT NULL,
+    subject     TEXT    NOT NULL,
+    device_id   INTEGER NOT NULL DEFAULT 0,
+    dimension   TEXT    NOT NULL,
+    key         TEXT    NOT NULL,
+    bytes_down  INTEGER NOT NULL DEFAULT 0,
+    bytes_up    INTEGER NOT NULL DEFAULT 0,
+    connections INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, subject, device_id, dimension, key)
+) WITHOUT ROWID;
+
+CREATE TABLE TRAFFIC_ROLLUP_DAY (
+    bucket      INTEGER NOT NULL,
+    subject     TEXT    NOT NULL,
+    device_id   INTEGER NOT NULL DEFAULT 0,
+    dimension   TEXT    NOT NULL,
+    key         TEXT    NOT NULL,
+    bytes_down  INTEGER NOT NULL DEFAULT 0,
+    bytes_up    INTEGER NOT NULL DEFAULT 0,
+    connections INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, subject, device_id, dimension, key)
+) WITHOUT ROWID;
+
+CREATE TABLE DEVICE_SEEN (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   INTEGER NOT NULL REFERENCES DEVICES(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    first_seen  TIMESTAMP NOT NULL,
+    last_seen   TIMESTAMP NOT NULL,
+    UNIQUE (device_id, kind, key)
+);
+
+CREATE INDEX IDX_SEEN_LAST_SEEN ON DEVICE_SEEN(last_seen);
+
+CREATE TABLE APP_SESSIONS (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   TIMESTAMP NOT NULL,
+    ended_at     TIMESTAMP NULL,
+    last_beat    TIMESTAMP NOT NULL,
+    end_reason   TEXT NULL,
+    mode         TEXT NOT NULL,
+    capture      BOOLEAN NOT NULL,
+    passive_only BOOLEAN NOT NULL,
+    version      TEXT NOT NULL
+);
+
+CREATE INDEX IDX_APP_SESSIONS_ENDED ON APP_SESSIONS(ended_at);
+";
+
 /// Lista ordenada de migraciones.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -206,6 +279,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "protocolos_y_etiquetas",
         sql: SQL_ESQUEMA_FASE_4,
         already_applied: Some(v4_ya_aplicada),
+    },
+    Migration {
+        version: 5,
+        name: "historico_y_rollups",
+        sql: SQL_ESQUEMA_FASE_5,
+        already_applied: Some(v5_ya_aplicada),
     },
 ];
 
@@ -266,6 +345,21 @@ fn v4_ya_aplicada(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(false)
 }
 
+/// Comprueba si la migración v5 ya está presente.
+///
+/// La primera tabla de la migración es TRAFFIC_ROLLUP_MINUTE: si existe, el
+/// bloque se aplicó entero (apply_all lo ejecuta en una transacción).
+fn v5_ya_aplicada(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'TRAFFIC_ROLLUP_MINUTE'
+         )",
+        [],
+        |fila| fila.get(0),
+    )
+}
+
 /// Tabla interna que registra las migraciones ya aplicadas.
 const SQL_CREAR_SCHEMA_MIGRATIONS: &str = "\
 CREATE TABLE IF NOT EXISTS SCHEMA_MIGRATIONS (
@@ -309,6 +403,17 @@ pub fn apply_all(conn: &mut Connection) -> Result<u32> {
         )?;
         transaccion.commit()?;
         version = migracion.version;
+    }
+
+    // auto_vacuum = INCREMENTAL se aplica una sola vez, fuera de la transacción
+    // de la migración (VACUUM no puede ir dentro). Con una base ya en v5 y el
+    // modo activo no se repite el VACUUM en cada arranque (AC del checklist).
+    if version >= 5 {
+        let modo: i64 = conn.query_row("PRAGMA auto_vacuum", [], |fila| fila.get(0))?;
+        if modo != 2 {
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+            tracing::debug!("auto_vacuum incremental activado con VACUUM");
+        }
     }
 
     Ok(version)
@@ -385,28 +490,28 @@ mod tests {
         let mut conn = conexion_vacia();
 
         let primera = apply_all(&mut conn).expect("aplicar migraciones");
-        assert_eq!(primera, 4);
-        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+        assert_eq!(primera, 5);
+        assert_eq!(current_version(&conn).expect("leer versión"), 5);
 
         // Una segunda aplicación no debe duplicar registros ni fallar.
         let segunda = apply_all(&mut conn).expect("reaplicar migraciones");
-        assert_eq!(segunda, 4);
+        assert_eq!(segunda, 5);
 
         let registros: i64 = conn
             .query_row("SELECT COUNT(*) FROM SCHEMA_MIGRATIONS", [], |fila| {
                 fila.get(0)
             })
             .expect("contar migraciones aplicadas");
-        assert_eq!(registros, 4);
+        assert_eq!(registros, 5);
 
         let (version, aplicada): (u32, String) = conn
             .query_row(
-                "SELECT version, applied_at FROM SCHEMA_MIGRATIONS WHERE version = 4",
+                "SELECT version, applied_at FROM SCHEMA_MIGRATIONS WHERE version = 5",
                 [],
                 |fila| Ok((fila.get(0)?, fila.get(1)?)),
             )
             .expect("leer registro de migración v4");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         chrono::DateTime::parse_from_rfc3339(&aplicada)
             .expect("applied_at debe ser RFC 3339 en UTC");
         assert!(aplicada.ends_with('Z'), "applied_at debe estar en UTC");
@@ -425,14 +530,14 @@ mod tests {
         assert_eq!(current_version(&conn).expect("leer versión"), 1);
 
         let version = apply_all(&mut conn).expect("reaplicar migraciones v2, v3 y v4");
-        assert_eq!(version, 4);
-        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+        assert_eq!(version, 5);
+        assert_eq!(current_version(&conn).expect("leer versión"), 5);
         let registros: i64 = conn
             .query_row("SELECT COUNT(*) FROM SCHEMA_MIGRATIONS", [], |fila| {
                 fila.get(0)
             })
             .expect("contar migraciones");
-        assert_eq!(registros, 4, "los cuatro registros deben quedar anotados");
+        assert_eq!(registros, 5, "los cinco registros deben quedar anotados");
     }
 
     #[test]
@@ -464,7 +569,7 @@ mod tests {
         .expect("insertar equipo de F1");
 
         let version = apply_all(&mut conn).expect("migrar F1 hasta la última versión");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // Los datos de F1 siguen ahí y las columnas nuevas son NULL.
         let (mac, hostname, os_family, manual, model, os_source): (
@@ -521,7 +626,7 @@ mod tests {
 
     #[test]
     fn las_migraciones_estan_ordenadas_y_son_validas() {
-        assert_eq!(MIGRATIONS.len(), 4);
+        assert_eq!(MIGRATIONS.len(), 5);
         for (indice, migracion) in MIGRATIONS.iter().enumerate() {
             assert_eq!(migracion.version, indice as u32 + 1);
             assert!(!migracion.sql.trim().is_empty());
@@ -530,10 +635,12 @@ mod tests {
         assert_eq!(MIGRATIONS[1].name, "descubrimiento_avanzado");
         assert_eq!(MIGRATIONS[2].name, "trafico_en_vivo");
         assert_eq!(MIGRATIONS[3].name, "protocolos_y_etiquetas");
+        assert_eq!(MIGRATIONS[4].name, "historico_y_rollups");
         assert!(MIGRATIONS[0].already_applied.is_none());
         assert!(MIGRATIONS[1].already_applied.is_some());
         assert!(MIGRATIONS[2].already_applied.is_some());
         assert!(MIGRATIONS[3].already_applied.is_some());
+        assert!(MIGRATIONS[4].already_applied.is_some());
     }
 
     /// Acciones ON DELETE declaradas en las claves foráneas de una tabla.
@@ -570,6 +677,11 @@ mod tests {
             "NAME_CACHE",
             "SCHEMA_MIGRATIONS",
             "TRAFFIC_SNAPSHOT",
+            "TRAFFIC_ROLLUP_MINUTE",
+            "TRAFFIC_ROLLUP_HOUR",
+            "TRAFFIC_ROLLUP_DAY",
+            "DEVICE_SEEN",
+            "APP_SESSIONS",
         ] {
             assert!(
                 tablas.contains(&esperada.to_string()),
@@ -578,8 +690,8 @@ mod tests {
         }
         assert_eq!(
             tablas.len(),
-            9,
-            "el esquema completo debe tener nueve tablas: {tablas:?}"
+            14,
+            "el esquema completo debe tener catorce tablas: {tablas:?}"
         );
 
         let indices = objetos(&conn, "index");
@@ -595,6 +707,8 @@ mod tests {
             "IDX_CONN_APP",
             "IDX_NAME_CACHE_IP",
             "IDX_NAME_CACHE_EXPIRES",
+            "IDX_SEEN_LAST_SEEN",
+            "IDX_APP_SESSIONS_ENDED",
         ] {
             assert!(
                 indices.contains(&esperado.to_string()),
@@ -712,6 +826,44 @@ mod tests {
                 "expires_at"
             ]
         );
+        for tabla in [
+            "TRAFFIC_ROLLUP_MINUTE",
+            "TRAFFIC_ROLLUP_HOUR",
+            "TRAFFIC_ROLLUP_DAY",
+        ] {
+            assert_eq!(
+                columnas(&conn, tabla),
+                vec![
+                    "bucket",
+                    "subject",
+                    "device_id",
+                    "dimension",
+                    "key",
+                    "bytes_down",
+                    "bytes_up",
+                    "connections"
+                ],
+                "columnas de {tabla}"
+            );
+        }
+        assert_eq!(
+            columnas(&conn, "DEVICE_SEEN"),
+            vec!["id", "device_id", "kind", "key", "first_seen", "last_seen"]
+        );
+        assert_eq!(
+            columnas(&conn, "APP_SESSIONS"),
+            vec![
+                "id",
+                "started_at",
+                "ended_at",
+                "last_beat",
+                "end_reason",
+                "mode",
+                "capture",
+                "passive_only",
+                "version"
+            ]
+        );
     }
 
     #[test]
@@ -729,8 +881,8 @@ mod tests {
         assert_eq!(current_version(&conn).expect("leer versión"), 2);
 
         let version = apply_all(&mut conn).expect("reaplicar migraciones v3 y v4");
-        assert_eq!(version, 4);
-        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+        assert_eq!(version, 5);
+        assert_eq!(current_version(&conn).expect("leer versión"), 5);
         assert!(objetos(&conn, "table").contains(&"TRAFFIC_SNAPSHOT".to_string()));
         assert!(objetos(&conn, "table").contains(&"NAME_CACHE".to_string()));
     }
@@ -787,7 +939,7 @@ mod tests {
         // Migración aditiva hasta la última versión: los datos anteriores se
         // conservan.
         let version = apply_all(&mut conn).expect("migrar F2 a la última versión");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let (ip, alias, os_family): (String, Option<String>, Option<String>) = conn
             .query_row("SELECT ip, alias, os_family FROM DEVICES", [], |fila| {
@@ -989,8 +1141,8 @@ mod tests {
 
         // Migración aditiva a v4: no se pierde ninguna fila.
         let version = apply_all(&mut conn).expect("migrar F3 a F4");
-        assert_eq!(version, 4);
-        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+        assert_eq!(version, 5);
+        assert_eq!(current_version(&conn).expect("leer versión"), 5);
 
         // DEVICES conserva lo de F1/F2 y las seis columnas nuevas están a NULL.
         let (mac, ip, hostname, alias, os_family): (
@@ -1113,17 +1265,260 @@ mod tests {
         .expect("insertar una entrada de NAME_CACHE");
 
         // Reaplicar no falla, no duplica registros ni toca los datos.
-        assert_eq!(apply_all(&mut conn).expect("reaplicar migraciones"), 4);
+        assert_eq!(apply_all(&mut conn).expect("reaplicar migraciones"), 5);
         let registros: i64 = conn
             .query_row("SELECT COUNT(*) FROM SCHEMA_MIGRATIONS", [], |fila| {
                 fila.get(0)
             })
             .expect("contar migraciones");
-        assert_eq!(registros, 4);
+        assert_eq!(registros, 5);
         let filas_cache: i64 = conn
             .query_row("SELECT COUNT(*) FROM NAME_CACHE", [], |fila| fila.get(0))
             .expect("contar NAME_CACHE");
         assert_eq!(filas_cache, 1, "los datos de NAME_CACHE se conservan");
+    }
+
+    #[test]
+    fn migracion_v5_conserva_datos_de_una_bd_de_fase_4() {
+        let mut conn = conexion_vacia();
+
+        // Base de datos de Fase 4: esquema v1..v4 registrado y datos de todas
+        // las tablas anteriores.
+        conn.execute_batch(SQL_CREAR_SCHEMA_MIGRATIONS)
+            .expect("crear SCHEMA_MIGRATIONS");
+        conn.execute_batch(SQL_ESQUEMA_INICIAL)
+            .expect("aplicar esquema v1");
+        conn.execute_batch(SQL_ESQUEMA_FASE_2)
+            .expect("aplicar esquema v2");
+        conn.execute_batch(SQL_ESQUEMA_FASE_3)
+            .expect("aplicar esquema v3");
+        conn.execute_batch(SQL_ESQUEMA_FASE_4)
+            .expect("aplicar esquema v4");
+        conn.execute(
+            "INSERT INTO SCHEMA_MIGRATIONS (version, applied_at)
+             VALUES (1, ?1), (2, ?1), (3, ?1), (4, ?1)",
+            params!["2026-11-10T10:00:00Z"],
+        )
+        .expect("registrar v1..v4");
+        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+
+        conn.execute(
+            "INSERT INTO INTERFACES (name, mac, ipv4, netmask, gateway, is_up, last_seen)
+             VALUES ('eth0', 'aa:bb:cc:dd:ee:ff', '192.168.1.10', '255.255.255.0',
+                     '192.168.1.1', 1, '2026-11-10T10:00:00Z')",
+            [],
+        )
+        .expect("insertar interfaz de F1");
+        conn.execute(
+            "INSERT INTO DEVICES (mac, ip, hostname, vendor, interface_id, device_type,
+                                  is_online, first_seen, last_seen, alias, notes, os_family,
+                                  device_type_manual, last_fingerprint, model, dhcp_fingerprint,
+                                  dhcp_vendor, dhcp_hostname, user_agent, os_source)
+             VALUES ('aa:bb:cc:dd:ee:01', '192.168.1.50', 'portatil', 'Apple', 1, 'pc', 1,
+                     '2026-11-10T10:00:00Z', '2026-11-10T10:05:00Z', 'mi portatil', 'no tocar',
+                     'linux', 'pc', '{\"ttl\":64}', 'MacBookPro18,3', '1,3,6', 'MSFT 5.0',
+                     'portatil', 'Mozilla/5.0', 'dhcp')",
+            [],
+        )
+        .expect("insertar equipo de F1/F2/F4");
+        conn.execute(
+            "INSERT INTO DEVICE_EVENTS (device_id, event_type, details, created_at)
+             VALUES (1, 'new', '{}', '2026-11-10T10:00:00Z')",
+            [],
+        )
+        .expect("insertar evento");
+        conn.execute(
+            "INSERT INTO DEVICE_SERVICES
+                 (device_id, port, protocol, service, banner, first_seen, last_seen)
+             VALUES (1, 22, 'tcp', 'ssh', 'SSH-2.0', '2026-11-10T10:10:00Z',
+                     '2026-11-10T10:10:00Z')",
+            [],
+        )
+        .expect("insertar servicio");
+        conn.execute(
+            "INSERT INTO DISCOVERY_SOURCES (device_id, source, last_seen)
+             VALUES (1, 'arp', '2026-11-10T10:10:00Z')",
+            [],
+        )
+        .expect("insertar fuente");
+        conn.execute(
+            "INSERT INTO TRAFFIC_SNAPSHOT
+                 (device_id, bytes_in, bytes_out, packets_in, packets_out, peak_bps,
+                  window_s, updated_at)
+             VALUES (1, 100, 200, 1, 2, 300, 60, '2026-11-10T10:11:00Z')",
+            [],
+        )
+        .expect("insertar snapshot");
+        conn.execute(
+            "INSERT INTO CONNECTIONS
+                 (device_id, protocol, src_ip, src_port, dst_ip, dst_port, state,
+                  bytes_in, bytes_out, first_seen, last_seen, client_is_src,
+                  app_protocol, server_name, name_source, app, category, app_source, ja4)
+             VALUES (1, 'tcp', '192.168.1.50', 40000, '1.1.1.1', 443, 'ESTABLISHED',
+                     10, 20, '2026-11-10T10:12:00Z', '2026-11-10T10:13:00Z', 1,
+                     'tls', 'youtube.com', 'sni', 'youtube', 'streaming', 'domain',
+                     't13d1516h2')",
+            [],
+        )
+        .expect("insertar conexión");
+        conn.execute(
+            "INSERT INTO NAME_CACHE (ip, name, source, first_seen, last_seen, expires_at)
+             VALUES ('1.1.1.1', 'youtube.com', 'dns', '2026-11-10T10:12:00Z',
+                     '2026-11-10T10:12:00Z', '2026-11-10T11:12:00Z')",
+            [],
+        )
+        .expect("insertar nombre");
+
+        // Abrir con F5: migración v5 aditiva y auto_vacuum incremental.
+        let version = apply_all(&mut conn).expect("migrar F4 hasta F5");
+        assert_eq!(version, 5);
+
+        // Todos los datos de F4 se conservan.
+        for (tabla, filas) in [
+            ("INTERFACES", 1i64),
+            ("DEVICES", 1),
+            ("DEVICE_EVENTS", 1),
+            ("DEVICE_SERVICES", 1),
+            ("DISCOVERY_SOURCES", 1),
+            ("TRAFFIC_SNAPSHOT", 1),
+            ("CONNECTIONS", 1),
+            ("NAME_CACHE", 1),
+        ] {
+            let total: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {tabla}"), [], |fila| {
+                    fila.get(0)
+                })
+                .expect("contar filas de F4");
+            assert_eq!(total, filas, "se perdieron filas de {tabla}");
+        }
+        let (alias, os_family, ja4): (String, String, String) = conn
+            .query_row(
+                "SELECT d.alias, d.os_family, c.ja4
+                   FROM DEVICES d, CONNECTIONS c
+                  WHERE d.id = c.device_id",
+                [],
+                |fila| Ok((fila.get(0)?, fila.get(1)?, fila.get(2)?)),
+            )
+            .expect("leer datos de F4");
+        assert_eq!(alias, "mi portatil");
+        assert_eq!(os_family, "linux");
+        assert_eq!(ja4, "t13d1516h2");
+
+        // Las tablas nuevas existen y están vacías.
+        for tabla in [
+            "TRAFFIC_ROLLUP_MINUTE",
+            "TRAFFIC_ROLLUP_HOUR",
+            "TRAFFIC_ROLLUP_DAY",
+            "DEVICE_SEEN",
+            "APP_SESSIONS",
+        ] {
+            let total: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {tabla}"), [], |fila| {
+                    fila.get(0)
+                })
+                .expect("contar tabla nueva");
+            assert_eq!(total, 0, "la tabla nueva {tabla} debe quedar vacía");
+        }
+
+        // auto_vacuum = INCREMENTAL (2) tras el VACUUM de la migración.
+        let modo: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |fila| fila.get(0))
+            .expect("leer auto_vacuum");
+        assert_eq!(modo, 2, "auto_vacuum debe ser INCREMENTAL");
+
+        // Una segunda apertura no repite nada.
+        let version = apply_all(&mut conn).expect("reaplicar migraciones");
+        assert_eq!(version, 5);
+        let registros: i64 = conn
+            .query_row("SELECT COUNT(*) FROM SCHEMA_MIGRATIONS", [], |fila| {
+                fila.get(0)
+            })
+            .expect("contar migraciones");
+        assert_eq!(registros, 5);
+    }
+
+    #[test]
+    fn la_migracion_v5_es_idempotente_aunque_se_borre_su_registro() {
+        let mut conn = conexion_vacia();
+        apply_all(&mut conn).expect("aplicar migraciones");
+
+        conn.execute("DELETE FROM SCHEMA_MIGRATIONS WHERE version = 5", [])
+            .expect("borrar registro de v5");
+        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+
+        let version = apply_all(&mut conn).expect("reaplicar migración v5");
+        assert_eq!(version, 5);
+        assert_eq!(current_version(&conn).expect("leer versión"), 5);
+        let registros: i64 = conn
+            .query_row("SELECT COUNT(*) FROM SCHEMA_MIGRATIONS", [], |fila| {
+                fila.get(0)
+            })
+            .expect("contar migraciones");
+        assert_eq!(registros, 5, "el registro de v5 vuelve a quedar anotado");
+        assert!(objetos(&conn, "table").contains(&"TRAFFIC_ROLLUP_MINUTE".to_string()));
+    }
+
+    /// Comprueba que las tablas de rollup son WITHOUT ROWID con la clave
+    /// primaria en el orden del §3.
+    #[test]
+    fn las_tablas_de_rollup_son_without_rowid_con_su_clave() {
+        let mut conn = conexion_vacia();
+        apply_all(&mut conn).expect("aplicar migraciones");
+        for tabla in [
+            "TRAFFIC_ROLLUP_MINUTE",
+            "TRAFFIC_ROLLUP_HOUR",
+            "TRAFFIC_ROLLUP_DAY",
+        ] {
+            let sin_rowid: i64 = conn
+                .query_row(
+                    "SELECT wr FROM pragma_table_list WHERE name = ?1",
+                    params![tabla],
+                    |fila| fila.get(0),
+                )
+                .expect("leer without rowid");
+            assert_eq!(sin_rowid, 1, "{tabla} debe ser WITHOUT ROWID");
+            // Orden de definición de las columnas.
+            let mut sentencia = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{tabla}') ORDER BY cid"
+                ))
+                .expect("preparar columnas");
+            let columnas: Vec<String> = sentencia
+                .query_map([], |fila| fila.get(0))
+                .expect("consultar columnas")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("leer columnas");
+            assert_eq!(
+                columnas,
+                vec![
+                    "bucket",
+                    "subject",
+                    "device_id",
+                    "dimension",
+                    "key",
+                    "bytes_down",
+                    "bytes_up",
+                    "connections"
+                ],
+                "columnas de {tabla}"
+            );
+            // Orden de la clave primaria (los cinco primeros, en orden).
+            let mut sentencia = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{tabla}') WHERE pk > 0 ORDER BY pk"
+                ))
+                .expect("preparar clave primaria");
+            let clave: Vec<String> = sentencia
+                .query_map([], |fila| fila.get(0))
+                .expect("consultar clave primaria")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("leer clave primaria");
+            assert_eq!(
+                clave,
+                vec!["bucket", "subject", "device_id", "dimension", "key"],
+                "clave primaria de {tabla}"
+            );
+        }
     }
 
     #[test]
@@ -1141,15 +1536,17 @@ mod tests {
         )
         .expect("insertar entrada de NAME_CACHE");
 
-        conn.execute("DELETE FROM SCHEMA_MIGRATIONS WHERE version = 4", [])
-            .expect("borrar registro de v4");
+        // Se borran v4 y v5: la versión actual se lee como MAX(version).
+        conn.execute("DELETE FROM SCHEMA_MIGRATIONS WHERE version >= 4", [])
+            .expect("borrar registros de v4 y v5");
         assert_eq!(current_version(&conn).expect("leer versión"), 3);
 
         // already_applied detecta la tabla NAME_CACHE y evita reejecutar los
-        // ALTER TABLE, que fallarían con "duplicate column name".
-        let version = apply_all(&mut conn).expect("reaplicar migración v4");
-        assert_eq!(version, 4);
-        assert_eq!(current_version(&conn).expect("leer versión"), 4);
+        // ALTER TABLE, que fallarían con "duplicate column name"; v5 se salta
+        // por su tabla TRAFFIC_ROLLUP_MINUTE.
+        let version = apply_all(&mut conn).expect("reaplicar migraciones v4 y v5");
+        assert_eq!(version, 5);
+        assert_eq!(current_version(&conn).expect("leer versión"), 5);
         let filas: i64 = conn
             .query_row("SELECT COUNT(*) FROM NAME_CACHE", [], |fila| fila.get(0))
             .expect("contar NAME_CACHE");
@@ -1159,6 +1556,6 @@ mod tests {
                 fila.get(0)
             })
             .expect("contar migraciones");
-        assert_eq!(registros, 4, "el registro de v4 vuelve a quedar anotado");
+        assert_eq!(registros, 5, "el registro de v5 vuelve a quedar anotado");
     }
 }

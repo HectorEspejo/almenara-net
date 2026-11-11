@@ -65,6 +65,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// Parámetros de persistencia.
     pub storage: StorageConfig,
+    /// Parámetros del histórico (Fase 5).
+    pub history: HistoryConfig,
     /// Parámetros de interfaz.
     pub ui: UiConfig,
     /// Parámetros del motor de inferencia (Fase 4).
@@ -124,6 +126,120 @@ impl Default for StorageConfig {
             db_path: "~/.local/share/almenara/data.db".to_string(),
             events_retention_days: DEFAULT_RETENTION_DAYS,
         }
+    }
+}
+
+/// Valores por defecto de [history] (§7.12).
+pub const DEFAULT_MINUTE_DAYS: u32 = 2;
+/// Días de retención de las horas.
+pub const DEFAULT_HOUR_DAYS: u32 = 90;
+/// Días de retención de días, inventario y sesiones.
+pub const DEFAULT_DAY_DAYS: u32 = 730;
+/// Días de retención de destinos por hora.
+pub const DEFAULT_DESTINATION_DAYS: u32 = 30;
+/// Claves normales por sujeto, dimensión y cubo.
+pub const DEFAULT_TOP_KEYS: usize = 20;
+/// Tamaño de la base de datos a partir del cual se avisa (MB).
+pub const DEFAULT_MAX_DB_MB: u64 = 1024;
+/// Mínimo aceptado de max_db_mb.
+pub const MIN_MAX_DB_MB: u64 = 64;
+
+/// Sección [history]: retención y límites del histórico de F5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Guardar histórico (rollups e inventario).
+    pub enabled: bool,
+    /// Retención de minutos en días (48 h con el valor por defecto).
+    pub minute_days: u32,
+    /// Retención de horas en días.
+    pub hour_days: u32,
+    /// Retención de días, inventario y sesiones en días.
+    pub day_days: u32,
+    /// Retención de destinos por hora en días (0 = no guardarlos).
+    pub destination_days: u32,
+    /// Claves normales por sujeto, dimensión y cubo; el resto, «otros».
+    pub top_keys: usize,
+    /// Aviso cuando la base de datos supera este tamaño en MB.
+    pub max_db_mb: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minute_days: DEFAULT_MINUTE_DAYS,
+            hour_days: DEFAULT_HOUR_DAYS,
+            day_days: DEFAULT_DAY_DAYS,
+            destination_days: DEFAULT_DESTINATION_DAYS,
+            top_keys: DEFAULT_TOP_KEYS,
+            max_db_mb: DEFAULT_MAX_DB_MB,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// Retención equivalente para el DAO del histórico.
+    pub fn retention(&self) -> crate::history::Retention {
+        crate::history::Retention {
+            minute_days: self.minute_days,
+            hour_days: self.hour_days,
+            day_days: self.day_days,
+            destination_days: self.destination_days,
+        }
+    }
+
+    /// Corrige los valores fuera de rango con el valor por defecto y avisa.
+    ///
+    /// La configuración nunca aborta el arranque: un valor inválido se avisa una
+    /// vez y se sustituye por el valor por defecto (§7.12).
+    pub fn validar(&mut self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if !(1..=7).contains(&self.minute_days) {
+            avisos.push(format!(
+                "[history].minute_days = {} no es válido (1-7); se usa {DEFAULT_MINUTE_DAYS}",
+                self.minute_days
+            ));
+            self.minute_days = DEFAULT_MINUTE_DAYS;
+        }
+        if !(7..=365).contains(&self.hour_days) {
+            avisos.push(format!(
+                "[history].hour_days = {} no es válido (7-365); se usa {DEFAULT_HOUR_DAYS}",
+                self.hour_days
+            ));
+            self.hour_days = DEFAULT_HOUR_DAYS;
+        }
+        if !(30..=3650).contains(&self.day_days) {
+            avisos.push(format!(
+                "[history].day_days = {} no es válido (30-3650); se usa {DEFAULT_DAY_DAYS}",
+                self.day_days
+            ));
+            self.day_days = DEFAULT_DAY_DAYS;
+        }
+        if self.destination_days > self.hour_days {
+            avisos.push(format!(
+                "[history].destination_days = {} no puede superar hour_days = {}; se usa {}",
+                self.destination_days,
+                self.hour_days,
+                DEFAULT_DESTINATION_DAYS.min(self.hour_days)
+            ));
+            self.destination_days = DEFAULT_DESTINATION_DAYS.min(self.hour_days);
+        }
+        if !(5..=100).contains(&self.top_keys) {
+            avisos.push(format!(
+                "[history].top_keys = {} no es válido (5-100); se usa {DEFAULT_TOP_KEYS}",
+                self.top_keys
+            ));
+            self.top_keys = DEFAULT_TOP_KEYS;
+        }
+        if self.max_db_mb < MIN_MAX_DB_MB {
+            avisos.push(format!(
+                "[history].max_db_mb = {} no es válido (mínimo {MIN_MAX_DB_MB}); se usa {DEFAULT_MAX_DB_MB}",
+                self.max_db_mb
+            ));
+            self.max_db_mb = DEFAULT_MAX_DB_MB;
+        }
+        avisos
     }
 }
 
@@ -468,6 +584,9 @@ impl Config {
         match Self::load(path) {
             Ok(config) => {
                 let (mut config, mut avisos) = config.descartar_lease_paths_inexistentes();
+                // [history] se valida campo a campo: un valor inválido se avisa
+                // una vez y usa el valor por defecto, sin abortar el arranque.
+                avisos.extend(config.history.validar());
                 avisos.extend(config.warnings());
                 // Las claves obsoletas de F3 se avisan una sola vez y se
                 // descartan: la inferencia se rige por [inference].enabled.
@@ -766,7 +885,83 @@ mod tests {
         assert_eq!(config.capture.sni_attribution, None);
         assert!(!config.capture.has_filter());
         assert_eq!(config.capture.filter_label(), "(ninguno)");
+        // [history] con los valores por defecto de §7.12.
+        assert!(config.history.enabled);
+        assert_eq!(config.history.minute_days, 2);
+        assert_eq!(config.history.hour_days, 90);
+        assert_eq!(config.history.day_days, 730);
+        assert_eq!(config.history.destination_days, 30);
+        assert_eq!(config.history.top_keys, 20);
+        assert_eq!(config.history.max_db_mb, 1024);
+        assert_eq!(
+            config.history.retention(),
+            crate::history::Retention {
+                minute_days: 2,
+                hour_days: 90,
+                day_days: 730,
+                destination_days: 30,
+            }
+        );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn la_plantilla_incluye_la_seccion_history() {
+        let plantilla = Config::default().to_toml();
+        assert!(
+            plantilla.contains("[history]"),
+            "falta [history]: {plantilla}"
+        );
+        assert!(plantilla.contains("minute_days = 2"));
+        assert!(plantilla.contains("hour_days = 90"));
+        assert!(plantilla.contains("day_days = 730"));
+        assert!(plantilla.contains("destination_days = 30"));
+        assert!(plantilla.contains("top_keys = 20"));
+        assert!(plantilla.contains("max_db_mb = 1024"));
+    }
+
+    #[test]
+    fn los_valores_invalidos_de_history_avisan_y_usan_el_valor_por_defecto() {
+        let mut config = Config::default();
+        config.history.hour_days = 2;
+        config.history.minute_days = 0;
+        config.history.day_days = 10;
+        config.history.top_keys = 1000;
+        config.history.max_db_mb = 1;
+        config.history.destination_days = 500;
+        let avisos = config.history.validar();
+        assert_eq!(avisos.len(), 6, "un aviso por valor inválido: {avisos:?}");
+        assert_eq!(config.history.hour_days, DEFAULT_HOUR_DAYS);
+        assert_eq!(config.history.minute_days, DEFAULT_MINUTE_DAYS);
+        assert_eq!(config.history.day_days, DEFAULT_DAY_DAYS);
+        assert_eq!(config.history.top_keys, DEFAULT_TOP_KEYS);
+        assert_eq!(config.history.max_db_mb, DEFAULT_MAX_DB_MB);
+        assert_eq!(config.history.destination_days, DEFAULT_DESTINATION_DAYS);
+        // La configuración nunca aborta: validate() no falla por [history].
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn destination_days_no_puede_superar_las_horas_validas() {
+        let mut config = Config::default();
+        config.history.hour_days = 7;
+        config.history.destination_days = 30;
+        let avisos = config.history.validar();
+        assert_eq!(avisos.len(), 1);
+        assert_eq!(config.history.destination_days, 7);
+    }
+
+    #[test]
+    fn load_or_default_avisa_de_history_invalido() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[history]\nhour_days = 2\n").unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(config.history.hour_days, DEFAULT_HOUR_DAYS);
+        assert!(
+            avisos.iter().any(|aviso| aviso.contains("hour_days")),
+            "debe avisar una vez: {avisos:?}"
+        );
     }
 
     #[test]

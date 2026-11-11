@@ -16,8 +16,10 @@ mod config;
 mod discovery;
 mod error;
 mod events;
+mod history;
 mod identify;
 mod inference;
+mod instance;
 mod logging;
 mod notifier;
 mod oui;
@@ -118,6 +120,16 @@ async fn ejecutar(cli: Cli) -> Result<()> {
     let db_path = config.database_path()?;
     let theme = Theme::from_flags(config.ui.no_color, cli.no_color);
 
+    // Instancia única por base de datos (ADR-65): si otra Almenara tiene el
+    // bloqueo, se sale sin abrir la BD y con código 1.
+    let _instance_lock = match instance::InstanceLock::acquire(&db_path) {
+        Ok(bloqueo) => bloqueo,
+        Err(err) => {
+            tracing::warn!(%err, "ya hay una instancia de Almenara en marcha");
+            return Err(error::Error::Config(err.to_string()));
+        }
+    };
+
     // 4) Capacidades y base de datos (con modal bloqueante si falla).
     let capabilities = capabilities::Capabilities::detect();
     tracing::info!(modo = capabilities.mode_label(), detalle = %capabilities.detail, "Capacidades detectadas");
@@ -206,6 +218,43 @@ async fn ejecutar(cli: Cli) -> Result<()> {
 
     // 6) Canales, estado de la TUI y tarea de escaneo.
     let (event_tx, event_rx) = events::bus();
+
+    // Histórico (F5): las sesiones interrumpidas se cierran en el arranque y se
+    // abre la de esta ejecución; el lector de solo lectura se lanza después de
+    // las migraciones (la conexión de escritura ya creó el WAL).
+    match repo.close_open_sessions() {
+        Ok(cerradas) if cerradas > 0 => {
+            tracing::info!(cerradas, "sesiones interrumpidas cerradas al arrancar");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "no se pudieron cerrar las sesiones abiertas"),
+    }
+    let session_info = history::SessionInfo {
+        // Valores persistidos de APP_SESSIONS.mode (§3): privileged/degraded.
+        mode: if capabilities.raw_sockets {
+            "privileged"
+        } else {
+            "degraded"
+        }
+        .to_string(),
+        capture: config.capture.enabled && capabilities.raw_sockets,
+        passive_only: config.scan.passive_only,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let session_id = match repo.open_session(&session_info) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(%err, "no se pudo abrir la sesión del histórico");
+            None
+        }
+    };
+    let history_reader = match history::reader::HistoryReader::spawn(&db_path, event_tx.clone()) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            tracing::warn!(%err, "no se pudo lanzar el lector del histórico");
+            None
+        }
+    };
     let (command_tx, command_rx) = events::command_channel();
     let scan_options = ScanOptions::from_config(&config.scan, capabilities.raw_sockets)?;
     let intervalo = Duration::from_secs(config.scan.interval_s);
@@ -219,6 +268,9 @@ async fn ejecutar(cli: Cli) -> Result<()> {
     );
     app.theme = theme;
     app.set_data(devices, interfaces);
+    app.session_id = session_id;
+    app.last_beat = Some(std::time::Instant::now());
+    app.history_reader = history_reader;
     for aviso in avisos {
         app.push_notification(Level::Warn, aviso);
     }

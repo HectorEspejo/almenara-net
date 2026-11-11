@@ -142,6 +142,18 @@ fn draw_lista(frame: &mut Frame, app: &mut App, area: Rect) {
     let interior = bloque.inner(area);
     frame.render_widget(bloque, area);
 
+    // Línea «Último evento» al pie del contenido (encima de la barra de estado);
+    // se oculta si no hay evento o si el texto no cabe (§6, mockup 5).
+    let evento = linea_ultimo_evento(app, interior.width);
+    let (area_lista, area_evento) = match &evento {
+        Some(_) if interior.height > 3 => {
+            let filas =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(interior);
+            (filas[0], Some(filas[1]))
+        }
+        _ => (interior, None),
+    };
+
     if indices.is_empty() {
         let mensaje = if app.filter == Filter::Alert {
             "No hay alertas: esta pestaña llegará en una fase posterior"
@@ -157,14 +169,61 @@ fn draw_lista(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(1),
             Constraint::Fill(1),
         ])
-        .split(interior);
+        .split(area_lista);
         frame.render_widget(parrafo, filas[1]);
-        return;
+    } else {
+        match app.list_view {
+            ListView::Flat => draw_flat(frame, app, &indices, area_lista),
+            ListView::Grouped => draw_grouped(frame, app, &indices, area_lista),
+        }
     }
+    if let (Some(linea), Some(area)) = (evento, area_evento) {
+        frame.render_widget(Paragraph::new(linea), area);
+    }
+}
 
-    match app.list_view {
-        ListView::Flat => draw_flat(frame, app, &indices, interior),
-        ListView::Grouped => draw_grouped(frame, app, &indices, interior),
+/// Línea «Último evento: hace N min · <equipo> <qué pasó>».
+///
+/// Devuelve None si todavía no hay evento o si el texto no cabe en el ancho
+/// disponible (se oculta sin recortar).
+fn linea_ultimo_evento(app: &App, ancho: u16) -> Option<Line<'static>> {
+    let evento = app.history.last_event.as_ref()?;
+    let ahora = crate::history::localtime::now_unix();
+    let hace = hace_cuanto(ahora.saturating_sub(evento.at_unix));
+    let detalle = match &evento.device_label {
+        Some(equipo)
+            if !evento
+                .summary
+                .to_lowercase()
+                .contains(&equipo.to_lowercase()) =>
+        {
+            format!("{equipo}: {}", evento.summary)
+        }
+        _ => evento.summary.clone(),
+    };
+    let texto = format!("Último evento: hace {hace} · {detalle}");
+    if texto.chars().count() > usize::from(ancho) {
+        return None;
+    }
+    Some(Line::from(vec![
+        Span::styled("Último evento: ", app.theme.accent),
+        Span::styled(format!("hace {hace}"), app.theme.dim),
+        Span::styled(" · ", app.theme.dim),
+        Span::styled(detalle, app.theme.normal),
+    ]))
+}
+
+/// Texto de «hace cuánto» de un evento («2 min», «3 h», «2 d»).
+fn hace_cuanto(segundos: i64) -> String {
+    let segundos = segundos.max(0);
+    if segundos < 60 {
+        format!("{segundos} s")
+    } else if segundos < 3600 {
+        format!("{} min", segundos / 60)
+    } else if segundos < 86_400 {
+        format!("{} h", segundos / 3600)
+    } else {
+        format!("{} d", segundos / 86_400)
     }
 }
 
@@ -334,6 +393,7 @@ fn ajustar(texto: &str, ancho: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::hace_cuanto;
     use crate::capabilities::Capabilities;
     use crate::config::{Config, ListView};
     use crate::repo::devices::Device;
@@ -602,5 +662,52 @@ mod tests {
         app.selected = 2;
         dibujar(&mut app, 100, 24);
         assert_eq!(app.table_state.selected(), Some(2));
+    }
+
+    fn ultimo_evento(resumen: &str) -> crate::history::TimelineItem {
+        let ahora = crate::history::localtime::now_unix();
+        crate::history::TimelineItem {
+            at: crate::history::localtime::rfc3339(ahora - 120),
+            at_unix: ahora - 120,
+            kind: crate::history::TimelineKind::Event,
+            device_id: Some(1),
+            device_label: Some("iPhone-Marta".to_string()),
+            event_type: "reappeared".to_string(),
+            summary: resumen.to_string(),
+            session_reason: None,
+        }
+    }
+
+    #[test]
+    fn la_linea_de_ultimo_evento_se_muestra_encima_de_la_barra() {
+        let mut app = app_con(vec![dispositivo(1, "10.0.0.1", true, true)]);
+        app.history.last_event = Some(ultimo_evento("iPhone-Marta vuelve a estar en línea"));
+        let contenido = dibujar(&mut app, 100, 24);
+        assert!(contenido.contains("Último evento:"));
+        assert!(contenido.contains("hace 2 min"));
+        assert!(contenido.contains("iPhone-Marta vuelve a estar en línea"));
+    }
+
+    #[test]
+    fn sin_ultimo_evento_no_se_muestra_la_linea() {
+        let mut app = app_con(vec![dispositivo(1, "10.0.0.1", true, true)]);
+        let contenido = dibujar(&mut app, 100, 24);
+        assert!(!contenido.contains("Último evento:"));
+    }
+
+    #[test]
+    fn la_linea_de_ultimo_evento_se_oculta_si_no_cabe() {
+        let mut app = app_con(vec![dispositivo(1, "10.0.0.1", true, true)]);
+        app.history.last_event = Some(ultimo_evento(&"x".repeat(90)));
+        let contenido = dibujar(&mut app, 80, 24);
+        assert!(!contenido.contains("Último evento:"));
+    }
+
+    #[test]
+    fn el_texto_de_hace_cuanto_usa_minutos_horas_y_dias() {
+        assert_eq!(hace_cuanto(30), "30 s");
+        assert_eq!(hace_cuanto(120), "2 min");
+        assert_eq!(hace_cuanto(3 * 3600), "3 h");
+        assert_eq!(hace_cuanto(2 * 86_400), "2 d");
     }
 }

@@ -19,7 +19,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let mut lineas: Vec<Line> = Vec::new();
     lineas.push(Line::from(Span::styled(
         format!(
-            "Almenara v{} — Fase 4: protocolos, apps y top talkers",
+            "Almenara v{} — Fase 5: histórico, rollups y eventos",
             env!("CARGO_PKG_VERSION")
         ),
         app.theme.title,
@@ -49,7 +49,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Histórico y Alertas: llegarán en las fases 5 y 6",
+        "  Histórico     gráfica con huecos y cursor, más tráfico del rango y eventos",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Alertas       llegarán en la fase 6",
         app.theme.dim,
     )));
 
@@ -60,8 +64,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  w      ventana: 60 s → 5 min → sesión (no se guarda; arranca en 60 s)",
+        "  w      ventana: 60 s → 5 min → 1 h → 24 h → sesión (no se guarda)",
         app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "         1 h y 24 h salen del histórico (minutos cerrados); con",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "         [history] enabled = false se saltan",
+        app.theme.dim,
     )));
     lineas.push(Line::from(Span::styled(
         "  Enter  ¿quién lo usa? en destino/app/categoría/protocolo; en proceso abre",
@@ -81,6 +93,45 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lineas.push(Line::from(Span::styled(
         "  la red conmutada: solo se ve el tráfico propio y la difusión.",
+        app.theme.dim,
+    )));
+
+    lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled("Histórico (F5)", app.theme.accent)));
+    lineas.push(Line::from(Span::styled(
+        "  e      sujeto: toda la red, este equipo o un equipo (con /)",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  w      rango: 24 h → 7 días → 30 días → 1 año",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Tab    foco entre la gráfica, «Más tráfico» y Eventos",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  < >    cursor de la gráfica: fecha, bajada y subida del punto en texto",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  f      filtro de eventos: todos, altas y presencia, identidad, servicios o",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "         Almenara; / busca por nombre de equipo; Enter abre el detalle",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  En el detalle de equipo, w alterna su histórico entre 24 h y 7 días.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Los huecos se dibujan con ░ y nunca se interpolan; el tiempo que aún no",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  ha pasado se deja en blanco.",
         app.theme.dim,
     )));
 
@@ -147,6 +198,64 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lineas.push(Line::from(Span::styled(
         "  puerto y proceso local; la barra muestra «inferencia: desactivada».",
+        app.theme.dim,
+    )));
+
+    lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled(
+        "Privacidad del histórico (F5)",
+        app.theme.accent,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Solo se guardan agregados: bytes y conexiones por equipo y dimensión.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Nunca se guarda contenido ni nombres completos: el destino es el dominio",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  registrable, la IP o el equipo de la LAN. Sin registro de conexiones.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Retención: minutos 48 h, horas 90 días y días 2 años. Los destinos solo",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  viven 2 h por minuto y 30 días por hora; nunca en los días ni en el",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  inventario. La presencia se deriva de los eventos y dura lo que ellos,",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  90 días: la presencia de un móvil es la de su dueño. Si en casa viven",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  más personas, conviene que lo sepan. Todo es local: nada sale del equipo.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(vec![
+        Span::styled("  Para desactivarlo: ", app.theme.normal),
+        Span::styled("[history] enabled = false", app.theme.accent),
+        Span::styled(
+            " (deja de guardar rollups e inventario; los eventos y las sesiones siguen)",
+            app.theme.normal,
+        ),
+    ]));
+    lineas.push(Line::from(Span::styled(
+        "  Para borrarlo: cierra Almenara y borra la base de datos, o baja las",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  retenciones en [history]. Deja Almenara abierta (p. ej. en tmux) para",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  tener histórico continuo: solo se guarda mientras está abierta.",
         app.theme.dim,
     )));
 
@@ -281,7 +390,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lineas.push(Line::from(Span::styled(
         format!(
-            "  Almenara v{} — Fase 4. Detalle de fuentes en data/FUENTES.md",
+            "  Almenara v{} — Fase 5. Detalle de fuentes en data/FUENTES.md",
             env!("CARGO_PKG_VERSION")
         ),
         app.theme.dim,
@@ -348,7 +457,7 @@ mod tests_f4 {
             assert!(contenido.contains(tecla), "falta el atajo {tecla}");
         }
         assert!(contenido.contains("agrupar: equipo → destino → app"));
-        assert!(contenido.contains("ventana: 60 s → 5 min → sesión"));
+        assert!(contenido.contains("ventana: 60 s → 5 min → 1 h → 24 h → sesión"));
         assert!(contenido.contains("alternar nombres ⇄ IPs"));
     }
 
@@ -373,7 +482,48 @@ mod tests_f4 {
         assert!(contenido.contains("IP Geolocation by DB-IP (db-ip.com), CC BY 4.0"));
         assert!(contenido.contains("Public Suffix List"));
         assert!(contenido.contains("MPL 2.0"));
-        assert!(contenido.contains("Almenara v0.4.0 — Fase 4"));
-        assert!(contenido.contains("Fase 4: protocolos, apps y top talkers"));
+        assert!(contenido.contains("Fase 5"));
+        assert!(contenido.contains("Fase 5: histórico, rollups y eventos"));
+        assert!(contenido.contains(" — Fase 5"));
+    }
+
+    #[test]
+    fn la_ayuda_documenta_las_teclas_del_historico_de_f5() {
+        let app = app_prueba(false);
+        let contenido = texto(&app);
+        for tecla in [
+            "e (Histórico)",
+            "w (Histórico)",
+            "< > (Histórico)",
+            "f (Histórico)",
+            "Tab (Histórico)",
+            "w (detalle)",
+        ] {
+            assert!(contenido.contains(tecla), "falta el atajo {tecla}");
+        }
+        assert!(contenido.contains("sujeto: toda la red, este equipo o un equipo"));
+        assert!(contenido.contains("rango: 24 h → 7 días → 30 días → 1 año"));
+        assert!(contenido.contains("cursor de la gráfica: fecha, bajada y subida"));
+        assert!(contenido.contains("Histórico (F5)"));
+        assert!(contenido.contains("alterna su histórico entre 24 h y 7 días"));
+    }
+
+    #[test]
+    fn la_ayuda_explica_la_privacidad_del_historico() {
+        let app = app_prueba(false);
+        let contenido = texto(&app);
+        assert!(contenido.contains("Privacidad del histórico (F5)"));
+        assert!(contenido.contains("Solo se guardan agregados"));
+        assert!(contenido.contains("Sin registro de conexiones"));
+        assert!(contenido.contains("minutos 48 h, horas 90 días y días 2 años"));
+        assert!(contenido.contains("Los destinos solo"));
+        assert!(contenido.contains("30 días por hora"));
+        assert!(
+            contenido.contains("la presencia de un móvil es la de su dueño"),
+            "debe avisar de que la presencia es la de la persona"
+        );
+        assert!(contenido.contains("[history] enabled = false"));
+        assert!(contenido.contains("Todo es local"));
+        assert!(contenido.contains("borra la base de datos"));
     }
 }

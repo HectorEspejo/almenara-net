@@ -3,6 +3,74 @@
 Todas las versiones relevantes del proyecto. El formato sigue
 [Versionado Semántico](https://semver.org/lang/es/).
 
+## [0.5.0] - 2026-11-11
+
+**Fase 5 — Histórico, rollups y eventos.** Almenara deja de olvidar: cierra cada
+minuto sus contadores de F4 y los guarda como rollups por minuto (48 h), hora
+(90 días) y día local (2 años), con retención, purga y compactación. Con ellos
+llegan la pestaña Histórico, las ventanas de 1 h y 24 h de Tráfico y el
+histórico de cada equipo; se completan los eventos (vuelta a estar en línea,
+servicios, SO y tipo) y la presencia, y se guarda el inventario por equipo.
+
+### Añadido
+
+- **Histórico agregado sin registro de conexiones** (ADR-58): rollups por
+  minuto, hora y día con sujetos device, host, other y network; dimensiones
+  total, app, categoría, destino, protocolo, proceso, organización y país;
+  claves especiales (~sin_identificar, ~lan y ~desconocido) y tope de top_keys
+  claves por cubo con el resto en ~otros (los totales cuadran).
+- **Retención por resolución**: minutos 48 h y destinos 2 h; horas 90 días y
+  destinos 30 días; días, inventario y sesiones 2 años. Purga horaria con
+  incremental_vacuum y aviso si la BD supera max_db_mb.
+- **Migración v5 aditiva**: TRAFFIC_ROLLUP_MINUTE/HOUR/DAY (WITHOUT ROWID),
+  DEVICE_SEEN y APP_SESSIONS, auto_vacuum = INCREMENTAL (un único VACUUM) y
+  test de compatibilidad F4 → F5 sin pérdida de datos.
+- **Sesiones con latido**: cada ejecución abre una sesión (modo, captura,
+  pasivo y versión), late cada minuto y se cierra con q o como interrumpida en
+  el arranque siguiente. Los huecos de cobertura se marcan, nunca se
+  interpolan.
+- **Instancia única** por base de datos con flock sobre data.db.lock.
+- **Eventos nuevos**: reappeared (con away_since/away_s), disappeared con
+  last_seen, service_new (incluido reopened), service_gone, os_changed y
+  type_changed; sin eventos de servicios en el primer escaneo ni con
+  passive_only, y un puerto STALE por tiempo no emite evento.
+- **Presencia por equipo** calculada al vuelo desde los eventos y las sesiones.
+- **Inventario por equipo** (DEVICE_SEEN): apps, categorías, organizaciones,
+  países y JA4 con primera y última vez, y puertos abiertos desde
+  DEVICE_SERVICES.
+- **Lector del histórico** en su propio hilo con conexión de solo lectura y
+  progress_handler de 2 s; la TUI descarta las respuestas obsoletas.
+- **TUI**: pestaña Histórico (sujeto con e, rango con w, foco con Tab, gráfica
+  con huecos ░ y cursor < >, «Más tráfico» y línea de tiempo de eventos con f
+  y /); ventanas de **1 h y 24 h** en Tráfico con volúmenes, minutos cerrados y
+  huecos; detalle con histórico 24 h ⇄ 7 días, presencia y «Visto en este
+  equipo»; línea «Último evento» en Equipos; [history], tamaño de la BD y
+  cobertura en Config; Ayuda con las teclas y la privacidad.
+- **Histórico sintético** determinista y prueba ignorada de medición
+  (cargo test --release -- --ignored medir_historial), sin depender de
+  CAP_NET_RAW.
+- **Configuración** [history] con validación tolerante (aviso único y valor por
+  defecto).
+- README con el histórico, la retención, la privacidad, la copia de la BD
+  (sqlite3 data.db ".backup copia.db" o VACUUM INTO), el consejo de dejar
+  Almenara abierta (por ejemplo en tmux) para histórico continuo y la instancia
+  única.
+
+### Cambiado
+
+- La versión sube a 0.5.0; la pestaña Histórico deja de ser un placeholder.
+- cargo test incluye los rollups, la consolidación, la purga, la presencia, el
+  inventario y las consultas del lector.
+
+### Limitaciones conocidas
+
+- Solo hay histórico mientras Almenara está abierta (la TUI es la que escribe);
+  el modo servicio queda para el roadmap (ADR-59).
+- El histórico guarda agregados: no hay detalle por conexión (ADR-58) y los
+  destinos solo viven 2 h por minuto y 30 días por hora (ADR-57).
+- Las 9 casillas de F4 pendientes de la pasada con CAP_NET_RAW siguen abiertas
+  (decisión del desarrollador); las mediciones de F5 usan histórico sintético.
+
 ## [0.4.0] - 2026-11-11
 
 **Fase 4 — Protocolos, apps y top talkers.** Almenara pone nombre al tráfico:

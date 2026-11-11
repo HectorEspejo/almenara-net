@@ -4,11 +4,13 @@
 //! barra de estado (2 líneas en terminales estrechas, 3 en anchos) y pie con los
 //! atajos. Si el terminal es menor de 80x24 se muestra un mensaje claro.
 
+pub mod charts;
 pub mod config_view;
 pub mod connections;
 pub mod device_detail;
 pub mod devices;
 pub mod help;
+pub mod history;
 pub mod placeholder;
 pub mod traffic;
 
@@ -77,6 +79,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Equipos => devices::draw(frame, app, area),
         Tab::Trafico => traffic::draw(frame, app, area),
         Tab::Conexiones => connections::draw(frame, app, area),
+        Tab::Historico => history::draw(frame, app, area),
         Tab::Config => config_view::draw(frame, app, area),
         Tab::Ayuda => help::draw(frame, app, area),
         otro if otro.is_placeholder() => placeholder::draw(frame, app, area),
@@ -282,7 +285,11 @@ fn etiqueta_fuente(fuente: &str) -> &str {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let atajos = crate::tui::keys::footer_para(app.tab, app.detail_open(), app.who_uses_open());
+    let atajos = crate::tui::keys::footer_para(
+        app.tab,
+        app.detail_open(),
+        app.who_uses_open() || app.history.history_who_uses_open(),
+    );
     let lineas: Vec<Line> = atajos
         .iter()
         .map(|linea| Line::from(Span::styled(*linea, app.theme.dim)))
@@ -472,11 +479,64 @@ mod tests {
 
     #[test]
     fn pestana_placeholder_muestra_no_disponible() {
+        // Tras F5 solo Alertas (F6) sigue siendo un placeholder.
         let mut app = app_vacia();
-        app.tab = Tab::Historico;
+        app.tab = Tab::Alertas;
         let texto = dibujar(&mut app, 100, 30);
         assert!(texto.contains("no disponible"));
-        assert!(texto.contains("Histórico"));
+        assert!(texto.contains("Alertas"));
+    }
+
+    #[test]
+    #[ignore]
+    fn medir_render_historico() {
+        // §8: render ≤ 16 ms en 80x24 y ≤ 33 ms en 120x40 con Histórico abierto.
+        use crate::history::{Range, Series, SeriesPoint};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::{Duration, Instant};
+
+        let mut app = app_vacia();
+        app.tab = Tab::Historico;
+        let ahora = crate::history::localtime::now_unix();
+        app.history.range = Range::Hours24;
+        app.history.series = Some(Series {
+            range: Range::Hours24,
+            points: (0..48)
+                .map(|indice| SeriesPoint {
+                    at: ahora - (47 - indice) * 1800,
+                    bytes_down: (indice as u64 * 1000) % 70_000,
+                    bytes_up: (indice as u64 * 100) % 9_000,
+                    gap: indice % 9 == 0,
+                    future: false,
+                })
+                .collect(),
+            total_down: 900_000,
+            total_up: 90_000,
+            max: Some((30, 70_000)),
+        });
+
+        for (ancho, alto, limite_ms) in [(80u16, 24u16, 16u64), (120, 40, 33)] {
+            let backend = TestBackend::new(ancho, alto);
+            let mut terminal = Terminal::new(backend).expect("terminal de prueba");
+            // Calentamiento para no medir la primera asignación.
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("dibujo de calentamiento");
+            let vueltas = 50u32;
+            let inicio = Instant::now();
+            for _ in 0..vueltas {
+                terminal
+                    .draw(|frame| draw(frame, &mut app))
+                    .expect("dibujo");
+            }
+            let media = inicio.elapsed() / vueltas;
+            println!("render Histórico {ancho}x{alto}: {media:?} de media ({vueltas} vueltas)");
+            assert!(
+                media <= Duration::from_millis(limite_ms),
+                "el render con Histórico abierto debe ser ≤ {limite_ms} ms (medido {media:?})"
+            );
+        }
     }
 
     #[test]

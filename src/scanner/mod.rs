@@ -22,9 +22,9 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use pnet::ipnetwork::Ipv4Network;
 
 use crate::classify::{self, DeviceCtx, DeviceType, OsFamily, ServiceKind};
@@ -33,6 +33,7 @@ use crate::discovery::{
     self, DetectedService, DiscoveryState, HostActiveScan, PassiveData, UpnpDevice,
 };
 use crate::error::Result;
+use crate::history::changes::{Changes, NewEvent};
 use crate::identify::dhcp as dhcp_ident;
 use crate::identify::mac as mac_ident;
 use crate::identify::models as models_ident;
@@ -90,6 +91,19 @@ pub struct Host {
     pub fingerprint_attempted: bool,
     /// Servicios detectados (mDNS, SSDP y port scan).
     pub services: Vec<DetectedService>,
+    /// Se ha ejecutado un escaneo de puertos TCP real de este equipo en el ciclo.
+    ///
+    /// El escaneo de puertos de F2 solo corre al descubrir el equipo, al cambiar
+    /// su IP/MAC o con `r` manual; si falla, este campo queda a false para no
+    /// interpretar como cerrados puertos que no se han llegado a escanear.
+    pub port_scan_attempted: bool,
+    /// Puertos TCP que ha intentado el escaneo de puertos en este ciclo.
+    ///
+    /// La reconciliación lo usa para distinguir un puerto CERRADO (escaneado y
+    /// sin respuesta) de un puerto STALE por tiempo (no escaneado, §7.7).
+    pub port_scan_ports: Vec<u16>,
+    /// Servicios abiertos que ha visto el escaneo de puertos en este ciclo.
+    pub port_scan_services: Vec<DetectedService>,
     /// Fuentes de descubrimiento de Fase 2 que han visto al equipo.
     pub discovery_sources: Vec<DiscoverySource>,
     /// Tipos de servicio mDNS anunciados.
@@ -136,6 +150,9 @@ impl Host {
             last_fingerprint: None,
             fingerprint_attempted: false,
             services: Vec::new(),
+            port_scan_attempted: false,
+            port_scan_ports: Vec::new(),
+            port_scan_services: Vec::new(),
             discovery_sources: Vec::new(),
             mdns_services: Vec::new(),
             upnp_types: Vec::new(),
@@ -676,8 +693,14 @@ pub async fn run_scan(
         let objetivos = state.select_for_active_scan(&hosts, manual);
         let escaneos = discovery::scan_hosts_active(&objetivos, &options.top_ports).await;
         for escaneo in escaneos {
+            // Sin un port scan real no se pueden deducir cierres de servicios:
+            // los puertos no escaneados no deben interpretarse como cerrados.
+            let port_scan_ok = !escaneo
+                .errors
+                .iter()
+                .any(|error| error.starts_with(PREFIJO_ERROR_PORT_SCAN));
             errors.extend(escaneo.errors.clone());
-            aplicar_escaneo_activo(&mut hosts, &escaneo);
+            aplicar_escaneo_activo(&mut hosts, &escaneo, &options.top_ports, port_scan_ok);
         }
     }
 
@@ -1052,13 +1075,34 @@ fn anyadir_fuente(fuentes: &mut Vec<DiscoverySource>, fuente: DiscoverySource) {
     }
 }
 
+/// Prefijo del error con el que `discovery::scan_host_active` avisa de que el
+/// escaneo de puertos no se pudo ejecutar (mismo texto en `src/discovery/mod.rs`).
+const PREFIJO_ERROR_PORT_SCAN: &str = "El port scan de ";
+
 /// Aplica el resultado del escaneo activo de un equipo.
-fn aplicar_escaneo_activo(hosts: &mut [Host], escaneo: &HostActiveScan) {
+///
+/// `top_ports` y `port_scan_ok` describen el escaneo de puertos del ciclo: solo
+/// con un escaneo real (y no fallido) se guardan los puertos intentados, los
+/// abiertos y la fuente `portscan`, que es la línea base de `service_new` y
+/// `service_gone` (§7.7). El fingerprint se aplica aunque falle el port scan:
+/// son pruebas independientes.
+fn aplicar_escaneo_activo(
+    hosts: &mut [Host],
+    escaneo: &HostActiveScan,
+    top_ports: &[u16],
+    port_scan_ok: bool,
+) {
     let Some(host) = hosts.iter_mut().find(|host| host.mac == escaneo.mac) else {
         return;
     };
     for servicio in &escaneo.services {
         fusionar_servicio(&mut host.services, servicio.clone());
+    }
+    if port_scan_ok && !top_ports.is_empty() {
+        host.port_scan_attempted = true;
+        host.port_scan_ports = top_ports.to_vec();
+        host.port_scan_services = escaneo.services.clone();
+        anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Portscan);
     }
     if escaneo.fingerprint_attempted {
         host.fingerprint_attempted = true;
@@ -1066,7 +1110,6 @@ fn aplicar_escaneo_activo(hosts: &mut [Host], escaneo: &HostActiveScan) {
         host.fingerprint_score = escaneo.os_score;
         host.last_fingerprint = escaneo.last_fingerprint.clone();
     }
-    anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Portscan);
 }
 
 /// Heurística para distinguir un televisor de un dispositivo de streaming.
@@ -1423,9 +1466,27 @@ impl Reconciliation {
                 EventType::HostnameChanged => {
                     mensaje_con_etiqueta("Cambio de nombre en", &evento.label, &evento.ip)
                 }
+                EventType::Reappeared => {
+                    mensaje_con_etiqueta("Vuelve a estar en línea:", &evento.label, &evento.ip)
+                }
+                EventType::ServiceNew => {
+                    mensaje_con_etiqueta("Nuevo servicio en", &evento.label, &evento.ip)
+                }
+                EventType::ServiceGone => {
+                    mensaje_con_etiqueta("Servicio cerrado en", &evento.label, &evento.ip)
+                }
+                EventType::OsChanged => {
+                    mensaje_con_etiqueta("Cambio de SO en", &evento.label, &evento.ip)
+                }
+                EventType::TypeChanged => {
+                    mensaje_con_etiqueta("Cambio de tipo en", &evento.label, &evento.ip)
+                }
             };
             let nivel = match evento.event_type {
                 EventType::New | EventType::Disappeared | EventType::MacChanged => Level::Warn,
+                EventType::Reappeared | EventType::ServiceNew | EventType::ServiceGone => {
+                    Level::Info
+                }
                 _ => Level::Info,
             };
             let es_nuevo_resumido = evento.event_type == EventType::New && self.new_devices > 5;
@@ -1435,6 +1496,100 @@ impl Reconciliation {
         }
         out
     }
+}
+
+/// Persiste un evento nuevo y lo añade al resumen del ciclo.
+fn registrar_evento(
+    repo: &mut Repo,
+    device_id: i64,
+    evento: &NewEvent,
+    host: &Host,
+    etiqueta: &str,
+    events: &mut Vec<ReconciledEvent>,
+    errors: &mut Vec<String>,
+) {
+    match repo.append_event(device_id, evento.tipo, &evento.details.to_string()) {
+        Ok(()) => events.push(ReconciledEvent {
+            event_type: evento.tipo,
+            ip: host.ip.to_string(),
+            label: etiqueta.to_string(),
+        }),
+        Err(err) => errors.push(format!(
+            "No se pudo registrar {} de {}: {err}",
+            evento.tipo.as_str(),
+            host.ip
+        )),
+    }
+}
+
+/// Calcula los eventos de servicios de un escaneo de puertos real (§7.7).
+///
+/// Se llama antes de escribir los servicios y las fuentes del ciclo: la fuente
+/// `portscan` de DISCOVERY_SOURCES distingue el primer escaneo (línea base, sin
+/// eventos) y los servicios conocidos son los persistidos antes del upsert. El
+/// puerto y el protocolo de cada cierre viajan en el detalle del `service_gone`;
+/// el llamador los usa después para materializar el STALE de F2.
+fn eventos_de_servicios(
+    repo: &Repo,
+    device_id: i64,
+    host: &Host,
+    passive_only: bool,
+    errores: &mut Vec<String>,
+) -> Vec<NewEvent> {
+    if !host.port_scan_attempted || passive_only {
+        return Vec::new();
+    }
+
+    let ya_escaneado = match repo.list_sources(device_id) {
+        Ok(fuentes) => fuentes
+            .iter()
+            .any(|fila| fila.source == DiscoverySource::Portscan),
+        Err(err) => {
+            errores.push(format!(
+                "No se pudieron leer las fuentes de {}: {err}",
+                host.ip
+            ));
+            return Vec::new();
+        }
+    };
+
+    let conocidos = match repo.list_services(device_id) {
+        Ok(servicios) => servicios,
+        Err(err) => {
+            errores.push(format!(
+                "No se pudieron leer los servicios de {}: {err}",
+                host.ip
+            ));
+            return Vec::new();
+        }
+    };
+
+    let escaneados: HashSet<u16> = host.port_scan_ports.iter().copied().collect();
+    let mut ultimos_eventos: HashMap<u16, EventType> = HashMap::new();
+    for servicio in &conocidos {
+        if servicio.protocol != Protocol::Tcp || !escaneados.contains(&servicio.port) {
+            continue;
+        }
+        match repo.last_service_event(device_id, servicio.port, servicio.protocol) {
+            Ok(Some(evento)) => {
+                ultimos_eventos.insert(servicio.port, evento.event_type);
+            }
+            Ok(None) => {}
+            Err(err) => errores.push(format!(
+                "No se pudo leer el último evento del servicio {} de {}: {err}",
+                servicio.port, host.ip
+            )),
+        }
+    }
+
+    Changes::services(
+        ya_escaneado,
+        passive_only,
+        &host.port_scan_ports,
+        &host.port_scan_services,
+        &conocidos,
+        &ultimos_eventos,
+    )
 }
 
 /// Reconoce el resultado de un escaneo contra la base de datos.
@@ -1450,7 +1605,8 @@ pub fn reconcile(
     retention_days: u32,
     stale_before: &str,
 ) -> Result<Reconciliation> {
-    let ahora = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let ahora_sistema = SystemTime::now();
+    let ahora = DateTime::<Utc>::from(ahora_sistema).to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut errors = Vec::new();
     let mut events = Vec::new();
 
@@ -1647,6 +1803,23 @@ pub fn reconcile(
                     })
                     .unwrap_or_else(|| host.ip.to_string());
 
+                // Presencia: un equipo OFFLINE que vuelve a verse (§7.7 y §7.8).
+                if cambios.became_online {
+                    if let Some(previo) = previos_por_mac.get(&host.mac) {
+                        if let Some(evento) = Changes::presence(previo, true, ahora_sistema) {
+                            registrar_evento(
+                                repo,
+                                device_id,
+                                &evento,
+                                host,
+                                &etiqueta,
+                                &mut events,
+                                &mut errors,
+                            );
+                        }
+                    }
+                }
+
                 if cambios.is_new {
                     nuevos += 1;
                     // `mac_random` permite a F6 bajar la severidad de un equipo
@@ -1694,7 +1867,7 @@ pub fn reconcile(
                     events.push(ReconciledEvent {
                         event_type: EventType::HostnameChanged,
                         ip: host.ip.to_string(),
-                        label: etiqueta,
+                        label: etiqueta.clone(),
                     });
                 }
 
@@ -1731,6 +1904,63 @@ pub fn reconcile(
                     }
                 }
 
+                // Servicios: se comparan con lo persistido ANTES de escribir
+                // los servicios y las fuentes de este ciclo (§7.7). La fuente
+                // `portscan` de DISCOVERY_SOURCES marca la línea base: en el
+                // primer escaneo del equipo no hay eventos.
+                let eventos_servicio =
+                    eventos_de_servicios(repo, device_id, host, report.passive_only, &mut errors);
+                let mut puertos_cerrados: Vec<(u16, Protocol)> = Vec::new();
+                for evento in &eventos_servicio {
+                    if evento.tipo == EventType::ServiceGone {
+                        if let (Some(port), Some(protocol)) = (
+                            evento.details.get("port").and_then(|valor| valor.as_u64()),
+                            evento
+                                .details
+                                .get("protocol")
+                                .and_then(|valor| valor.as_str())
+                                .and_then(Protocol::from_str),
+                        ) {
+                            puertos_cerrados.push((port as u16, protocol));
+                        }
+                    }
+                    registrar_evento(
+                        repo,
+                        device_id,
+                        evento,
+                        host,
+                        &etiqueta,
+                        &mut events,
+                        &mut errors,
+                    );
+                }
+
+                // Identidad: `os_changed` y `type_changed` comparando el equipo
+                // previo con el ya persistido después de aplicar tipo e
+                // identidad (§7.7).
+                if let Some(previo) = previos_por_mac.get(&host.mac) {
+                    match repo.get_device_by_mac(&host.mac) {
+                        Ok(Some(actual)) => {
+                            for evento in Changes::identity(previo, &actual) {
+                                registrar_evento(
+                                    repo,
+                                    device_id,
+                                    &evento,
+                                    host,
+                                    &etiqueta,
+                                    &mut events,
+                                    &mut errors,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => errors.push(format!(
+                            "No se pudo releer el equipo {} para comparar su identidad: {err}",
+                            host.ip
+                        )),
+                    }
+                }
+
                 // Servicios detectados.
                 for servicio in &host.services {
                     let upsert_servicio = ServiceUpsert {
@@ -1746,6 +1976,22 @@ pub fn reconcile(
                             "No se pudo guardar el servicio {} de {}: {err}",
                             servicio.port, host.ip
                         )),
+                    }
+                }
+
+                // Cierres del escaneo: el servicio queda STALE de forma
+                // determinista para F2, sin cambiar el esquema (§7.7). Va
+                // después del upsert para que el cierre visto por el escaneo
+                // mande sobre un anuncio mDNS del mismo ciclo y el aviso no se
+                // repita en el siguiente escaneo.
+                for (port, protocol) in puertos_cerrados {
+                    if let Err(err) =
+                        repo.mark_service_closed(device_id, port, protocol, stale_before)
+                    {
+                        errors.push(format!(
+                            "No se pudo marcar cerrado el servicio {port}/{}: {err}",
+                            protocol.as_str()
+                        ));
                     }
                 }
 
@@ -1857,6 +2103,9 @@ pub fn reconcile(
                 let details = serde_json::json!({
                     "before": {"ip": device.ip, "is_online": true},
                     "after": {"is_online": false},
+                    // F5: la presencia (§7.8) usa last_seen para marcar el
+                    // inicio de la ausencia, también tras un arranque.
+                    "last_seen": &device.last_seen,
                 })
                 .to_string();
                 if let Err(err) = repo.append_event(device.id, EventType::Disappeared, &details) {
@@ -2099,13 +2348,25 @@ mod tests {
 
     #[test]
     fn tipos_de_evento_cubiertos() {
-        assert_eq!(EventType::ALL.len(), 5);
+        assert_eq!(EventType::ALL.len(), 10);
         assert_eq!(EventType::New.as_str(), "new");
         assert_eq!(
             EventType::from_str("mac_changed"),
             Some(EventType::MacChanged)
         );
         assert_eq!(EventType::from_str("otro"), None);
+        // F5: los cinco tipos nuevos van y vuelven sin cambio de esquema.
+        for tipo in [
+            EventType::Reappeared,
+            EventType::ServiceNew,
+            EventType::ServiceGone,
+            EventType::OsChanged,
+            EventType::TypeChanged,
+        ] {
+            assert_eq!(EventType::from_str(tipo.as_str()), Some(tipo));
+        }
+        assert_eq!(EventType::Reappeared.as_str(), "reappeared");
+        assert_eq!(EventType::ServiceGone.as_str(), "service_gone");
     }
 
     #[test]
@@ -2183,6 +2444,64 @@ mod tests {
             mdns_records: Vec::new(),
             ssdp_records: Vec::new(),
         }
+    }
+
+    /// Informe de un ciclo en modo pasivo (sin tráfico activo, §7.7).
+    fn informe_pasivo(hosts: Vec<Host>) -> ScanReport {
+        ScanReport {
+            passive_only: true,
+            ..informe_de_prueba(hosts)
+        }
+    }
+
+    /// Servicio TCP detectado por puerto, como lo dejaría el escaneo activo.
+    fn servicio_tcp(puerto: u16) -> DetectedService {
+        DetectedService {
+            port: puerto,
+            protocol: Protocol::Tcp,
+            service: classify::service(puerto, None),
+            banner: None,
+        }
+    }
+
+    /// Marca en el host un escaneo de puertos real con sus puertos abiertos.
+    fn aplicar_portscan_de_prueba(host: &mut Host, escaneados: &[u16], abiertos: &[u16]) {
+        host.port_scan_attempted = true;
+        host.port_scan_ports = escaneados.to_vec();
+        host.port_scan_services = abiertos
+            .iter()
+            .map(|puerto| servicio_tcp(*puerto))
+            .collect();
+        for servicio in &host.port_scan_services {
+            fusionar_servicio(&mut host.services, servicio.clone());
+        }
+        anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Portscan);
+    }
+
+    /// Tipos de evento de una reconciliación.
+    fn tipos_de_evento(reconciliacion: &Reconciliation) -> Vec<EventType> {
+        reconciliacion
+            .events
+            .iter()
+            .map(|evento| evento.event_type)
+            .collect()
+    }
+
+    /// Eventos persistidos de un tipo, con los detalles JSON ya parseados.
+    fn eventos_persistidos(repo: &Repo, device_id: i64, tipo: EventType) -> Vec<serde_json::Value> {
+        repo.list_events(device_id)
+            .unwrap()
+            .into_iter()
+            .filter(|evento| evento.event_type == tipo)
+            .map(|evento| serde_json::from_str(&evento.details).unwrap())
+            .collect()
+    }
+
+    /// Indica si una reconciliación ha emitido algún evento de servicios.
+    fn hay_eventos_de_servicio(reconciliacion: &Reconciliation) -> bool {
+        tipos_de_evento(reconciliacion)
+            .iter()
+            .any(|tipo| matches!(tipo, EventType::ServiceNew | EventType::ServiceGone))
     }
 
     #[test]
@@ -2401,6 +2720,44 @@ mod tests {
     }
 
     #[test]
+    fn el_escaneo_activo_solo_marca_puertos_y_fuente_si_es_real() {
+        let mut hosts = vec![host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", None)];
+        let escaneo = HostActiveScan {
+            mac: "aa:bb:cc:dd:ee:01".to_string(),
+            ip: "192.168.1.10".parse().unwrap(),
+            services: vec![servicio_tcp(22)],
+            os_family: None,
+            os_score: 0,
+            last_fingerprint: None,
+            fingerprint_attempted: false,
+            errors: Vec::new(),
+        };
+        aplicar_escaneo_activo(&mut hosts, &escaneo, &[22, 80], true);
+        assert!(hosts[0].port_scan_attempted);
+        assert_eq!(hosts[0].port_scan_ports, vec![22, 80]);
+        assert_eq!(hosts[0].port_scan_services.len(), 1);
+        assert!(hosts[0]
+            .discovery_sources
+            .contains(&DiscoverySource::Portscan));
+
+        // Un port scan fallido no marca la línea base ni los puertos: sin
+        // escaneo real no se pueden deducir cierres de servicios.
+        let mut hosts = vec![host_de_prueba("aa:bb:cc:dd:ee:02", "192.168.1.11", None)];
+        let mut escaneo_fallido = escaneo.clone();
+        escaneo_fallido.mac = "aa:bb:cc:dd:ee:02".to_string();
+        escaneo_fallido.ip = "192.168.1.11".parse().unwrap();
+        escaneo_fallido.errors.push(format!(
+            "{PREFIJO_ERROR_PORT_SCAN}192.168.1.11 falló: sin ruta al equipo"
+        ));
+        aplicar_escaneo_activo(&mut hosts, &escaneo_fallido, &[22, 80], false);
+        assert!(!hosts[0].port_scan_attempted);
+        assert!(hosts[0].port_scan_ports.is_empty());
+        assert!(!hosts[0]
+            .discovery_sources
+            .contains(&DiscoverySource::Portscan));
+    }
+
+    #[test]
     fn reconcilia_servicios_fuentes_y_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
@@ -2442,6 +2799,382 @@ mod tests {
         assert!(nombres.contains(&"mdns"));
         assert!(nombres.contains(&"portscan"));
         assert!(!nombres.contains(&"ssdp"));
+    }
+
+    #[test]
+    fn reconcilia_reappeared_con_ausencia_y_disappeared_con_last_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(1);
+
+        let inicial = informe_de_prueba(vec![host_de_prueba(
+            "aa:bb:cc:dd:ee:01",
+            "192.168.1.10",
+            Some("laptop"),
+        )]);
+        let primera = reconcile(&mut repo, &inicial, &mut tracker, 90, STALE_FUTURO).unwrap();
+        let device_id = primera.devices[0].id;
+        let last_seen_inicial = primera.devices[0].last_seen.clone();
+
+        // Un ciclo sin verlo: OFFLINE y evento disappeared con last_seen (§7.7).
+        let vacio = informe_de_prueba(vec![]);
+        let segunda = reconcile(&mut repo, &vacio, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert!(tipos_de_evento(&segunda).contains(&EventType::Disappeared));
+        let desaparecido = eventos_persistidos(&repo, device_id, EventType::Disappeared);
+        assert_eq!(desaparecido.len(), 1);
+        assert_eq!(desaparecido[0]["last_seen"], last_seen_inicial);
+
+        // Se fuerza un last_seen antiguo para comprobar la ausencia calculada.
+        repo.connection()
+            .execute(
+                "UPDATE DEVICES SET last_seen = ?1 WHERE id = ?2",
+                rusqlite::params!["2000-01-01T00:00:00Z", device_id],
+            )
+            .unwrap();
+
+        let reaparece = informe_de_prueba(vec![host_de_prueba(
+            "aa:bb:cc:dd:ee:01",
+            "192.168.1.10",
+            Some("laptop"),
+        )]);
+        let tercera = reconcile(&mut repo, &reaparece, &mut tracker, 90, STALE_FUTURO).unwrap();
+        let tipos = tipos_de_evento(&tercera);
+        assert!(tipos.contains(&EventType::Reappeared));
+        assert!(!tipos.contains(&EventType::New));
+        let reaparecido = eventos_persistidos(&repo, device_id, EventType::Reappeared);
+        assert_eq!(reaparecido.len(), 1);
+        assert_eq!(reaparecido[0]["away_since"], "2000-01-01T00:00:00Z");
+        assert!(reaparecido[0]["away_s"].as_u64().unwrap_or(0) > 0);
+        assert!(tercera
+            .notifications()
+            .iter()
+            .any(|notificacion| notificacion.message.contains("Vuelve a estar en línea")));
+
+        // Un ciclo más con el equipo presente no repite el aviso.
+        let cuarta = reconcile(&mut repo, &reaparece, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert!(!tipos_de_evento(&cuarta).contains(&EventType::Reappeared));
+        assert_eq!(
+            eventos_persistidos(&repo, device_id, EventType::Reappeared).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reconcilia_os_changed_y_type_changed_automaticos() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        // Ciclo 1: SSH → PC y SO Linux por huella TCP.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        host.services.push(servicio_tcp(22));
+        host.os_family = Some(OsFamily::Linux);
+        host.os_source = Some(OsSource::Tcp);
+        let primera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let device_id = primera.devices[0].id;
+        assert_eq!(primera.devices[0].device_type, "pc");
+        assert_eq!(primera.devices[0].os_family.as_deref(), Some("linux"));
+
+        // Ciclo 2: SSH + HTTP → servidor y SO Windows por DHCP.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        host.services.push(servicio_tcp(22));
+        host.services.push(servicio_tcp(80));
+        host.os_family = Some(OsFamily::Windows);
+        host.os_source = Some(OsSource::Dhcp);
+        let segunda = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let tipos = tipos_de_evento(&segunda);
+        assert!(tipos.contains(&EventType::OsChanged));
+        assert!(tipos.contains(&EventType::TypeChanged));
+
+        let os = eventos_persistidos(&repo, device_id, EventType::OsChanged);
+        assert_eq!(os.len(), 1);
+        assert_eq!(os[0]["before"], "linux");
+        assert_eq!(os[0]["after"], "windows");
+        assert_eq!(os[0]["os_source"], "dhcp");
+        let tipo = eventos_persistidos(&repo, device_id, EventType::TypeChanged);
+        assert_eq!(tipo.len(), 1);
+        assert_eq!(tipo[0]["before"], "pc");
+        assert_eq!(tipo[0]["after"], "server");
+
+        // El mismo escaneo repetido no duplica los eventos de identidad.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        host.services.push(servicio_tcp(22));
+        host.services.push(servicio_tcp(80));
+        host.os_family = Some(OsFamily::Windows);
+        host.os_source = Some(OsSource::Dhcp);
+        let tercera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(!tipos_de_evento(&tercera).contains(&EventType::OsChanged));
+        assert!(!tipos_de_evento(&tercera).contains(&EventType::TypeChanged));
+    }
+
+    #[test]
+    fn identidad_no_emite_con_unknown_ni_con_override_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        // Unknown → PC: el tipo desconocido no genera type_changed.
+        let inicial = informe_de_prueba(vec![host_de_prueba(
+            "aa:bb:cc:dd:ee:01",
+            "192.168.1.10",
+            None,
+        )]);
+        let primera = reconcile(&mut repo, &inicial, &mut tracker, 90, STALE_FUTURO).unwrap();
+        let device_id = primera.devices[0].id;
+        assert_eq!(primera.devices[0].device_type, "unknown");
+
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", None);
+        host.services.push(servicio_tcp(22));
+        host.os_family = Some(OsFamily::Linux);
+        host.os_source = Some(OsSource::Tcp);
+        let segunda = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(segunda.devices[0].device_type, "pc");
+        let tipos = tipos_de_evento(&segunda);
+        assert!(!tipos.contains(&EventType::TypeChanged));
+        // os_family NULL → linux tampoco es un cambio entre valores no nulos.
+        assert!(!tipos.contains(&EventType::OsChanged));
+
+        // Override manual: el automático pasa de pc a server y no hay evento.
+        repo.set_device_type_manual(device_id, Some(crate::classify::DeviceType::Mobile))
+            .unwrap();
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", None);
+        host.services.push(servicio_tcp(22));
+        host.services.push(servicio_tcp(80));
+        host.os_family = Some(OsFamily::Linux);
+        host.os_source = Some(OsSource::Tcp);
+        let tercera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let tipos = tipos_de_evento(&tercera);
+        assert!(!tipos.contains(&EventType::TypeChanged));
+        assert!(!tipos.contains(&EventType::OsChanged));
+        let dispositivo = tercera
+            .devices
+            .iter()
+            .find(|dispositivo| dispositivo.id == device_id)
+            .unwrap();
+        assert_eq!(
+            dispositivo.device_type, "server",
+            "el automático cambia por debajo"
+        );
+        assert_eq!(dispositivo.effective_device_type(), "mobile");
+    }
+
+    #[test]
+    fn reconcilia_eventos_de_servicios_con_escaneo_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+        let puertos = [22u16, 80, 443];
+
+        // Primer escaneo: es la línea base y no genera eventos de servicios.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[22]);
+        let primera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let device_id = primera.devices[0].id;
+        assert!(!hay_eventos_de_servicio(&primera));
+        assert_eq!(repo.list_services(device_id).unwrap().len(), 1);
+        assert!(repo
+            .list_sources(device_id)
+            .unwrap()
+            .iter()
+            .any(|fila| fila.source == DiscoverySource::Portscan));
+
+        // Segundo escaneo: el 80 aparece y el 22 sigue abierto.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[22, 80]);
+        let segunda = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let nuevos = eventos_persistidos(&repo, device_id, EventType::ServiceNew);
+        assert_eq!(nuevos.len(), 1);
+        assert_eq!(nuevos[0]["port"], 80);
+        assert_eq!(nuevos[0]["protocol"], "tcp");
+        assert_eq!(nuevos[0]["service"], "http");
+        assert_eq!(nuevos[0]["reopened"], false);
+        assert!(segunda
+            .notifications()
+            .iter()
+            .any(|notificacion| notificacion.message.contains("Nuevo servicio en")));
+
+        // Repetir el mismo escaneo no duplica el aviso (idempotencia).
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[22, 80]);
+        let repetida = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(!hay_eventos_de_servicio(&repetida));
+
+        // Tercer escaneo: el 22 se ve cerrado → service_gone y STALE determinista.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[80]);
+        let tercera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let cerrados = eventos_persistidos(&repo, device_id, EventType::ServiceGone);
+        assert_eq!(cerrados.len(), 1);
+        assert_eq!(cerrados[0]["port"], 22);
+        assert_eq!(cerrados[0]["protocol"], "tcp");
+        assert_eq!(cerrados[0]["service"], "ssh");
+        assert!(tercera
+            .notifications()
+            .iter()
+            .any(|notificacion| notificacion.message.contains("Servicio cerrado en")));
+        let servicio_cerrado = repo
+            .list_services(device_id)
+            .unwrap()
+            .into_iter()
+            .find(|servicio| servicio.port == 22)
+            .expect("el puerto cerrado sigue persistido");
+        assert_eq!(
+            servicio_cerrado.last_seen, "2998-12-31T23:59:59Z",
+            "el cierre se materializa como STALE (un segundo bajo el umbral)"
+        );
+
+        // Repetir el escaneo con el 22 cerrado no repite service_gone.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[80]);
+        let repetida = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(!hay_eventos_de_servicio(&repetida));
+        assert_eq!(
+            eventos_persistidos(&repo, device_id, EventType::ServiceGone).len(),
+            1
+        );
+
+        // Cuarto escaneo: el 22 vuelve a abrirse → service_new con reopened.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[22, 80]);
+        let cuarta = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(cuarta
+            .notifications()
+            .iter()
+            .any(|notificacion| notificacion.message.contains("Nuevo servicio en")));
+        let reabierto = eventos_persistidos(&repo, device_id, EventType::ServiceNew)
+            .into_iter()
+            .find(|detalles| detalles["port"] == 22)
+            .expect("el puerto 22 debe tener un service_new de reapertura");
+        assert_eq!(reabierto["reopened"], true);
+    }
+
+    #[test]
+    fn sin_eventos_de_servicios_en_pasivo_y_el_stale_por_tiempo_no_avisa() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+        let puertos = [22u16, 80];
+
+        // Primer escaneo real: línea base.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[22]);
+        let primera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(!hay_eventos_de_servicio(&primera));
+
+        // Ciclo sin escaneo de puertos: el 22 solo pasa a STALE por tiempo y no
+        // hay service_gone (§7.7).
+        let host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        let ciclo = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(!hay_eventos_de_servicio(&ciclo));
+        assert!(
+            ciclo.stale_services >= 1,
+            "el servicio no visto queda STALE por tiempo"
+        );
+
+        // Modo pasivo: aunque el host traiga datos de un escaneo, no se emiten
+        // eventos de servicios.
+        let mut host = host_de_prueba("aa:bb:cc:dd:ee:01", "192.168.1.10", Some("laptop"));
+        aplicar_portscan_de_prueba(&mut host, &puertos, &[80]);
+        let pasivo = reconcile(
+            &mut repo,
+            &informe_pasivo(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert!(!hay_eventos_de_servicio(&pasivo));
     }
 
     #[test]

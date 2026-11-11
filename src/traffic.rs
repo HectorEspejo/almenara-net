@@ -508,8 +508,11 @@ pub fn spawn(
     resolver.set_devices(&nombres_para_resolver(&devices));
     resolver.set_services(servicios_para_resolver(&devices));
 
-    // Rankings con los nombres del catálogo y de los equipos.
+    // Rankings con los nombres del catálogo y de los equipos. El histórico de
+    // F5 se alimenta del mismo volcado por flujo y segundo (§7.2).
     let mut rankings = Rankings::new();
+    rankings.set_history_enabled(config.history.enabled);
+    rankings.set_history_top_keys(config.history.top_keys);
     rankings.set_devices(mapa_nombres_equipos(&devices));
     rankings.set_app_names(
         resolver
@@ -949,9 +952,22 @@ async fn ejecutar(
                     });
                 }
 
-                // Volcado de los bytes del último segundo a los rankings.
-                rankings.tick(ahora);
-                volcar_pendientes(&mut pendientes, &mut resolver, &mut rankings, &cache, &host_ips, ahora);
+                // Volcado de los bytes del último segundo a los rankings. Al
+                // cambiar el minuto UTC, el lote del histórico viaja a la TUI.
+                if let Some(lote) = rankings.tick(ahora, std::time::SystemTime::now()) {
+                    let _ = event_tx.send(AppEvent::Rollup(Box::new(lote)));
+                }
+                let nuevos: HashSet<ConnectionKey> =
+                    cache.drenar_nuevos().into_iter().collect();
+                volcar_pendientes(
+                    &mut pendientes,
+                    &mut resolver,
+                    &mut rankings,
+                    &cache,
+                    &host_ips,
+                    &nuevos,
+                    ahora,
+                );
 
                 let agregado = aggregator.snapshot();
                 let host_actual = host.snapshot();
@@ -1021,6 +1037,8 @@ async fn ejecutar(
                         device_id: vista.device_id,
                         process: proceso,
                         l4: L4::from_protocol(vista.key.protocol),
+                        protocol: Some(AppProtocol::transport_fallback(vista.key.protocol)),
+                        es_cliente: false,
                     };
                     rankings.record_connection(etiqueta, &ctx);
                 }
@@ -1091,7 +1109,14 @@ async fn ejecutar(
                         let cuota = rankings.who_uses(dimension, &key, window);
                         let _ = reply.send(cuota);
                     }
-                    Some(TrafficCommand::Stop) | None => break,
+                    Some(TrafficCommand::Stop) | None => {
+                        // Minuto parcial al salir con q (§4.8) y aviso de parada.
+                        if let Some(lote) = rankings.flush_rollup(std::time::SystemTime::now()) {
+                            let _ = event_tx.send(AppEvent::Rollup(Box::new(lote)));
+                        }
+                        let _ = event_tx.send(AppEvent::TrafficStopped);
+                        break;
+                    }
                 }
             }
         }
@@ -1121,6 +1146,7 @@ fn volcar_pendientes(
     rankings: &mut Rankings,
     cache: &ConnCache,
     host_ips: &HashSet<IpAddr>,
+    nuevos: &HashSet<ConnectionKey>,
     ahora: Instant,
 ) {
     for (key, acumulado) in pendientes.drain() {
@@ -1138,11 +1164,35 @@ fn volcar_pendientes(
             (acumulado.desde_origen, acumulado.desde_destino)
         };
         let (device_id, proceso) = contexto_para(&key, cliente_origen, cache, host_ips);
+        // El inventario JA4 solo es del flujo en el que el equipo atribuido es el
+        // cliente, no el servidor de la LAN que recibe una conexión de fuera.
+        let cliente = if cliente_origen {
+            key.origin
+        } else {
+            key.destination
+        };
+        let es_cliente = match device_id {
+            Some(DEVICE_ID_HOST) => host_ips.contains(&cliente.ip),
+            Some(id) => cache.dispositivo_de(&cliente.ip) == Some(id),
+            None => false,
+        };
         let ctx = FlowCtx {
             device_id,
             process: proceso,
             l4: L4::from_protocol(key.protocol),
+            // El histórico necesita el protocolo real del flujo (tcp/udp/icmp/…) para
+            // que la dimensión protocolo no pierda ICMP y otros transportes.
+            protocol: Some(AppProtocol::transport_fallback(key.protocol)),
+            es_cliente,
         };
+        // Conexiones del minuto: se cuenta el flujo la primera vez que aparece y
+        // se refresca su etiqueta en los volcados siguientes del mismo minuto.
+        let flujo = huella_flujo(&key);
+        if nuevos.contains(&key) {
+            rankings.record_flow(flujo, &etiqueta, &ctx);
+        } else {
+            rankings.refresh_flow(flujo, &etiqueta, &ctx);
+        }
         if subida > 0 {
             rankings.record(&etiqueta, &ctx, subida, Dir::Up, ahora);
         }
@@ -1150,6 +1200,14 @@ fn volcar_pendientes(
             rankings.record(&etiqueta, &ctx, bajada, Dir::Down, ahora);
         }
     }
+}
+
+/// Huella estable de un flujo para contarlo una sola vez por minuto.
+fn huella_flujo(key: &ConnectionKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Equipo y proceso local atribuidos a un flujo para los rankings.
@@ -1290,6 +1348,8 @@ struct ConnCache {
     entradas: HashMap<ConnectionKey, Entrada>,
     ip_device: HashMap<IpAddr, i64>,
     host_ips: HashSet<IpAddr>,
+    /// Flujos vistos por primera vez desde el último drenado (para los rollups).
+    nuevos: Vec<ConnectionKey>,
 }
 
 impl ConnCache {
@@ -1298,7 +1358,13 @@ impl ConnCache {
             entradas: HashMap::new(),
             ip_device,
             host_ips,
+            nuevos: Vec::new(),
         }
+    }
+
+    /// Drena los flujos vistos por primera vez desde la última llamada.
+    fn drenar_nuevos(&mut self) -> Vec<ConnectionKey> {
+        std::mem::take(&mut self.nuevos)
     }
 
     fn set_dispositivos(&mut self, ip_device: HashMap<IpAddr, i64>) {
@@ -1325,10 +1391,14 @@ impl ConnCache {
         for meta in paquetes {
             let key = ConnectionKey::from_packet(meta);
             let salida = meta.src() == key.origin;
+            let es_nueva = !self.entradas.contains_key(&key);
             let entrada = self
                 .entradas
                 .entry(key)
                 .or_insert_with(|| Entrada::nueva(key, meta.timestamp));
+            if es_nueva && self.nuevos.len() < MAX_CONEXIONES {
+                self.nuevos.push(key);
+            }
             entrada.last_seen = meta.timestamp;
             entrada.seen_capture = true;
             if salida {

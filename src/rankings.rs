@@ -29,9 +29,11 @@
 //!   protección de memoria frente a destinos hostiles.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::capture::windows::{Windows, LEN_60S};
+use crate::history::rollup::{sujetos_y_dims, MinuteRollup};
+use crate::history::RollupBatch;
 use crate::inference::{AppProtocol, DestinationKind, FlowLabel, L4};
 use crate::traffic::DEVICE_ID_HOST;
 
@@ -41,9 +43,10 @@ const MAX_CLAVES_POR_DIMENSION: usize = 2048;
 const INACTIVIDAD_DESALOJO: Duration = Duration::from_secs(300);
 
 /// Dimensiones de los rankings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
     /// Equipos (incluye la fila [host]).
+    #[default]
     Device,
     /// Destinos: dominio registrable, IP remota o equipo de la LAN.
     Destination,
@@ -87,35 +90,73 @@ impl Dimension {
 }
 
 /// Ventanas de los rankings.
+///
+/// Las tres primeras viven en memoria (F3/F4). Las ventanas de 1 h y 24 h
+/// (F5) no se acumulan en memoria: se consultan al histórico con
+/// [Window::history] y las responde el lector de solo lectura (ADR-63).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Window {
     /// 60 s (1 punto/s).
     Sixty,
     /// 5 min (1 punto/5 s).
     FiveMin,
+    /// Última hora (minutos cerrados, desde el histórico).
+    OneHour,
+    /// Últimas 24 h (horas y minutos de la hora en curso, desde el histórico).
+    Day24,
     /// Acumulado desde el arranque.
     Session,
 }
 
 impl Window {
-    /// Las tres ventanas, en el orden de w.
+    /// Las ventanas en memoria, en el orden de w de F3/F4.
     pub const ALL: [Self; 3] = [Self::Sixty, Self::FiveMin, Self::Session];
+
+    /// Las cinco ventanas del ciclo de w, en orden (F5 añade 1 h y 24 h).
+    pub const UI_ALL: [Self; 5] = [
+        Self::Sixty,
+        Self::FiveMin,
+        Self::OneHour,
+        Self::Day24,
+        Self::Session,
+    ];
 
     /// Etiqueta visible.
     pub fn label(self) -> &'static str {
         match self {
             Self::Sixty => "60 s",
             Self::FiveMin => "5 min",
+            Self::OneHour => "1 h",
+            Self::Day24 => "24 h",
             Self::Session => "sesión",
         }
     }
 
-    /// Índice de la ventana.
+    /// Índice de la ventana en el ciclo de w (0-4).
     pub fn index(self) -> usize {
+        Self::UI_ALL
+            .iter()
+            .position(|window| *window == self)
+            .unwrap_or(0)
+    }
+
+    /// Siguiente ventana del ciclo de w.
+    pub fn next_ui(self) -> Self {
+        Self::UI_ALL[(self.index() + 1) % Self::UI_ALL.len()]
+    }
+
+    /// Indica si la ventana se acumula en memoria.
+    #[allow(dead_code)]
+    pub fn in_memory(self) -> bool {
+        matches!(self, Self::Sixty | Self::FiveMin | Self::Session)
+    }
+
+    /// Ventana equivalente del histórico, si la hay.
+    pub fn history(self) -> Option<crate::history::HistWindow> {
         match self {
-            Self::Sixty => 0,
-            Self::FiveMin => 1,
-            Self::Session => 2,
+            Self::OneHour => Some(crate::history::HistWindow::OneHour),
+            Self::Day24 => Some(crate::history::HistWindow::Day24),
+            _ => None,
         }
     }
 }
@@ -174,6 +215,13 @@ pub struct FlowCtx {
     pub process: Option<(u32, String)>,
     /// Transporte.
     pub l4: Option<L4>,
+    /// Protocolo de aplicación o de transporte ya resuelto (F5).
+    ///
+    /// La captura lo rellena con el protocolo real del flujo (incluido ICMP)
+    /// para que el histórico no tenga que adivinarlo a partir de l4.
+    pub protocol: Option<AppProtocol>,
+    /// La columna Equipo del flujo es el cliente (para el inventario JA4, §7.9).
+    pub es_cliente: bool,
 }
 
 /// Fila de un ranking.
@@ -306,6 +354,8 @@ impl UsoEquipo {
             Window::Sixty => self.bytes_bajada_60.total(),
             Window::FiveMin => self.bytes_bajada_5min.total(),
             Window::Session => self.sesion_bajada,
+            // Las ventanas de 1 h y 24 h salen del histórico (lector).
+            Window::OneHour | Window::Day24 => 0,
         }
     }
 
@@ -314,6 +364,8 @@ impl UsoEquipo {
             Window::Sixty => self.bytes_subida_60.total(),
             Window::FiveMin => self.bytes_subida_5min.total(),
             Window::Session => self.sesion_subida,
+            // Las ventanas de 1 h y 24 h salen del histórico (lector).
+            Window::OneHour | Window::Day24 => 0,
         }
     }
 
@@ -429,6 +481,8 @@ impl Entrada {
             Window::Sixty => self.bytes_bajada_60.total(),
             Window::FiveMin => self.bytes_bajada_5min.total(),
             Window::Session => self.sesion_bajada,
+            // Las ventanas de 1 h y 24 h salen del histórico (lector).
+            Window::OneHour | Window::Day24 => 0,
         }
     }
 
@@ -437,6 +491,8 @@ impl Entrada {
             Window::Sixty => self.bytes_subida_60.total(),
             Window::FiveMin => self.bytes_subida_5min.total(),
             Window::Session => self.sesion_subida,
+            // Las ventanas de 1 h y 24 h salen del histórico (lector).
+            Window::OneHour | Window::Day24 => 0,
         }
     }
 
@@ -494,6 +550,8 @@ pub struct Rankings {
     sin_identificar_sesion: u64,
     /// Conexiones activas por clave y dimensión.
     connections: [HashMap<String, u32>; 6],
+    /// Acumuladores del minuto del histórico (F5).
+    rollup: MinuteRollup,
 }
 
 impl Default for Rankings {
@@ -513,6 +571,7 @@ impl Default for Rankings {
             total_sesion: 0,
             sin_identificar_sesion: 0,
             connections: std::array::from_fn(|_| HashMap::new()),
+            rollup: MinuteRollup::new(false),
         }
     }
 }
@@ -544,6 +603,57 @@ impl Rankings {
     /// Actualiza la categoría corta de cada app (clave de app → corto).
     pub fn set_app_categories(&mut self, categorias: HashMap<String, String>) {
         self.app_categories = categorias;
+    }
+
+    /// Activa o desactiva los acumuladores del histórico ([history].enabled).
+    pub fn set_history_enabled(&mut self, enabled: bool) {
+        self.rollup.set_enabled(enabled);
+    }
+
+    /// Fija el tope de claves de los rollups ([history].top_keys).
+    pub fn set_history_top_keys(&mut self, top_keys: usize) {
+        self.rollup.set_top_keys(top_keys);
+    }
+
+    /// Registra un flujo nuevo del minuto para contar sus conexiones.
+    ///
+    /// Si el flujo ya se contó en el minuto se refresca su etiqueta (la que
+    /// tenga al cerrarse el minuto, §7.2) sin contar otra conexión.
+    pub fn record_flow(&mut self, flujo: u64, label: &FlowLabel, ctx: &FlowCtx) {
+        if !self.rollup.enabled() {
+            return;
+        }
+        let (subjects, dims) = sujetos_y_dims(label, ctx);
+        if self.rollup.conoce_flujo(flujo) {
+            self.rollup.actualizar_flujo(flujo, &subjects, &dims);
+        } else {
+            self.rollup.add_flow(flujo, &subjects, &dims);
+        }
+    }
+
+    /// Refresca la etiqueta de un flujo ya contado en el minuto, sin contar otra
+    /// conexión. Si el flujo no se contó en este minuto, no hace nada.
+    pub fn refresh_flow(&mut self, flujo: u64, label: &FlowLabel, ctx: &FlowCtx) {
+        if !self.rollup.enabled() || !self.rollup.conoce_flujo(flujo) {
+            return;
+        }
+        let (subjects, dims) = sujetos_y_dims(label, ctx);
+        self.rollup.actualizar_flujo(flujo, &subjects, &dims);
+    }
+
+    /// Cierra el minuto en curso (parcial) al parar el agregador.
+    pub fn flush_rollup(&mut self, wall: SystemTime) -> Option<RollupBatch> {
+        if !self.rollup.enabled() {
+            return None;
+        }
+        let minuto = minuto_utc(wall);
+        let actual = self.rollup.minute();
+        let lote = self.rollup.flush(if actual == 0 { minuto } else { actual });
+        if lote.is_empty() {
+            None
+        } else {
+            Some(lote)
+        }
     }
 
     /// Vacía las conexiones activas de todas las dimensiones.
@@ -682,10 +792,21 @@ impl Rankings {
                 }
             }
         }
+
+        // Mismo volcado por flujo y segundo que los rankings: acumuladores del
+        // histórico del minuto en curso (§7.2).
+        if self.rollup.enabled() {
+            let (subjects, dims) = sujetos_y_dims(label, ctx);
+            self.rollup.add(&subjects, &dims, bytes, dir);
+        }
     }
 
-    /// Avanza las ventanas y desaloja claves inactivas.
-    pub fn tick(&mut self, now: Instant) {
+    /// Avanza las ventanas, desaloja claves inactivas y cierra el minuto.
+    ///
+    /// Cuando el reloj UTC cambia de minuto devuelve el lote del histórico del
+    /// minuto cerrado (con topes e inventario) para que la tarea de tráfico lo
+    /// publique como AppEvent::Rollup. Sin histórico activo devuelve None.
+    pub fn tick(&mut self, now: Instant, wall: SystemTime) -> Option<RollupBatch> {
         self.total_60.advance(now);
         self.total_5min.advance(now);
         self.sin_identificar_60.advance(now);
@@ -699,6 +820,31 @@ impl Rankings {
         }
         for dim in Dimension::ALL {
             self.desalojar(dim, now);
+        }
+        self.cerrar_minuto(wall)
+    }
+
+    /// Cierra el minuto del histórico si el reloj UTC ha cambiado de minuto.
+    fn cerrar_minuto(&mut self, wall: SystemTime) -> Option<RollupBatch> {
+        if !self.rollup.enabled() {
+            return None;
+        }
+        let minuto = minuto_utc(wall);
+        let actual = self.rollup.minute();
+        if actual == 0 {
+            self.rollup.set_minute(minuto);
+            return None;
+        }
+        if minuto <= actual {
+            // Salto atrás del reloj: el minuto sigue acumulando en su cubo.
+            return None;
+        }
+        let lote = self.rollup.flush(actual);
+        self.rollup.set_minute(minuto);
+        if lote.is_empty() {
+            None
+        } else {
+            Some(lote)
         }
     }
 
@@ -846,6 +992,8 @@ impl Rankings {
             Window::Sixty => (self.sin_identificar_60.total(), self.total_60.total()),
             Window::FiveMin => (self.sin_identificar_5min.total(), self.total_5min.total()),
             Window::Session => (self.sin_identificar_sesion, self.total_sesion),
+            // Las ventanas de 1 h y 24 h salen del histórico (lector).
+            Window::OneHour | Window::Day24 => (0, 0),
         };
         if total == 0 {
             return 0.0;
@@ -1026,6 +1174,7 @@ fn claves<'a>(label: &'a FlowLabel, ctx: &'a FlowCtx) -> [Option<Clave<'a>>; 6] 
         .map(Clave::Categoria);
     let protocolo = label
         .app_protocol
+        .or(ctx.protocol)
         .or_else(|| ctx.l4.map(protocolo_de_transporte))
         .map(Clave::Protocolo);
     let proceso = match &ctx.process {
@@ -1046,6 +1195,15 @@ fn protocolo_de_transporte(l4: L4) -> AppProtocol {
         L4::Tcp => AppProtocol::Tcp,
         L4::Udp => AppProtocol::Udp,
     }
+}
+
+/// Inicio del minuto UTC de un instante del reloj de pared.
+fn minuto_utc(wall: SystemTime) -> i64 {
+    let segundos = wall
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    segundos - segundos.rem_euclid(60)
 }
 
 /// Nombre visible de un equipo; -1 es siempre la fila [host].
@@ -1119,6 +1277,8 @@ mod tests {
             device_id,
             process: process.map(|(pid, nombre)| (pid, nombre.to_string())),
             l4: Some(L4::Tcp),
+            protocol: None,
+            es_cliente: false,
         }
     }
 
@@ -1163,7 +1323,7 @@ mod tests {
         let ctx = contexto(Some(1), None);
         rankings.record(&flujo, &ctx, 1_000, Dir::Down, t0);
         rankings.record(&flujo, &ctx, 200, Dir::Up, t0 + Duration::from_secs(1));
-        rankings.tick(t0 + Duration::from_secs(2));
+        let _ = rankings.tick(t0 + Duration::from_secs(2), std::time::SystemTime::now());
 
         for window in Window::ALL {
             let apps = rankings.top(Dimension::App, window, SortKey::Total, 10);
@@ -1219,6 +1379,77 @@ mod tests {
     }
 
     #[test]
+    fn el_historico_cierra_el_minuto_con_el_reloj_utc() {
+        let mut rankings = Rankings::new();
+        rankings.set_history_enabled(true);
+        rankings.set_history_top_keys(20);
+        let t0 = Instant::now();
+        let base = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let flujo = etiqueta(
+            Some("youtube"),
+            Some("streaming"),
+            Some(AppProtocol::Tls),
+            destino_dominio("youtube.com", Some("Google LLC"), Some("US")),
+        );
+        let ctx = FlowCtx {
+            device_id: Some(1),
+            protocol: Some(AppProtocol::Tls),
+            ..FlowCtx::default()
+        };
+        rankings.record(&flujo, &ctx, 100, Dir::Down, t0);
+        rankings.record_flow(7, &flujo, &ctx);
+        // El primer tick solo fija el minuto en curso.
+        assert!(rankings.tick(t0, base).is_none());
+        // Al cambiar de minuto devuelve el lote del minuto cerrado.
+        let lote = rankings
+            .tick(t0 + Duration::from_secs(60), base + Duration::from_secs(60))
+            .expect("lote del minuto");
+        assert_eq!(lote.minute, 1_800_000_000);
+        assert!(lote
+            .rows
+            .iter()
+            .any(|fila| fila.dimension == crate::history::Dimension::Total));
+        assert!(lote
+            .rows
+            .iter()
+            .any(|fila| fila.dimension == crate::history::Dimension::App));
+        assert!(lote
+            .seen
+            .iter()
+            .any(|item| item.kind == crate::history::SeenKind::App));
+        // Un tick en el mismo minuto no vuelve a emitir lote.
+        assert!(rankings
+            .tick(t0 + Duration::from_secs(61), base + Duration::from_secs(61))
+            .is_none());
+    }
+
+    #[test]
+    fn el_minuto_parcial_se_cierra_al_parar() {
+        let mut rankings = Rankings::new();
+        rankings.set_history_enabled(true);
+        let t0 = Instant::now();
+        let base = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let flujo = etiqueta(Some("youtube"), None, None, destino_ip("1.1.1.1"));
+        let ctx = FlowCtx {
+            device_id: Some(1),
+            ..FlowCtx::default()
+        };
+        rankings.record(&flujo, &ctx, 50, Dir::Down, t0);
+        // Primer tick: fija el minuto en curso sin emitir lote.
+        assert!(rankings.tick(t0, base).is_none());
+        // Al parar, el minuto parcial sale con su bucket.
+        let lote = rankings
+            .flush_rollup(base + Duration::from_secs(10))
+            .expect("minuto parcial");
+        assert_eq!(lote.minute, 1_800_000_000);
+        assert!(!lote.rows.is_empty());
+        // Después de cerrarlo, otro flush no inventa un lote vacío.
+        assert!(rankings
+            .flush_rollup(base + Duration::from_secs(11))
+            .is_none());
+    }
+
+    #[test]
     fn el_avance_de_ventana_descarta_lo_caducado() {
         let mut rankings = Rankings::new();
         rankings.set_devices(mapa_equipos());
@@ -1232,14 +1463,14 @@ mod tests {
         let ctx = contexto(Some(1), None);
         rankings.record(&flujo, &ctx, 500, Dir::Down, t0);
 
-        rankings.tick(t0 + Duration::from_secs(30));
+        let _ = rankings.tick(t0 + Duration::from_secs(30), std::time::SystemTime::now());
         assert_eq!(
             fila_de(&rankings, Dimension::App, Window::Sixty, "youtube").map(|fila| fila.total()),
             Some(500),
             "a los 30 s el dato sigue en la ventana de 60 s"
         );
 
-        rankings.tick(t0 + Duration::from_secs(61));
+        let _ = rankings.tick(t0 + Duration::from_secs(61), std::time::SystemTime::now());
         assert!(
             rankings
                 .top(Dimension::App, Window::Sixty, SortKey::Total, 10)
@@ -1257,7 +1488,7 @@ mod tests {
             "el acumulado de sesión conserva el dato"
         );
 
-        rankings.tick(t0 + Duration::from_secs(301));
+        let _ = rankings.tick(t0 + Duration::from_secs(301), std::time::SystemTime::now());
         assert!(
             rankings
                 .top(Dimension::App, Window::FiveMin, SortKey::Total, 10)
@@ -1301,7 +1532,7 @@ mod tests {
         rankings.record(&b, &dos, 10, Dir::Down, t0);
         rankings.record(&b, &uno, 50, Dir::Up, t0);
         rankings.record(&c, &uno, 200, Dir::Down, t0);
-        rankings.tick(t0 + Duration::from_secs(1));
+        let _ = rankings.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
 
         assert_eq!(
             claves_de(&rankings.top(Dimension::App, Window::Sixty, SortKey::Total, 10)),
@@ -1347,7 +1578,7 @@ mod tests {
             Dir::Down,
             t0,
         );
-        rankings.tick(t0 + Duration::from_secs(1));
+        let _ = rankings.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
 
         let cuotas = rankings.who_uses(Dimension::App, "youtube", Window::Sixty);
         assert_eq!(cuotas.len(), 3);
@@ -1364,7 +1595,7 @@ mod tests {
         assert_eq!(cuotas.iter().map(|cuota| cuota.bytes).sum::<u64>(), 500);
 
         // La ventana de sesión sigue repartiendo los mismos bytes.
-        rankings.tick(t0 + Duration::from_secs(400));
+        let _ = rankings.tick(t0 + Duration::from_secs(400), std::time::SystemTime::now());
         assert!(
             rankings
                 .top(Dimension::App, Window::FiveMin, SortKey::Total, 10)
@@ -1399,7 +1630,7 @@ mod tests {
         );
         rankings.record(&sin_app, &contexto(Some(1), None), 900, Dir::Down, t0);
         rankings.record(&con_app, &contexto(Some(1), None), 100, Dir::Down, t0);
-        rankings.tick(t0 + Duration::from_secs(1));
+        let _ = rankings.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
 
         assert!((rankings.unidentified_share(Window::Sixty) - 90.0).abs() < 0.01);
         assert!((rankings.unidentified_share(Window::FiveMin) - 90.0).abs() < 0.01);
@@ -1407,11 +1638,11 @@ mod tests {
 
         let mut limpio = Rankings::new();
         limpio.record(&con_app, &contexto(Some(1), None), 100, Dir::Down, t0);
-        limpio.tick(t0 + Duration::from_secs(1));
+        let _ = limpio.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
         assert_eq!(limpio.unidentified_share(Window::Sixty), 0.0);
         assert_eq!(Rankings::new().unidentified_share(Window::Session), 0.0);
 
-        rankings.tick(t0 + Duration::from_secs(61));
+        let _ = rankings.tick(t0 + Duration::from_secs(61), std::time::SystemTime::now());
         assert_eq!(
             rankings.unidentified_share(Window::Sixty),
             0.0,
@@ -1432,7 +1663,7 @@ mod tests {
             destino_lan(5, "nas-synology"),
         );
         rankings.record(&flujo, &contexto(Some(1), None), 800, Dir::Down, t0);
-        rankings.tick(t0 + Duration::from_secs(1));
+        let _ = rankings.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
 
         let destinos = rankings.top(Dimension::Destination, Window::Sixty, SortKey::Total, 10);
         assert_eq!(destinos.len(), 1);
@@ -1489,7 +1720,7 @@ mod tests {
             Dir::Down,
             t0,
         );
-        rankings.tick(t0 + Duration::from_secs(1));
+        let _ = rankings.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
 
         let filas = rankings.top(Dimension::Process, Window::Sixty, SortKey::Total, 10);
         assert_eq!(claves_de(&filas), vec!["1234", "55"]);
@@ -1519,7 +1750,7 @@ mod tests {
         );
         rankings.record(&youtube, &contexto(Some(1), None), 100, Dir::Down, t0);
         rankings.record(&dns, &contexto(Some(1), None), 50, Dir::Down, t0);
-        rankings.tick(t0);
+        let _ = rankings.tick(t0, std::time::SystemTime::now());
 
         rankings.begin_connections();
         rankings.record_connection(&youtube, &contexto(Some(1), None));
@@ -1579,7 +1810,7 @@ mod tests {
         );
         rankings.record(&youtube, &contexto(Some(1), None), 200, Dir::Down, t0);
         rankings.record(&sin_catalogo, &contexto(Some(1), None), 100, Dir::Down, t0);
-        rankings.tick(t0);
+        let _ = rankings.tick(t0, std::time::SystemTime::now());
 
         let apps = rankings.top(Dimension::App, Window::Sixty, SortKey::Total, 10);
         let youtube_fila = apps
@@ -1626,7 +1857,7 @@ mod tests {
         rankings.record(&flujo, &udp, 20, Dir::Down, t0);
         let sin_l4 = FlowCtx::default();
         rankings.record(&flujo, &sin_l4, 30, Dir::Down, t0);
-        rankings.tick(t0);
+        let _ = rankings.tick(t0, std::time::SystemTime::now());
 
         let filas = rankings.top(Dimension::Protocol, Window::Sixty, SortKey::Total, 10);
         assert_eq!(claves_de(&filas), vec!["udp", "tcp"]);
@@ -1665,7 +1896,7 @@ mod tests {
         rankings.record(&youtube, &contexto(Some(1), None), 100, Dir::Up, t0);
         rankings.record(&dns, &contexto(Some(1), None), 50, Dir::Down, t0);
         rankings.record(&youtube, &contexto(Some(2), None), 1_000, Dir::Down, t0);
-        rankings.tick(t0 + Duration::from_secs(1));
+        let _ = rankings.tick(t0 + Duration::from_secs(1), std::time::SystemTime::now());
 
         let apps = rankings.top_for_device(Dimension::App, 1, Window::FiveMin, 10);
         assert_eq!(claves_de(&apps), vec!["youtube", "dns"]);
@@ -1706,7 +1937,7 @@ mod tests {
         let t0 = Instant::now();
         let vacia = FlowLabel::empty(ip("10.0.0.1"));
         rankings.record(&vacia, &FlowCtx::default(), 10, Dir::Down, t0);
-        rankings.tick(t0);
+        let _ = rankings.tick(t0, std::time::SystemTime::now());
 
         let destinos = rankings.top(Dimension::Destination, Window::Sixty, SortKey::Total, 10);
         assert_eq!(destinos.len(), 1);
@@ -1765,7 +1996,7 @@ mod tests {
         // Cinco minutos después todas las claves llevan tiempo inactivas: al
         // entrar una nueva se desaloja la más antigua sin bytes en 5 min.
         let despues = t0 + Duration::from_secs(301);
-        rankings.tick(despues);
+        let _ = rankings.tick(despues, std::time::SystemTime::now());
         let flujo = etiqueta(
             None,
             None,
@@ -1913,6 +2144,8 @@ mod tests {
                 device_id,
                 process: process.map(|(pid, nombre)| (pid, nombre.to_string())),
                 l4,
+                protocol: None,
+                es_cliente: false,
             };
             rankings.record(&flujo, &ctx, bytes, dir, base + Duration::from_millis(paso));
             if paso % 97 == 0 {
@@ -1921,10 +2154,16 @@ mod tests {
             rankings.record_connection(&flujo, &ctx);
             if paso % 61 == 0 {
                 let salto = azar.siguiente() % 400;
-                rankings.tick(base + Duration::from_millis(paso) + Duration::from_secs(salto));
+                let _ = rankings.tick(
+                    base + Duration::from_millis(paso) + Duration::from_secs(salto),
+                    std::time::SystemTime::now(),
+                );
             }
         }
-        rankings.tick(base + Duration::from_secs(500));
+        let _ = rankings.tick(
+            base + Duration::from_secs(500),
+            std::time::SystemTime::now(),
+        );
 
         for window in Window::ALL {
             let pct = rankings.unidentified_share(window);
@@ -1994,7 +2233,7 @@ mod tests {
         rankings.record(&flujo, &ctx, u64::MAX, Dir::Down, t0);
         rankings.record(&flujo, &ctx, u64::MAX, Dir::Up, t0);
         rankings.record(&flujo, &ctx, u64::MAX, Dir::Down, t0);
-        rankings.tick(t0);
+        let _ = rankings.tick(t0, std::time::SystemTime::now());
 
         let filas = rankings.top(Dimension::App, Window::Session, SortKey::Total, 10);
         assert_eq!(filas.len(), 1);

@@ -7,7 +7,7 @@
 
 use rusqlite::{params, Connection, Row};
 
-use super::ahora_rfc3339;
+use super::{ahora_rfc3339, Repo};
 use crate::error::Result;
 
 /// Protocolo de transporte de un servicio.
@@ -144,6 +144,63 @@ pub(crate) fn prune(conn: &Connection, older_than: &str) -> Result<usize> {
     Ok(borrados)
 }
 
+/// Materializa el cierre de un servicio (CERRADO → STALE de F2).
+///
+/// DEVICE_SERVICES no tiene columna de estado: el estado STALE se deriva de
+/// `last_seen` (F2). Para que un cierre detectado por un escaneo de puertos sea
+/// determinista, `last_seen` se deja un segundo por debajo del umbral de
+/// obsolescencia `stale_before` (que la reconciliación calcula con
+/// `scan.interval_s * scan.offline_after_cycles`): así `mark_stale` lo cuenta
+/// como STALE de inmediato, sin cambiar el esquema y sin borrar la fila (la
+/// purga por retención la eliminará más tarde). El instante real del cierre
+/// queda en DEVICE_EVENTS con el evento `service_gone`.
+///
+/// Devuelve cuántas filas ha actualizado (0 si el servicio no estaba
+/// persistido). Si `stale_before` no fuera una fecha válida se usa tal cual:
+/// la fila no quedará STALE, pero el estado CERRADO sigue siendo el último
+/// evento y los avisos no se duplican.
+pub(crate) fn mark_closed(
+    conn: &Connection,
+    device_id: i64,
+    port: u16,
+    protocol: Protocol,
+    stale_before: &str,
+) -> Result<usize> {
+    let marca = marca_de_cierre(stale_before);
+    let cambiados = conn.execute(
+        "UPDATE DEVICE_SERVICES SET last_seen = ?1
+         WHERE device_id = ?2 AND port = ?3 AND protocol = ?4",
+        params![marca, device_id, port, protocol.as_str()],
+    )?;
+    Ok(cambiados)
+}
+
+/// Instante de cierre: justo por debajo del umbral de obsolescencia.
+fn marca_de_cierre(stale_before: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(stale_before) {
+        Ok(umbral) => (umbral - chrono::Duration::seconds(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        Err(_) => stale_before.to_string(),
+    }
+}
+
+impl Repo {
+    /// Marca un servicio como cerrado (STALE determinista de F2, F5).
+    ///
+    /// Lo llama la reconciliación tras emitir `service_gone`; no cambia el
+    /// esquema y mantiene la fila para que un escaneo posterior pueda marcar
+    /// `reopened = true` en `service_new`.
+    pub fn mark_service_closed(
+        &mut self,
+        device_id: i64,
+        port: u16,
+        protocol: Protocol,
+        stale_before: &str,
+    ) -> Result<usize> {
+        mark_closed(&self.conn, device_id, port, protocol, stale_before)
+    }
+}
+
 /// Reconstruye un servicio a partir de una fila de SQL_SELECCION.
 fn fila_a_servicio(fila: &Row<'_>) -> rusqlite::Result<DeviceService> {
     let protocolo: String = fila.get(3)?;
@@ -162,6 +219,62 @@ fn fila_a_servicio(fila: &Row<'_>) -> rusqlite::Result<DeviceService> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::{DeviceUpsert, Interface, Repo};
+
+    #[test]
+    fn marcar_cierre_deja_el_servicio_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let interface_id = repo
+            .upsert_interface(&Interface::without_id(
+                "eth0".to_string(),
+                Some("02:00:00:00:00:ff".to_string()),
+                Some("192.168.1.10".to_string()),
+                Some("255.255.255.0".to_string()),
+                None,
+                true,
+                "2026-01-01T00:00:00Z".to_string(),
+            ))
+            .unwrap();
+        let (device_id, _) = repo
+            .upsert_device(&DeviceUpsert {
+                mac: "aa:bb:cc:dd:ee:01".to_string(),
+                ip: "192.168.1.20".to_string(),
+                hostname: None,
+                vendor: None,
+                interface_id,
+                device_type: "unknown".to_string(),
+            })
+            .unwrap();
+        repo.upsert_service(&ServiceUpsert {
+            device_id,
+            port: 445,
+            protocol: Protocol::Tcp,
+            service: Some("smb".to_string()),
+            banner: None,
+        })
+        .unwrap();
+
+        let stale_before = "2999-01-01T00:00:00Z";
+        assert_eq!(
+            repo.mark_service_closed(device_id, 445, Protocol::Tcp, stale_before)
+                .unwrap(),
+            1
+        );
+        let servicio = repo.list_services(device_id).unwrap().remove(0);
+        assert_eq!(servicio.last_seen, "2998-12-31T23:59:59Z");
+        assert_eq!(
+            repo.mark_stale_services(device_id, stale_before).unwrap(),
+            1,
+            "el cierre debe dejar el servicio STALE de inmediato"
+        );
+        assert_eq!(
+            repo.mark_service_closed(device_id, 22, Protocol::Tcp, stale_before)
+                .unwrap(),
+            0,
+            "un puerto no persistido no se toca"
+        );
+    }
 
     #[test]
     fn protocolo_ida_y_vuelta() {

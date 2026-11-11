@@ -33,6 +33,12 @@ pub mod migrations;
 #[allow(dead_code)]
 pub mod names;
 #[allow(dead_code)]
+pub mod rollups;
+#[allow(dead_code)]
+pub mod seen;
+#[allow(dead_code)]
+pub mod sessions;
+#[allow(dead_code)]
 pub mod traffic_snapshot;
 
 use std::path::{Path, PathBuf};
@@ -127,6 +133,12 @@ impl Repo {
     #[cfg(test)]
     pub fn connection(&self) -> &SqliteConnection {
         &self.conn
+    }
+
+    /// Acceso mutable a la conexión (solo para pruebas internas).
+    #[cfg(test)]
+    pub fn connection_mut(&mut self) -> &mut SqliteConnection {
+        &mut self.conn
     }
 
     /// Inserta o actualiza una interfaz por nombre y devuelve su id.
@@ -748,7 +760,7 @@ mod tests {
 
         assert!(ruta.exists(), "debe existir el fichero de base de datos");
         assert_eq!(repo.path(), ruta.as_path());
-        assert_eq!(repo.schema_version().expect("leer versión"), 4);
+        assert_eq!(repo.schema_version().expect("leer versión"), 5);
         assert_eq!(repo.count_devices().expect("contar dispositivos"), 0);
     }
 
@@ -758,11 +770,11 @@ mod tests {
         let ruta = directorio.path().join("data.db");
 
         let primera = Repo::init(&ruta).expect("primer init");
-        assert_eq!(primera.schema_version().expect("leer versión"), 4);
+        assert_eq!(primera.schema_version().expect("leer versión"), 5);
         drop(primera);
 
         let segunda = Repo::init(&ruta).expect("segundo init sobre el mismo fichero");
-        assert_eq!(segunda.schema_version().expect("leer versión"), 4);
+        assert_eq!(segunda.schema_version().expect("leer versión"), 5);
     }
 
     #[test]
@@ -778,12 +790,15 @@ mod tests {
                    AND name IN ('INTERFACES', 'DEVICES', 'DEVICE_EVENTS',
                                  'DEVICE_SERVICES', 'DISCOVERY_SOURCES',
                                  'SCHEMA_MIGRATIONS', 'TRAFFIC_SNAPSHOT',
-                                 'CONNECTIONS', 'NAME_CACHE')",
+                                 'CONNECTIONS', 'NAME_CACHE',
+                                 'TRAFFIC_ROLLUP_MINUTE', 'TRAFFIC_ROLLUP_HOUR',
+                                 'TRAFFIC_ROLLUP_DAY', 'DEVICE_SEEN',
+                                 'APP_SESSIONS')",
                 [],
                 |fila| fila.get(0),
             )
             .expect("contar tablas del esquema");
-        assert_eq!(tablas, 9, "deben existir las nueve tablas del esquema");
+        assert_eq!(tablas, 14, "deben existir las catorce tablas del esquema");
 
         let modo: String = repo
             .connection()
@@ -1176,7 +1191,7 @@ mod tests {
 
         // El segundo repositorio se abre con el primero aún vivo (modo WAL).
         let mut segundo = Repo::init(&ruta).expect("segundo repositorio sobre el mismo fichero");
-        assert_eq!(segundo.schema_version().expect("leer versión"), 4);
+        assert_eq!(segundo.schema_version().expect("leer versión"), 5);
         assert_eq!(segundo.list_interfaces().expect("listar").len(), 1);
 
         segundo

@@ -5,6 +5,7 @@
 //! para caducar notificaciones. La base de datos se usa solo desde este hilo.
 
 pub mod app;
+pub mod history_state;
 pub mod keys;
 pub mod theme;
 pub mod traffic_state;
@@ -139,6 +140,31 @@ pub async fn run(
     if let Some(tx) = &app.traffic_command_tx {
         let _ = tx.try_send(TrafficCommand::Stop);
     }
+
+    // Cierre ordenado (§4.8): el agregador cierra el minuto parcial, la TUI lo
+    // escribe antes de cerrar la sesión y espera como mucho 2 s a que pare.
+    let limite = Instant::now() + Duration::from_secs(2);
+    while !app.traffic_stopped && Instant::now() < limite {
+        let espera = tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await;
+        match espera {
+            Ok(Ok(AppEvent::Rollup(lote))) => {
+                escribir_lote_historico(&mut app, &mut repo, *lote);
+            }
+            Ok(Ok(AppEvent::TrafficStopped)) => app.traffic_stopped = true,
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => {}
+        }
+    }
+    // Reintento final de los lotes pendientes (si falla, se pierde como mucho el
+    // último minuto; la sesión se cierra igualmente).
+    escribir_pendientes(&mut app, &mut repo);
+    if let Some(id) = app.session_id {
+        if let Err(err) = repo.close_session(id, std::time::SystemTime::now()) {
+            tracing::warn!(%err, "no se pudo cerrar la sesión de Almenara");
+        }
+    }
     restore_terminal();
     resultado
 }
@@ -153,12 +179,29 @@ async fn bucle(
     ticker: &mut tokio::time::Interval,
 ) -> Result<()> {
     loop {
+        // Contexto del histórico (pestaña, detalle, agrupación y ventana): la
+        // vista decide qué consultas necesita y el render nunca toca la BD.
+        app.history.sync_context(
+            app.tab,
+            app.detail.as_ref().map(|detalle| detalle.device_id),
+            app.traffic_group,
+            app.traffic_window,
+        );
+        app.history.set_history_enabled(app.config.history.enabled);
+
         terminal
             .draw(|frame| views::draw(frame, app))
             .map_err(|err| Error::Terminal(format!("no se pudo dibujar la interfaz: {err}")))?;
 
         if app.should_quit {
             return Ok(());
+        }
+
+        // Consultas del histórico visibles: el lector responde por AppEvent::History.
+        if let Some(lector) = &app.history_reader {
+            for (id, consulta) in app.history.history_pending_requests(Utc::now().timestamp()) {
+                lector.query(id, consulta);
+            }
         }
 
         tokio::select! {
@@ -174,7 +217,15 @@ async fn bucle(
                                 key,
                                 label,
                                 window,
-                            } => pedir_quien_lo_usa(app, dimension, key, label, window).await,
+                            } => {
+                                if window.history().is_some() {
+                                    // Ventanas de 1 h y 24 h: la respuesta sale del
+                                    // lector del histórico, no de la tarea de tráfico.
+                                    app.history.ask_who_uses(dimension, key, label, window);
+                                } else {
+                                    pedir_quien_lo_usa(app, dimension, key, label, window).await;
+                                }
+                            }
                             otra => aplicar_accion(otra, app, repo),
                         }
                     }
@@ -204,6 +255,15 @@ async fn bucle(
                     Ok(AppEvent::CaptureNotice { level, message }) => {
                         app.push_notification(level, message);
                     }
+                    Ok(AppEvent::History { id, response }) => {
+                        app.history.apply_history_response(id, &response);
+                    }
+                    Ok(AppEvent::Rollup(lote)) => {
+                        escribir_lote_historico(app, repo, *lote);
+                    }
+                    Ok(AppEvent::TrafficStopped) => {
+                        app.traffic_stopped = true;
+                    }
                     Ok(AppEvent::Quit) => app.should_quit = true,
                     Err(broadcast::error::RecvError::Lagged(perdidos)) => {
                         app.push_notification(
@@ -219,6 +279,15 @@ async fn bucle(
                 if app.traffic.has_live_data() && app.should_persist_traffic() {
                     persistir_trafico(app, repo);
                 }
+                let consolidar = app
+                    .last_consolidation
+                    .map(|instante| instante.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if consolidar {
+                    consolidar_pendientes(app, repo);
+                }
+                latir_sesion(app, repo);
+                purgar_si_toca(app, repo);
             }
         }
     }
@@ -352,6 +421,192 @@ fn recargar_dispositivos(app: &mut App, repo: &Repo) {
     }
 }
 
+/// Tope de lotes del minuto pendientes de escribir (§4.1).
+const MAX_LOTES_PENDIENTES: usize = 10;
+
+/// Escribe el lote del minuto y su inventario, con reintento y descarte.
+///
+/// El hilo de la TUI es el único escritor (ADR-35). Si la escritura falla, el
+/// lote espera al minuto siguiente; con más de MAX_LOTES_PENDIENTES se descarta el
+/// más antiguo, se cuenta en rollup_drops y se avisa una sola vez.
+fn escribir_lote_historico(app: &mut App, repo: &mut Repo, lote: crate::history::RollupBatch) {
+    app.pending_rollups.push(lote);
+    while app.pending_rollups.len() > MAX_LOTES_PENDIENTES {
+        app.pending_rollups.remove(0);
+        app.rollup_counters.drops = app.rollup_counters.drops.saturating_add(1);
+        if !app.rollup_dropped_warned {
+            app.rollup_dropped_warned = true;
+            app.push_notification(
+                Level::Warn,
+                "No se puede escribir el histórico: se descartan lotes antiguos (rollup_drops)",
+            );
+        }
+    }
+    escribir_pendientes(app, repo);
+}
+
+/// Intenta escribir en orden todos los lotes pendientes; para al primer fallo.
+fn escribir_pendientes(app: &mut App, repo: &mut Repo) {
+    while let Some(lote) = app.pending_rollups.first().cloned() {
+        match repo.insert_minute_batch(&lote) {
+            Ok(_) => {
+                app.pending_rollups.remove(0);
+                app.rollup_counters.batches = app.rollup_counters.batches.saturating_add(1);
+                app.rollup_counters.overflow =
+                    app.rollup_counters.overflow.saturating_add(lote.overflow);
+                // Si el lote cierra una hora, se consolida en el acto (§4.1).
+                if (lote.minute + 60).rem_euclid(3600) == 0 {
+                    let hora = lote.minute - lote.minute.rem_euclid(3600);
+                    let top_keys = app.config.history.top_keys;
+                    if let Err(err) = repo.build_hour(hora, top_keys) {
+                        tracing::warn!(%err, hora, "no se pudo consolidar la hora del histórico");
+                    }
+                    limpiar_destinos_si_apagados(app, repo);
+                }
+                app.history.history_refresh();
+            }
+            Err(err) => {
+                tracing::warn!(%err, "no se pudo escribir el lote del histórico; se reintentará");
+                break;
+            }
+        }
+    }
+}
+
+/// Construye las horas y días pendientes en tandas de 10 (§4.2 y §4.3).
+fn consolidar_pendientes(app: &mut App, repo: &mut Repo) {
+    app.last_consolidation = Some(Instant::now());
+    if !app.config.history.enabled {
+        return;
+    }
+    let ahora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let hora_actual = crate::history::localtime::hour_start(ahora);
+    let hoy = crate::history::LocalDay::from_unix(ahora);
+    let top_keys = app.config.history.top_keys;
+
+    let pendientes = match repo.pending_hours(hora_actual) {
+        Ok(horas) => horas,
+        Err(err) => {
+            tracing::warn!(%err, "no se pudieron leer las horas pendientes del histórico");
+            return;
+        }
+    };
+    let mut consolidadas = 0usize;
+    for hora in pendientes.iter().take(10) {
+        match repo.build_hour(*hora, top_keys) {
+            Ok(_) => consolidadas += 1,
+            Err(err) => {
+                tracing::warn!(%err, hora, "no se pudo consolidar una hora del histórico");
+                break;
+            }
+        }
+    }
+
+    // Un día solo se consolida cuando todas sus horas lo están (23, 24 o 25).
+    match repo.pending_days(hoy) {
+        Ok(dias) => {
+            for dia in dias.iter().take(10) {
+                let (desde, hasta) = dia.limits();
+                let quedan_horas = match repo.pending_hours(hasta) {
+                    Ok(horas) => horas.iter().any(|hora| *hora >= desde && *hora < hasta),
+                    Err(_) => true,
+                };
+                if quedan_horas {
+                    continue;
+                }
+                match repo.build_day(*dia, top_keys) {
+                    Ok(_) => consolidadas += 1,
+                    Err(err) => {
+                        tracing::warn!(%err, dia = dia.aaaammdd(), "no se pudo consolidar un día");
+                        break;
+                    }
+                }
+            }
+        }
+        Err(err) => tracing::warn!(%err, "no se pudieron leer los días pendientes"),
+    }
+
+    if consolidadas > 0 {
+        limpiar_destinos_si_apagados(app, repo);
+        app.history.history_refresh();
+    }
+}
+
+/// Con destination_days = 0 no se guardan destinos por hora (§7.4): se limpian
+/// en cuanto se consolida la hora que los tenía por minuto.
+fn limpiar_destinos_si_apagados(app: &App, repo: &mut Repo) {
+    if app.config.history.destination_days != 0 {
+        return;
+    }
+    if let Err(err) = repo.clear_destination_hours() {
+        tracing::warn!(%err, "no se pudieron limpiar los destinos por hora");
+    }
+}
+
+/// Purga el histórico una vez por hora y avisa si la BD supera el límite (§7.4).
+fn purgar_si_toca(app: &mut App, repo: &mut Repo) {
+    let toca = app
+        .last_purge
+        .map(|instante| instante.elapsed() >= Duration::from_secs(3600))
+        .unwrap_or(true);
+    if !toca {
+        return;
+    }
+    app.last_purge = Some(Instant::now());
+    let retencion = app.config.history.retention();
+    match repo.purge_history(std::time::SystemTime::now(), &retencion) {
+        Ok(stats) => {
+            tracing::info!(
+                filas = stats.total_filas(),
+                paginas = stats.vacuum_pages,
+                "purga del histórico"
+            );
+            app.history.last_purge = Some(stats);
+            let bytes = std::fs::metadata(&app.db_path)
+                .map(|metadatos| metadatos.len())
+                .unwrap_or(0);
+            let mb = bytes / (1024 * 1024);
+            let limite = app.config.history.max_db_mb;
+            let por_encima = mb > limite;
+            app.history.db_over_limit = por_encima;
+            if por_encima && !app.db_size_warned {
+                app.db_size_warned = true;
+                app.push_notification(
+                    Level::Warn,
+                    format!(
+                        "La base de datos ({mb} MB) supera [history].max_db_mb = {limite} MB; baja las retenciones o borra la BD"
+                    ),
+                );
+            }
+        }
+        Err(err) => tracing::warn!(%err, "no se pudo purgar el histórico"),
+    }
+    if let Err(err) = repo.prune_events(app.config.storage.events_retention_days) {
+        tracing::warn!(%err, "no se pudieron podar los eventos");
+    }
+}
+
+/// Da el latido de la sesión cada minuto, haya tráfico o no (§7.6).
+fn latir_sesion(app: &mut App, repo: &mut Repo) {
+    let Some(id) = app.session_id else {
+        return;
+    };
+    let toca = app
+        .last_beat
+        .map(|instante| instante.elapsed() >= Duration::from_secs(60))
+        .unwrap_or(true);
+    if !toca {
+        return;
+    }
+    match repo.beat_session(id, std::time::SystemTime::now()) {
+        Ok(()) => app.last_beat = Some(Instant::now()),
+        Err(err) => tracing::warn!(%err, "no se pudo dar el latido de la sesión"),
+    }
+}
+
 fn procesar_escaneo(
     report: ScanReport,
     app: &mut App,
@@ -425,6 +680,7 @@ fn procesar_escaneo(
                 ));
             }
             app.apply_reconciliation(reconciliacion);
+            app.history.history_refresh();
             actualizar_mapa_dispositivos(app, repo);
             app.push_notification(Level::Info, resumen);
             for notification in notificaciones {
@@ -1038,6 +1294,131 @@ mod tests {
             app.selected_device().map(|device| device.id),
             Some(id),
             "la selección debe conservarse tras moverse de grupo"
+        );
+    }
+
+    /// Construye un lote de un minuto con una fila total y una entrada de
+    /// inventario para las pruebas del hilo de la TUI.
+    fn lote_de_prueba(minute: i64, device_id: i64) -> crate::history::RollupBatch {
+        use crate::history::{
+            Counter, Dimension, RollupBatch, RollupRow, SeenItem, SeenKind, Subject,
+        };
+        RollupBatch {
+            minute,
+            rows: vec![RollupRow {
+                subject: Subject::Device(device_id),
+                dimension: Dimension::Total,
+                key: String::new(),
+                counter: Counter {
+                    down: 100,
+                    up: 10,
+                    connections: 1,
+                },
+            }],
+            seen: vec![SeenItem {
+                device_id,
+                kind: SeenKind::App,
+                key: "youtube".to_string(),
+            }],
+            overflow: 0,
+        }
+    }
+
+    fn repo_con_equipo() -> (tempfile::TempDir, Repo, i64) {
+        use crate::repo::{DeviceUpsert, Interface};
+        let dir = tempfile::tempdir().expect("directorio temporal");
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repositorio");
+        let id_interfaz = repo
+            .upsert_interface(&Interface::without_id(
+                "eth0",
+                Some("aa:bb:cc:dd:ee:ff".to_string()),
+                Some("192.168.1.10".to_string()),
+                None,
+                None,
+                true,
+                "2026-11-10T10:00:00Z",
+            ))
+            .expect("interfaz");
+        let (device_id, _) = repo
+            .upsert_device(&DeviceUpsert {
+                mac: "aa:bb:cc:dd:ee:01".to_string(),
+                ip: "192.168.1.50".to_string(),
+                hostname: Some("laptop".to_string()),
+                vendor: None,
+                interface_id: id_interfaz,
+                device_type: "pc".to_string(),
+            })
+            .expect("equipo");
+        (dir, repo, device_id)
+    }
+
+    #[test]
+    fn el_lote_del_minuto_se_escribe_con_su_inventario() {
+        let (_dir, mut repo, device_id) = repo_con_equipo();
+        let mut app = app_prueba();
+        escribir_lote_historico(
+            &mut app,
+            &mut repo,
+            lote_de_prueba(1_800_000_000, device_id),
+        );
+        assert!(app.pending_rollups.is_empty());
+        assert_eq!(app.rollup_counters.batches, 1);
+        let minutos: i64 = repo
+            .connection()
+            .query_row("SELECT COUNT(*) FROM TRAFFIC_ROLLUP_MINUTE", [], |fila| {
+                fila.get(0)
+            })
+            .unwrap();
+        assert_eq!(minutos, 1);
+        let inventario: i64 = repo
+            .connection()
+            .query_row("SELECT COUNT(*) FROM DEVICE_SEEN", [], |fila| fila.get(0))
+            .unwrap();
+        assert_eq!(inventario, 1);
+    }
+
+    #[test]
+    fn al_cerrar_la_hora_se_consolida_en_el_mismo_lote() {
+        let (_dir, mut repo, device_id) = repo_con_equipo();
+        let mut app = app_prueba();
+        // Último minuto de la hora H: (bucket + 60) % 3600 == 0.
+        let hora = 1_800_000_000;
+        escribir_lote_historico(&mut app, &mut repo, lote_de_prueba(hora + 3540, device_id));
+        let horas: i64 = repo
+            .connection()
+            .query_row("SELECT COUNT(*) FROM TRAFFIC_ROLLUP_HOUR", [], |fila| {
+                fila.get(0)
+            })
+            .unwrap();
+        assert_eq!(horas, 1, "la hora cerrada debe consolidarse en el acto");
+        let bajada: i64 = repo
+            .connection()
+            .query_row(
+                "SELECT SUM(bytes_down) FROM TRAFFIC_ROLLUP_HOUR WHERE dimension = 'total'",
+                [],
+                |fila| fila.get(0),
+            )
+            .unwrap();
+        assert_eq!(bajada, 100);
+    }
+
+    #[test]
+    fn los_lotes_fallidos_se_reintentan_y_se_descarta_el_mas_antiguo() {
+        let (_dir, mut repo, _device_id) = repo_con_equipo();
+        let mut app = app_prueba();
+        // El inventario apunta a un equipo inexistente: la transacción falla.
+        let fallido = lote_de_prueba(1_800_000_000, 999_999);
+        for indice in 0..12i64 {
+            let mut lote = fallido.clone();
+            lote.minute += indice * 60;
+            escribir_lote_historico(&mut app, &mut repo, lote);
+        }
+        assert_eq!(app.pending_rollups.len(), MAX_LOTES_PENDIENTES);
+        assert!(app.rollup_counters.drops >= 2);
+        assert_eq!(app.rollup_counters.batches, 0);
+        assert!(
+            app.rollup_dropped_warned,
+            "se avisa una sola vez del descarte"
         );
     }
 }

@@ -1,18 +1,21 @@
 # Almenara
 
 Monitor de red en TUI para Linux: descubre los equipos conectados a la red local, qué servicios
-ofrecen, **qué tráfico generan en vivo** y **quién está detrás de cada conexión**. **Fase 4:
-protocolos, apps y top talkers** — un motor de inferencia identifica el protocolo de aplicación, el
-nombre del servidor (SNI de TLS y QUIC, `Host` de HTTP, respuestas DNS), la app y categoría del
-catálogo, la huella JA4 del cliente y el rol cliente/servidor, y añade rankings por destino, app,
-categoría, protocolo y proceso con el panel «¿Quién lo usa?» — sobre la base de las fases 1 a 3
-(descubrimiento ARP/ICMP/DNS/OUI, mDNS, SSDP, DHCP, NetBIOS, port scan, fingerprint,
-clasificación, captura AF_PACKET + TPACKET_V3 y tráfico en vivo).
+ofrecen, **qué tráfico generan en vivo**, **quién está detrás de cada conexión** y **qué ha pasado
+los últimos dos años**. **Fase 5: histórico, rollups y eventos** — cierra cada minuto los
+contadores de la Fase 4 y los guarda como agregados por minuto (48 h), hora (90 días) y día local
+(2 años), con retención, purga y compactación; añade la pestaña **Histórico**, las ventanas de
+**1 h y 24 h** de Tráfico y el histórico del detalle de equipo, completa los eventos (vuelta a
+estar en línea, servicios, SO y tipo), calcula la **presencia** y guarda el **inventario por
+equipo**. Todo sobre la base de las fases 1 a 4 (descubrimiento ARP/ICMP/DNS/OUI, mDNS, SSDP,
+DHCP, NetBIOS, port scan, fingerprint, clasificación, captura AF_PACKET + TPACKET_V3, tráfico en
+vivo, protocolos, apps y top talkers).
 
 ## Estado del proyecto
 
-**Fases 1 a 4 implementadas** (Fase 4 pendiente de entrega del informe de implementación al
-analista funcional). Documentación:
+**Fases 1 a 5 implementadas** (pendiente de entrega del informe de implementación de la Fase 5 al
+analista funcional; las 9 casillas de F4 de la pasada con `CAP_NET_RAW` siguen pendientes por
+decisión del desarrollador). Documentación:
 
 - Fase 1: [informe de fase](docs/fase1/almenara-fase1-informe.md),
   [checklist](docs/fase1/almenara-fase1-checklist.md) e
@@ -26,6 +29,35 @@ analista funcional). Documentación:
 - Fase 4: [informe de fase](docs/fase4/almenara-fase4-informe.md),
   [checklist](docs/fase4/almenara-fase4-checklist.md) e
   [informe de implementación](docs/fase4/almenara-fase4-implementacion.md).
+- Fase 5: [informe de fase](docs/fase5/almenara-fase5-informe.md),
+  [checklist](docs/fase5/almenara-fase5-checklist.md) e
+  [informe de implementación](docs/fase5/almenara-fase5-implementacion.md).
+
+## Novedades de la Fase 5
+
+- **Histórico agregado sin registro de conexiones**: rollups por minuto (48 h), hora (90 días) y
+  día local (2 años) con sujetos device/host/other/network y dimensiones total, app, categoría,
+  destino, protocolo, proceso, organización y país. Las claves especiales y el tope de 20 claves
+  con `~otros` mantienen los totales exactos sin que la base crezca sin control.
+- **Retención por resolución y tamaño acotado**: destinos solo 2 h por minuto y 30 días por hora
+  (nunca en días ni en el inventario), purga horaria con `incremental_vacuum` y aviso si la BD
+  supera `max_db_mb`.
+- **Pestaña Histórico**: sujeto con `e`, rango con `w` (24 h → 7 días → 30 días → 1 año), gráfica
+  con huecos `░` y cursor `<` `>`, «Más tráfico» y línea de tiempo de eventos con filtro `f` y
+  búsqueda `/`; foco con `Tab`.
+- **Tráfico de 1 h y 24 h** desde el histórico (volúmenes, minutos cerrados y huecos) y
+  «¿Quién lo usa?» en esas ventanas; **detalle de equipo** con histórico 24 h ⇄ 7 días, presencia
+  de 24 h y 7 días e inventario («Visto en este equipo»).
+- **Eventos nuevos**: vuelta a estar en línea, servicios que se abren o cierran, cambios de SO y de
+  tipo, y `disappeared` con la última vez visto. La **presencia** se calcula al vuelo desde los
+  eventos y las sesiones: cuando Almenara está cerrada se muestra «sin datos», nunca presente o
+  ausente inventados.
+- **Sesiones con latido** (para distinguir «sin tráfico» de «sin datos») e **instancia única** por
+  base de datos: una segunda Almenara no arranca y avisa con el PID de la que está en marcha.
+- **Privacidad**: solo agregados, sin contenido y sin nombres completos; los destinos son el
+  dominio registrable, la IP o el equipo de la LAN; el histórico se desactiva con
+  `[history].enabled = false`.
+- **Medición sin captura**: histórico sintético determinista y prueba ignorada `medir_historial`.
 
 ## Novedades de la Fase 4
 
@@ -166,6 +198,15 @@ apps_file = "~/.config/almenara/apps.toml"  # reglas propias de apps (opcional)
 db_path = "~/.local/share/almenara/data.db"
 events_retention_days = 90       # retención de DEVICE_EVENTS y de servicios STALE
 
+[history]                        # histórico (Fase 5)
+enabled = true                   # false = no guardar rollups ni inventario (w salta 1 h y 24 h)
+minute_days = 2                  # minutos: 48 h (los destinos por minuto, 2 h fijas)
+hour_days = 90                   # horas
+day_days = 730                   # días, inventario y sesiones (2 años)
+destination_days = 30            # destinos por hora (0 = no guardarlos)
+top_keys = 20                    # claves por sujeto, dimensión y cubo; el resto, «otros»
+max_db_mb = 1024                 # aviso cuando la base de datos lo supera
+
 [ui]
 theme = "default"
 no_color = false
@@ -189,6 +230,37 @@ traffic_group = "device"         # device | destination | app | category | proto
 - Los valores inválidos se avisan y se sustituyen por los valores por defecto (la aplicación nunca
   deja de arrancar por un error de configuración).
 
+## Histórico y copias de seguridad
+
+Almenara solo tiene histórico **mientras está abierta**: la TUI es la única que escribe. Cada
+arranque abre una sesión con su latido por minuto y cada cierre se registra, de modo que las
+gráficas y la presencia distinguen «sin tráfico» de «sin datos» (los huecos se dibujan con ░ y
+nunca se interpolan). Para tener histórico continuo, deja Almenara abierta, por ejemplo en tmux:
+
+```bash
+tmux new -s almenara
+./target/release/almenara        # o scripts/ejecutar-con-permisos.sh
+# Ctrl-b d para salir del tmux sin cerrar Almenara
+tmux attach -t almenara
+```
+
+Solo puede haber **una Almenara por base de datos**: la segunda muestra «Almenara ya está en marcha
+(PID n)» y sale con código 1 sin abrir la BD. El bloqueo es un flock sobre data.db.lock y el
+kernel lo libera si el proceso muere, así que no quedan bloqueos huérfanos.
+
+La BD se puede copiar sin parar Almenara (WAL permite lectores concurrentes):
+
+```bash
+sqlite3 ~/.local/share/almenara/data.db ".backup copia.db"
+# o, para compactar la copia:
+sqlite3 ~/.local/share/almenara/data.db "VACUUM INTO 'copia.db'"
+```
+
+Con Almenara cerrada basta con copiar data.db (y, si no se cerró limpiamente, también
+data.db-wal y data.db-shm). Perder la BD es perder el histórico; el inventario de equipos se
+reconstruye con el escaneo y la captura. Para borrar el histórico, cierra Almenara y borra la BD, o
+baja las retenciones de [history].
+
 ## Modo pasivo
 
 Con `[scan].passive_only = true` la aplicación **solo escucha: no consulta a nadie**, con
@@ -208,14 +280,17 @@ terminales de 100 columnas o más, añade las líneas de captura y visibilidad
 
 ## Uso de la TUI
 
-Pestañas: **Equipos · Tráfico · Conexiones · Histórico · Alertas · Config · Ayuda**. En Fase 4
-están operativas Equipos (plana o agrupada, con detalle master-detail), Tráfico (rankings por
-dimensión y «¿Quién lo usa?»), Conexiones (tabla con protocolo, equipo, destino, app y panel de
-detalle), Config y Ayuda. Histórico (F5) y Alertas (F6) siguen mostrando su placeholder.
+Pestañas: **Equipos · Tráfico · Conexiones · Histórico · Alertas · Config · Ayuda**. En Fase 5
+están operativas Equipos (plana o agrupada, con detalle master-detail y línea «Último evento»),
+Tráfico (rankings por dimensión y «¿Quién lo usa?»), Conexiones (tabla con protocolo, equipo,
+destino, app y panel de detalle), Histórico, Config y Ayuda. Solo Alertas (F6) sigue mostrando su
+placeholder.
 
 En la pestaña Tráfico, `g` cicla la agrupación (equipo → destino → app → categoría → protocolo →
-proceso) y se guarda en `[ui].traffic_group`; `w` cicla la ventana (60 s → 5 min → sesión, sin
-persistir). `Enter` abre el panel **«¿Quién lo usa?»** sobre destino, app, categoría o protocolo;
+proceso) y se guarda en `[ui].traffic_group`; `w` cicla la ventana (60 s → 5 min → 1 h → 24 h →
+sesión, sin persistir). Las ventanas de 1 h y 24 h se leen del histórico con volúmenes (no
+velocidades), números de conexiones, minutos cerrados y los huecos de cobertura; con
+`[history].enabled = false` se saltan. `Enter` abre el panel **«¿Quién lo usa?»** sobre destino, app, categoría o protocolo;
 sobre un equipo abre su detalle y sobre un proceso abre Conexiones filtrada por ese proceso. El pie
 muestra siempre el total y el porcentaje de tráfico sin identificar. La agrupación por equipo
 mantiene la fila **[host]** con el tráfico del propio equipo, que no pertenece al inventario.
@@ -225,13 +300,29 @@ país) y el equipo es el lado cliente o el de la LAN; sin rol conocido la fila s
 con `?` delante del destino. `i` alterna nombres ⇄ IPs y `v` abre el panel con las cabeceras y la
 identidad inferida (rol, fuentes, JA4 y proceso local).
 
+En Histórico, `e` abre el selector de sujeto (toda la red, este equipo o un equipo con `/`), `w`
+cicla el rango (24 h → 7 días → 30 días → 1 año) y `Tab` mueve el foco entre la gráfica, «Más
+tráfico» y los eventos. La gráfica dibuja bajada + subida por punto y los huecos con `░` (nunca
+interpolados); con el foco en la gráfica, `<` y `>` mueven un cursor que muestra en texto la
+fecha, la bajada y la subida del punto. «Más tráfico» muestra equipos y apps en toda la red, y
+apps, destinos, organizaciones y países en un equipo (los destinos solo hasta 30 días). En Eventos,
+`f` cicla el filtro (todos, altas y presencia, identidad, servicios, Almenara) y `/` busca por
+equipo; `Enter` sobre un equipo o un evento abre su detalle.
+
+En el detalle de equipo, `w` alterna el histórico entre 24 h y 7 días: una fila de tráfico y otra de
+presencia sobre el mismo eje, la rejilla de presencia de 7 días × 24 horas y el bloque «Visto en
+este equipo» con recuentos, lo nuevo de los últimos 7 días y los puertos abiertos.
+
 | Tecla | Acción |
 |-------|--------|
 | `h` `j` `k` `l` / flechas | mover la selección (j/k) o cambiar de pestaña (h/l) |
 | `Tab` / `Shift-Tab` | cambiar de pestaña; en el detalle, alternar el foco lista/detalle |
 | `1`-`7` | ir directamente a una pestaña |
 | `g` | Equipos: lista plana / agrupada. Tráfico: agrupar por equipo/destino/app/categoría/protocolo/proceso (se persiste) |
-| `w` | Tráfico: ventana 60 s → 5 min → sesión |
+| `w` | Tráfico: ventana 60 s → 5 min → 1 h → 24 h → sesión. Histórico: 24 h → 7 días → 30 días → 1 año. Detalle: histórico 24 h ⇄ 7 días |
+| `e` | Histórico: selector de sujeto (toda la red, este equipo o un equipo con `/`) |
+| `<` `>` | Histórico: cursor de la gráfica (fecha, bajada y subida del punto) |
+| `f` `Tab` | Histórico: filtro de eventos / foco entre gráfica, «Más tráfico» y Eventos |
 | `Enter` | Equipos/Tráfico: detalle del equipo. Tráfico: «¿Quién lo usa?» en destino/app/categoría/protocolo; Conexiones filtradas en proceso |
 | `i` | Conexiones: alternar nombres ⇄ IPs |
 | `v` | Conexiones: panel con cabeceras, rol, fuentes, JA4 y proceso |
@@ -254,11 +345,23 @@ Ejecuta `cargo test`, `cargo fmt --check` y `cargo clippy --all-targets -- -D wa
 suite incluye tests unitarios de firmas, TLS, HTTP, DNS, JA4 (vectores oficiales de FoxIO), QUIC
 (apéndice A de RFC 9001 y RFC 9369), catálogo, dominio registrable, bases IP, caché de nombres,
 rankings, identificación de equipos y migración v3 → v4, además de replays de tráfico mixto con
-etiquetas esperadas (TLS partido, QUIC, DNS, DHCP y ARP). El replay condicional de la feature no
-default `pcap` se mantiene para la fase 7:
+etiquetas esperadas (TLS partido, QUIC, DNS, DHCP y ARP). La Fase 5 añade tests de la migración
+v4 → v5 sin pérdida de datos, acumuladores y topes de los rollups (con los totales cuadrando),
+consolidación de horas y días (incluidos los días de 23 y 25 horas de los cambios de hora), purga
+por resolución, sesiones y huecos, instancia única, eventos nuevos y presencia, inventario y
+consultas del lector con datos sintéticos. El replay condicional de la feature no default `pcap` se
+mantiene para la fase 7:
 
 ```bash
 cargo test --features pcap
+```
+
+Las mediciones de la Fase 5 usan un histórico sintético determinista (30 equipos, 2 años de días,
+90 días de horas y 48 h de minutos) y no dependen de `CAP_NET_RAW`:
+
+```bash
+cargo test --release -- --ignored medir_historial
+cargo test --release -- --ignored medir_minute_rollup
 ```
 
 ## Datos y privacidad
@@ -281,19 +384,32 @@ solo aparecen en logs de nivel `debug` (no con `-v`). Los eventos y servicios qu
 se purgan según `events_retention_days`; las conexiones se purgan por timeout (TCP 300 s,
 TIME_WAIT/CLOSE_WAIT 60 s, UDP 60 s, ICMP 30 s).
 
-## Limitaciones (fases 3 y 4)
+**Histórico (Fase 5).** Se guardan solo agregados: bytes y conexiones por equipo y dimensión, sin
+contenido ni nombres completos y **sin registro de conexiones**. El destino es el dominio
+registrable, la IP o el equipo de la LAN; los destinos por equipo son el dato más sensible y por eso
+solo viven 2 h por minuto y 30 días por hora, nunca en los días ni en el inventario. La presencia de
+un móvil es la de su dueño y dura lo que los eventos (90 días). Todo es local: nada sale del equipo;
+para borrar el histórico basta con cerrar Almenara y borrar la BD o bajar las retenciones, y se
+desactiva entero con `[history].enabled = false`. La Ayuda de la TUI recuerda qué se guarda y
+cuánto tiempo.
+
+## Limitaciones (fases 3, 4 y 5)
 
 - **Visibilidad parcial en red conmutada**: se ve el 100 % del tráfico propio y de
   broadcast/multicast, pero del unicast entre terceros solo lo que llegue a la interfaz (sin
   port mirror ni modo promiscuo forzado). La barra lo declara como `propia + broadcast`.
-- Las ventanas son solo de 60 s y 5 min en memoria; 1 h y 24 h llegarán en la fase 5 con
-  persistencia real (rollups).
+- Solo hay histórico mientras Almenara está abierta: la TUI es la única que escribe (el modo
+  servicio queda para el roadmap). Los huecos se marcan y nunca se interpolan.
+- El histórico guarda agregados, no conexiones: responde a «quién consume» y «con quién habla este
+  equipo», no a un registro forense conexión a conexión. Los destinos solo viven 2 h por minuto y
+  30 días por hora.
+- Las ventanas de 1 h y 24 h llegan hasta el último minuto cerrado, no hasta el instante actual.
 - La atribución de proceso local a conexión depende de los permisos de `/proc/[pid]/fd`; para
   procesos de otros usuarios se degrada a NULL.
 - `/proc/net/nf_conntrack` puede requerir root; su lectura es best-effort.
 - Los sparklines arrancan a cero y el último snapshot se usa como semilla; los números de la
   semilla no se mezclan con las series nuevas.
-- Histórico y Alertas siguen siendo placeholders (fases 5 y 6).
+- Alertas sigue siendo un placeholder (fase 6).
 - **Visibilidad del nombre en Fase 4**: DoH/DoT y ECH ocultan una parte del tráfico; sin SNI/Host
   se etiqueta por caché DNS, ASN y puerto. En red conmutada el tráfico de terceros que no llega a
   la interfaz no se etiqueta; el porcentaje de tráfico sin identificar se muestra siempre en el pie
