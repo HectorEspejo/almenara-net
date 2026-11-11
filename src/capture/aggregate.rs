@@ -372,8 +372,6 @@ mod tests {
             len,
             tcp_flags: None,
             headers: None,
-            dns_qname: None,
-            sni: None,
         }
     }
 

@@ -13,15 +13,18 @@ use tokio::sync::mpsc;
 
 use crate::capabilities::Capabilities;
 use crate::classify::{group_for, DeviceGroup, DeviceType};
-use crate::config::{Config, ListView};
+use crate::config::{Config, ListView, TrafficGroup};
 use crate::events::{ScanCommand, TrafficCommand};
+use crate::inference::catalog::CatalogCounts;
 use crate::notifier::{Level, Notification, Notifier};
+use crate::rankings::{Dimension, SortKey as RankingSortKey, Window};
 use crate::repo::devices::Device;
 use crate::repo::interfaces::Interface;
 use crate::scanner::Reconciliation;
 use crate::tui::theme::Theme;
 use crate::tui::traffic_state::{
-    ConnectionFilter, ConnectionSort, DetailState, FocusPanel, HeadersView, TrafficState,
+    dimension_de_grupo, ConnectionFilter, ConnectionSort, DetailState, FocusPanel, HeadersView,
+    TrafficState,
 };
 
 /// Ancho mínimo de terminal soportado.
@@ -236,8 +239,10 @@ impl Filter {
 /// Modo del campo de entrada activo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// Búsqueda incremental.
+    /// Búsqueda incremental de equipos.
     Search,
+    /// Búsqueda incremental de conexiones (servidor, app o proceso).
+    ConnectionSearch,
     /// Edición del alias.
     Alias,
     /// Edición de las notas.
@@ -291,6 +296,19 @@ pub enum Action {
     OpenDetail {
         /// Id del dispositivo.
         device_id: i64,
+    },
+    /// Cambiar la agrupación del ranking de Tráfico (se persiste en [ui].traffic_group).
+    SetTrafficGroup(TrafficGroup),
+    /// Petición «¿Quién lo usa?» que el bucle resuelve con oneshot y timeout.
+    WhoUses {
+        /// Dimensión del ranking.
+        dimension: Dimension,
+        /// Clave de la fila.
+        key: String,
+        /// Texto visible de la fila.
+        label: String,
+        /// Ventana consultada.
+        window: Window,
     },
 }
 
@@ -367,6 +385,26 @@ pub struct App {
     pub traffic_command_tx: Option<mpsc::Sender<TrafficCommand>>,
     /// Marca temporal de la última persistencia de tráfico.
     pub last_traffic_persist: Option<Instant>,
+    /// Agrupación del ranking de Tráfico (F4, persistida en [ui].traffic_group).
+    pub traffic_group: Dimension,
+    /// Ventana del ranking de Tráfico (F4, no se persiste: arranca en 60 s).
+    pub traffic_window: Window,
+    /// Criterio de orden del ranking de Tráfico (tecla s).
+    pub rank_sort: RankingSortKey,
+    /// Mostrar nombres (true) o IPs (false) en la pestaña Conexiones.
+    pub show_names: bool,
+    /// Búsqueda confirmada de la pestaña Conexiones.
+    pub conn_search: String,
+    /// Desplazamiento vertical del panel de detalle de equipo.
+    pub detail_scroll: usize,
+    /// Desplazamiento máximo del panel de detalle (lo fija la vista al dibujar).
+    pub detail_max_scroll: usize,
+    /// Cifras del catálogo de apps para la pestaña Config.
+    pub catalog_counts: CatalogCounts,
+    /// Fecha de las bases IP embebidas para la pestaña Config.
+    pub ipdb_date: Option<String>,
+    /// Inicio de la sesión, para las medias de la ventana «sesión».
+    pub session_started: Instant,
 }
 
 impl App {
@@ -380,6 +418,7 @@ impl App {
     ) -> Self {
         let theme = Theme::from_flags(config.ui.no_color, false);
         let list_view = config.ui.list_view;
+        let traffic_group = dimension_de_grupo(config.ui.traffic_group);
         Self {
             devices: Vec::new(),
             interfaces: Vec::new(),
@@ -416,6 +455,16 @@ impl App {
             headers: None,
             traffic_command_tx: None,
             last_traffic_persist: None,
+            traffic_group,
+            traffic_window: Window::Sixty,
+            rank_sort: RankingSortKey::Total,
+            show_names: true,
+            conn_search: String::new(),
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            catalog_counts: CatalogCounts::default(),
+            ipdb_date: None,
+            session_started: Instant::now(),
         }
     }
 
@@ -544,8 +593,17 @@ impl App {
         self.tab = self.tab.prev();
     }
 
-    /// Inicia una búsqueda.
+    /// Inicia una búsqueda: equipos o, en la pestaña Conexiones, conexiones.
     pub fn begin_search(&mut self) {
+        if self.tab == Tab::Conexiones {
+            self.input = Some(InputState {
+                mode: InputMode::ConnectionSearch,
+                buffer: self.conn_search.clone(),
+                device_id: None,
+            });
+            self.conn_selected = 0;
+            return;
+        }
         self.tab = Tab::Equipos;
         self.input = Some(InputState {
             mode: InputMode::Search,
@@ -567,7 +625,7 @@ impl App {
         let (buffer, device_id) = match mode {
             InputMode::Alias => (device.alias.unwrap_or_default(), device.id),
             InputMode::Notes => (device.notes.unwrap_or_default(), device.id),
-            InputMode::Search => return,
+            InputMode::Search | InputMode::ConnectionSearch => return,
         };
         self.input = Some(InputState {
             mode,
@@ -579,11 +637,14 @@ impl App {
     /// Cancela el campo de entrada activo.
     pub fn cancel_input(&mut self) {
         if let Some(input) = self.input.take() {
-            if input.mode == InputMode::Search {
-                self.search.clear();
+            match input.mode {
+                InputMode::Search => self.search.clear(),
+                InputMode::ConnectionSearch => self.conn_search.clear(),
+                InputMode::Alias | InputMode::Notes => {}
             }
         }
         self.clamp_selection();
+        self.clamp_connection_selection();
     }
 
     /// Confirma el campo de entrada y devuelve la acción a ejecutar.
@@ -597,6 +658,16 @@ impl App {
                 self.search = buffer.trim().to_string();
                 self.selected = 0;
                 self.clamp_selection();
+                Action::None
+            }
+            Some(InputState {
+                mode: InputMode::ConnectionSearch,
+                buffer,
+                ..
+            }) => {
+                self.conn_search = buffer.trim().to_string();
+                self.conn_selected = 0;
+                self.clamp_connection_selection();
                 Action::None
             }
             Some(InputState {
@@ -624,9 +695,16 @@ impl App {
         if let Some(input) = self.input.as_mut() {
             input.buffer.push(caracter);
         }
-        if self.input.as_ref().map(|i| i.mode) == Some(InputMode::Search) {
-            self.selected = 0;
-            self.clamp_selection();
+        match self.input.as_ref().map(|i| i.mode) {
+            Some(InputMode::Search) => {
+                self.selected = 0;
+                self.clamp_selection();
+            }
+            Some(InputMode::ConnectionSearch) => {
+                self.conn_selected = 0;
+                self.clamp_connection_selection();
+            }
+            _ => {}
         }
     }
 
@@ -635,9 +713,16 @@ impl App {
         if let Some(input) = self.input.as_mut() {
             input.buffer.pop();
         }
-        if self.input.as_ref().map(|i| i.mode) == Some(InputMode::Search) {
-            self.selected = 0;
-            self.clamp_selection();
+        match self.input.as_ref().map(|i| i.mode) {
+            Some(InputMode::Search) => {
+                self.selected = 0;
+                self.clamp_selection();
+            }
+            Some(InputMode::ConnectionSearch) => {
+                self.conn_selected = 0;
+                self.clamp_connection_selection();
+            }
+            _ => {}
         }
     }
 
@@ -826,10 +911,15 @@ impl App {
             return self.handle_input_key(key);
         }
 
-        // El panel de cabeceras (no modal) se cierra con Esc sin salir de la pestaña.
-        if self.headers.is_some() && key.code == KeyCode::Esc {
-            self.close_headers();
-            return Action::None;
+        // Esc cierra, en orden, los paneles no modales abiertos.
+        if key.code == KeyCode::Esc {
+            if self.close_who_uses() {
+                return Action::None;
+            }
+            if self.headers.is_some() {
+                self.close_headers();
+                return Action::None;
+            }
         }
 
         // En el detalle master-detail, Tab alterna el foco y Esc lo cierra.
@@ -848,6 +938,39 @@ impl App {
                         return self.handle_detail_panel_key(key);
                     }
                 }
+            }
+        }
+
+        // Con el panel «¿Quién lo usa?» abierto, j/k mueven su selección.
+        if self.who_uses_open() {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_who_uses_selection(1);
+                    return Action::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_who_uses_selection(-1);
+                    return Action::None;
+                }
+                KeyCode::Home => {
+                    if let Some(panel) = self.traffic.who_uses.as_mut() {
+                        panel.selected = 0;
+                    }
+                    return Action::None;
+                }
+                KeyCode::End => {
+                    let total = self
+                        .traffic
+                        .who_uses
+                        .as_ref()
+                        .map(|panel| panel.rows.len())
+                        .unwrap_or(0);
+                    if let Some(panel) = self.traffic.who_uses.as_mut() {
+                        panel.selected = total.saturating_sub(1);
+                    }
+                    return Action::None;
+                }
+                _ => {}
             }
         }
 
@@ -895,7 +1018,11 @@ impl App {
                 self.select_last_in_tab();
                 Action::None
             }
-            KeyCode::Enter => self.open_selected_detail(),
+            KeyCode::Enter => match self.tab {
+                Tab::Equipos => self.open_selected_detail(),
+                Tab::Trafico => self.enter_ranking(),
+                _ => Action::None,
+            },
             KeyCode::Char('/') => {
                 self.begin_search();
                 Action::None
@@ -903,6 +1030,7 @@ impl App {
             KeyCode::Char('s') => {
                 match self.tab {
                     Tab::Conexiones => self.cycle_connection_sort(),
+                    Tab::Trafico => self.cycle_ranking_sort(),
                     _ => self.cycle_sort(),
                 }
                 Action::None
@@ -920,10 +1048,29 @@ impl App {
                 }
                 Action::None
             }
-            KeyCode::Char('g') => match self.toggle_list_view() {
-                Some(vista) => Action::SetListView(vista),
-                None => Action::None,
+            KeyCode::Char('i') => {
+                if self.tab == Tab::Conexiones {
+                    self.toggle_connection_names();
+                }
+                Action::None
+            }
+            KeyCode::Char('g') => match self.tab {
+                Tab::Equipos => match self.toggle_list_view() {
+                    Some(vista) => Action::SetListView(vista),
+                    None => Action::None,
+                },
+                Tab::Trafico => match self.cycle_traffic_group() {
+                    Some(grupo) => Action::SetTrafficGroup(grupo),
+                    None => Action::None,
+                },
+                _ => Action::None,
             },
+            KeyCode::Char('w') => {
+                if self.tab == Tab::Trafico {
+                    self.cycle_traffic_window();
+                }
+                Action::None
+            }
             KeyCode::Char('t') => self.cycle_device_type_manual(),
             KeyCode::Char('r') => Action::Rescan,
             KeyCode::Char('a') => {
@@ -936,12 +1083,66 @@ impl App {
             }
             KeyCode::Esc => {
                 self.clear_search();
+                self.clear_connection_search();
                 if self.tab != Tab::Equipos {
                     self.tab = Tab::Equipos;
                 }
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// Enter en la pestaña Tráfico: detalle, «¿quién lo usa?» o proceso.
+    ///
+    /// En equipo abre el detalle (drill-down de F3); en proceso abre Conexiones
+    /// filtrada; en destino, app, categoría o protocolo abre el panel.
+    fn enter_ranking(&mut self) -> Action {
+        if self.who_uses_open() {
+            return match self.selected_who_uses() {
+                Some(cuota) if cuota.device_id == crate::traffic::DEVICE_ID_HOST => {
+                    self.push_notification(
+                        Level::Info,
+                        "El tráfico del host no tiene detalle de equipo; consulta la pestaña Conexiones",
+                    );
+                    Action::None
+                }
+                Some(cuota) => Action::OpenDetail {
+                    device_id: cuota.device_id,
+                },
+                None => Action::None,
+            };
+        }
+        match self.traffic_group {
+            Dimension::Device => {
+                let Some(fila) = self.selected_ranking_row() else {
+                    return Action::None;
+                };
+                match fila.device_id {
+                    Some(device_id) if device_id == crate::traffic::DEVICE_ID_HOST => {
+                        self.push_notification(
+                            Level::Info,
+                            "El tráfico del host no tiene detalle de equipo; consulta la pestaña Conexiones",
+                        );
+                        Action::None
+                    }
+                    Some(device_id) => Action::OpenDetail { device_id },
+                    None => Action::None,
+                }
+            }
+            Dimension::Process => {
+                self.filtrar_conexiones_por_proceso();
+                Action::None
+            }
+            _ => match self.open_who_uses() {
+                Some((dimension, key, label, window)) => Action::WhoUses {
+                    dimension,
+                    key,
+                    label,
+                    window,
+                },
+                None => Action::None,
+            },
         }
     }
 
@@ -967,8 +1168,40 @@ impl App {
                 self.close_detail();
                 Action::None
             }
+            // Desplazamiento del panel derecho cuando no cabe (F4).
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll_detail(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll_detail(-1);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.scroll_detail(10);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                self.scroll_detail(-10);
+                Action::None
+            }
+            KeyCode::Home => {
+                self.detail_scroll = 0;
+                Action::None
+            }
+            KeyCode::End => {
+                self.detail_scroll = self.detail_max_scroll;
+                Action::None
+            }
             _ => Action::None,
         }
+    }
+
+    /// Desplaza el panel de detalle de equipo (j/k cuando tiene el foco).
+    pub fn scroll_detail(&mut self, delta: isize) {
+        let maximo = self.detail_max_scroll;
+        let actual = self.detail_scroll.min(maximo) as isize;
+        self.detail_scroll = (actual + delta).clamp(0, maximo as isize) as usize;
     }
 
     /// Mueve la selección de la pestaña activa.
@@ -1000,7 +1233,7 @@ impl App {
         match self.tab {
             Tab::Equipos => self.select_last(),
             Tab::Trafico => {
-                let total = self.traffic_rows().len();
+                let total = self.ranking_rows().len();
                 self.traffic_selected = total.saturating_sub(1);
                 *self.traffic_table_state.selected_mut() = Some(self.traffic_selected);
             }
@@ -1013,23 +1246,9 @@ impl App {
         }
     }
 
-    /// Abre el detalle del equipo seleccionado (Equipos o drill-down de Tráfico).
+    /// Abre el detalle del equipo seleccionado en la pestaña Equipos.
     fn open_selected_detail(&mut self) -> Action {
-        let device_id = match self.tab {
-            Tab::Equipos => self.selected_device().map(|device| device.id),
-            Tab::Trafico => self
-                .selected_traffic_device()
-                .map(|estadisticas| estadisticas.device_id),
-            _ => None,
-        };
-        match device_id {
-            Some(id) if id == crate::traffic::DEVICE_ID_HOST => {
-                self.push_notification(
-                    Level::Info,
-                    "El tráfico del host no tiene detalle de equipo; consulta la pestaña Conexiones",
-                );
-                Action::None
-            }
+        match self.selected_device().map(|device| device.id) {
             Some(device_id) => Action::OpenDetail { device_id },
             None => Action::None,
         }
@@ -1181,6 +1400,12 @@ mod tests {
             os_family: None,
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 

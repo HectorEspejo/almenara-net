@@ -187,6 +187,12 @@ mod tests {
             os_family: None,
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 

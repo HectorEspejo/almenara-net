@@ -1,11 +1,15 @@
 //! Orquestación del descubrimiento de equipos.
 //!
 //! Flujo de un ciclo de escaneo:
-//! 1. Lectura pasiva de /proc/net/arp.
-//! 2. Escaneo ARP activo e ICMP sweep si hay CAP_NET_RAW (si no, modo degradado).
-//! 3. Merge determinista por MAC y lookup de fabricante (OUI).
-//! 4. Reverse DNS con timeout y concurrencia limitada.
-//! 5. Reconciliación con la base de datos: altas, cambios y marcado offline.
+//! 1. Drenaje de los equipos observados y de la identidad de la captura (F4).
+//! 2. Lectura pasiva de /proc/net/arp.
+//! 3. Escaneo ARP activo e ICMP sweep si hay CAP_NET_RAW (si no, modo degradado).
+//! 4. Merge determinista por MAC y lookup de fabricante (OUI), con los equipos
+//!    observados en la captura como una fuente L2 más.
+//! 5. Reverse DNS con timeout y concurrencia limitada (solo IPs de la LAN y
+//!    nunca en modo pasivo).
+//! 6. Reconciliación con la base de datos: altas, cambios, identidad y marcado
+//!    offline.
 
 pub mod arp;
 pub mod dns;
@@ -14,8 +18,10 @@ pub mod interfaces;
 pub mod proc_arp;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
@@ -27,9 +33,16 @@ use crate::discovery::{
     self, DetectedService, DiscoveryState, HostActiveScan, PassiveData, UpnpDevice,
 };
 use crate::error::Result;
+use crate::identify::dhcp as dhcp_ident;
+use crate::identify::mac as mac_ident;
+use crate::identify::models as models_ident;
+use crate::identify::observed::ObservedHosts;
+use crate::identify::useragent;
+use crate::identify::{self, CaptureIdentityStore, DeviceIdentitySignals, OsSignals, OsSource};
+use crate::inference::{DhcpObservation, ObservedHost};
 use crate::notifier::{Level, Notification};
 use crate::oui;
-use crate::repo::devices::DeviceUpsert;
+use crate::repo::devices::{DeviceUpsert, IdentityUpdate};
 use crate::repo::events::EventType;
 use crate::repo::{Device, DiscoverySource, Interface, Protocol, Repo, ServiceUpsert};
 
@@ -83,6 +96,26 @@ pub struct Host {
     pub mdns_services: Vec<String>,
     /// Tipos de dispositivo UPnP anunciados.
     pub upnp_types: Vec<String>,
+    /// Modelo anunciado por mDNS (TXT) o UPnP, si se conoce.
+    pub model: Option<String>,
+    /// Huella DHCP capturada: opción 55 en decimal separada por comas.
+    pub dhcp_fingerprint: Option<String>,
+    /// Vendor class DHCP capturado: opción 60 saneada.
+    pub dhcp_vendor: Option<String>,
+    /// Hostname DHCP capturado: opción 12 saneada.
+    pub dhcp_hostname: Option<String>,
+    /// Último User-Agent HTTP en claro observado en la captura.
+    pub user_agent: Option<String>,
+    /// Señal que fijó `os_family` al combinar las señales de F2 y F4 (§7.12).
+    pub os_source: Option<OsSource>,
+    /// MAC administrada localmente (bit U/L): puede ser aleatoria por privacidad.
+    pub mac_random: bool,
+    /// Puntuación de la huella TCP de F2 (0 si no se intentó el fingerprint).
+    pub fingerprint_score: u8,
+    /// Pistas de SO del modelo anunciado (se combinan al final del ciclo).
+    model_os: Vec<(OsFamily, u8)>,
+    /// Tipo de equipo sugerido por el modelo anunciado.
+    model_device_type: Option<DeviceType>,
 }
 
 impl Host {
@@ -106,7 +139,28 @@ impl Host {
             discovery_sources: Vec::new(),
             mdns_services: Vec::new(),
             upnp_types: Vec::new(),
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
+            mac_random: false,
+            fingerprint_score: 0,
+            model_os: Vec::new(),
+            model_device_type: None,
         }
+    }
+
+    /// Aplica las señales de identidad de F4 a la clasificación de SO.
+    ///
+    /// Se ejecuta al cerrar el ciclo, cuando ya han llegado la huella DHCP, el
+    /// modelo y el User-Agent: suma sus puntos a los de la huella TCP de F2 y
+    /// guarda el SO ganador y la señal que más aportó (§7.12).
+    fn combinar_os(&mut self) {
+        let (familia, fuente) = identify::os_family(&senales_os(self));
+        self.os_family = familia;
+        self.os_source = fuente;
     }
 }
 
@@ -185,7 +239,8 @@ impl ScanOptions {
             concurrency: DEFAULT_SWEEP_CONCURRENCY,
             top_ports: scan.top_ports.clone(),
             dhcp_lease_paths,
-            netbios_enabled: true,
+            // En modo pasivo no se consulta a nadie (§7.15): NetBIOS desactivado.
+            netbios_enabled: !scan.passive_only,
         })
     }
 
@@ -193,6 +248,37 @@ impl ScanOptions {
     pub fn active_allowed(&self) -> bool {
         !self.passive_only && self.privileged
     }
+}
+
+/// Indica si el ciclo consulta NetBIOS (§7.15: nunca en modo pasivo).
+fn netbios_habilitado(options: &ScanOptions) -> bool {
+    options.netbios_enabled && !options.passive_only
+}
+
+/// Indica si el ciclo hace reverse DNS (§7.15: nunca en modo pasivo).
+fn dns_inverso_habilitado(options: &ScanOptions) -> bool {
+    !options.passive_only
+}
+
+/// Indica si una IPv4 pertenece a alguna de las subredes locales indicadas.
+///
+/// Es el guard explícito de §7.15: nunca se hace DNS inverso de IPs de Internet.
+fn es_ip_de_subred_local(ip: Ipv4Addr, redes: &[Ipv4Network]) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && redes.iter().any(|red| red.contains(ip))
+}
+
+/// Subredes locales del ciclo: las de las interfaces y los rangos configurados.
+fn redes_locales(interfaces: &[DetectedInterface], rangos: &[Ipv4Network]) -> Vec<Ipv4Network> {
+    let mut redes: Vec<Ipv4Network> = interfaces
+        .iter()
+        .filter_map(|iface| iface.network())
+        .collect();
+    redes.extend(rangos.iter().copied());
+    redes
 }
 
 /// Estado en memoria del escaneo activo entre ciclos.
@@ -253,7 +339,12 @@ impl ScanState {
 }
 
 /// Aplica la precedencia de hostname de la especificación:
-/// mDNS > NetBIOS > DHCP > reverse DNS (el alias manual se aplica en la TUI).
+/// alias > mDNS/fn > NetBIOS > DHCP (lease o capturado) > reverse DNS.
+///
+/// El alias manual se aplica en la TUI (manda sobre el hostname persistido). El
+/// nombre amigable de Google Cast (TXT `fn`, nivel mDNS) y el hostname DHCP
+/// capturado (opción 12, nivel de lease) llegan ya fundidos en `mdns` y `dhcp`
+/// respectivamente (§7.12).
 pub fn hostname_precedence(
     mdns: Option<&str>,
     netbios: Option<&str>,
@@ -264,6 +355,15 @@ pub fn hostname_precedence(
         .into_iter()
         .filter_map(nombre_valido)
         .next()
+}
+
+/// Precedencia de hostname en modo pasivo (§7.15):
+/// alias > mDNS/fn > DHCP (lease o capturado) > último conocido.
+///
+/// En pasivo no hay consultas NetBIOS ni DNS inverso; el «último conocido» lo
+/// conserva la persistencia, porque el upsert no pisa un hostname con NULL.
+pub fn hostname_precedence_pasivo(mdns: Option<&str>, dhcp: Option<&str>) -> Option<String> {
+    hostname_precedence(mdns, None, dhcp, None)
 }
 
 /// Valida y normaliza un hostname candidato.
@@ -303,15 +403,25 @@ pub fn persistir_interfaces_iniciales(repo: &mut Repo) -> Result<usize> {
     Ok(guardadas)
 }
 
-/// Ejecuta un ciclo de descubrimiento completo (F1 + F2).
+/// Ejecuta un ciclo de descubrimiento completo (F1 + F2 + F4).
+///
+/// `observado` e `identidad` son los almacenes compartidos con el hilo de
+/// captura de F4: al inicio del ciclo se vacían y sus observaciones se fusionan
+/// como una fuente L2 más (§7.14).
 pub async fn run_scan(
     options: &ScanOptions,
     state: &mut ScanState,
     discovery_state: &mut DiscoveryState,
     manual: bool,
+    observado: &Arc<Mutex<ObservedHosts>>,
+    identidad: &Arc<Mutex<CaptureIdentityStore>>,
 ) -> ScanReport {
     let started = Instant::now();
     let mut errors = Vec::new();
+
+    // Al inicio del ciclo se drenan los almacenes de la captura para no
+    // retener los locks durante el escaneo.
+    let (observados_captura, identidades_captura) = drenar_captura(observado, identidad);
 
     let detectados = match tokio::task::spawn_blocking(interfaces::detect).await {
         Ok(interfaces) => interfaces,
@@ -462,15 +572,37 @@ pub async fn run_scan(
         .filter_map(|iface| iface.mac.clone())
         .collect();
     hosts.retain(|host| !macs_locales.contains(&host.mac));
+    let macs_locales_normalizadas: HashSet<String> = macs_locales
+        .iter()
+        .filter_map(|mac| oui::normalize_mac(mac))
+        .collect();
 
-    // Reverse DNS con timeout corto y concurrencia limitada (pasivo permitido).
-    let ips: Vec<Ipv4Addr> = hosts.iter().map(|host| host.ip).collect();
-    let resueltos = dns::resolve_many(&ips, options.timeout, options.concurrency.max(1)).await;
-    let por_ip: HashMap<Ipv4Addr, String> = resueltos.into_iter().collect();
-    for host in &mut hosts {
-        if let Some(nombre) = por_ip.get(&host.ip) {
-            host.hostname = Some(nombre.clone());
-            host.reverse_dns_name = Some(nombre.clone());
+    // --- F4: equipos observados en la captura como fuente L2 (§7.14) ---
+    //
+    // Un equipo ya visto por ARP/ICMP no se duplica ni cambia de IP: solo gana
+    // la fuente `capture` y la identidad DHCP capturada. Los equipos que solo
+    // ha visto la captura se incorporan al ciclo y pueden provocar `new`.
+    fusionar_observados(&mut hosts, observados_captura, &macs_locales_normalizadas);
+    fusionar_identidad(&mut hosts, &identidades_captura);
+    hosts.retain(|host| !macs_locales_normalizadas.contains(&host.mac));
+
+    // Reverse DNS con timeout corto y concurrencia limitada. En modo pasivo no
+    // se hace (§7.15) y en ningún modo se resuelve una IP de Internet: solo las
+    // de las subredes locales del equipo.
+    if dns_inverso_habilitado(options) {
+        let redes = redes_locales(&selected, &options.ranges);
+        let ips: Vec<Ipv4Addr> = hosts
+            .iter()
+            .map(|host| host.ip)
+            .filter(|ip| es_ip_de_subred_local(*ip, &redes))
+            .collect();
+        let resueltos = dns::resolve_many(&ips, options.timeout, options.concurrency.max(1)).await;
+        let por_ip: HashMap<Ipv4Addr, String> = resueltos.into_iter().collect();
+        for host in &mut hosts {
+            if let Some(nombre) = por_ip.get(&host.ip) {
+                host.hostname = Some(nombre.clone());
+                host.reverse_dns_name = Some(nombre.clone());
+            }
         }
     }
 
@@ -502,7 +634,7 @@ pub async fn run_scan(
         .iter()
         .map(|host| (host.mac.clone(), host.ip))
         .collect();
-    let netbios = if options.netbios_enabled {
+    let netbios = if netbios_habilitado(options) {
         discovery::query_netbios(
             &pares,
             discovery::NETBIOS_TIMEOUT,
@@ -512,7 +644,7 @@ pub async fn run_scan(
     } else {
         HashMap::new()
     };
-    aplicar_fuentes_pasivas(&mut hosts, &pasivo, &[], &netbios);
+    aplicar_fuentes_pasivas(&mut hosts, &pasivo, &[], &netbios, options.passive_only);
 
     let mut mdns_records = pasivo.mdns.clone();
     let mut ssdp_records = pasivo.ssdp.clone();
@@ -533,7 +665,13 @@ pub async fn run_scan(
             leases: Vec::new(),
             errors: Vec::new(),
         };
-        aplicar_fuentes_pasivas(&mut hosts, &fuentes_activas, &upnp_devices, &HashMap::new());
+        aplicar_fuentes_pasivas(
+            &mut hosts,
+            &fuentes_activas,
+            &upnp_devices,
+            &HashMap::new(),
+            options.passive_only,
+        );
 
         let objetivos = state.select_for_active_scan(&hosts, manual);
         let escaneos = discovery::scan_hosts_active(&objetivos, &options.top_ports).await;
@@ -541,6 +679,12 @@ pub async fn run_scan(
             errors.extend(escaneo.errors.clone());
             aplicar_escaneo_activo(&mut hosts, &escaneo);
         }
+    }
+
+    // Cierre de identidad: MAC privada y SO combinado (F2 + DHCP + modelo + UA).
+    for host in &mut hosts {
+        host.mac_random = mac_ident::is_private(&host.mac);
+        host.combinar_os();
     }
 
     state.update_known(&hosts);
@@ -563,10 +707,149 @@ pub async fn run_scan(
     }
 }
 
+/// Drena los equipos observados y la identidad acumulada por la captura (F4).
+///
+/// Identidad capturada de un equipo: puede venir por MAC o por IP y trae las
+/// señales DHCP y el User-Agent observados (§7.12).
+type IdentidadCapturada = (Option<String>, Option<IpAddr>, DeviceIdentitySignals);
+
+/// Se vacían al inicio del ciclo para no retener los locks mientras se hace el
+/// escaneo. Un lock envenenado por un pánico de la captura no aborta el ciclo:
+/// se continúa sin las observaciones de ese almacén.
+fn drenar_captura(
+    observado: &Arc<Mutex<ObservedHosts>>,
+    identidad: &Arc<Mutex<CaptureIdentityStore>>,
+) -> (Vec<ObservedHost>, Vec<IdentidadCapturada>) {
+    let equipos = match observado.lock() {
+        Ok(mut buffer) => buffer.drain(),
+        Err(_) => Vec::new(),
+    };
+    let identidades = match identidad.lock() {
+        Ok(mut almacen) => almacen.drain(),
+        Err(_) => Vec::new(),
+    };
+    (equipos, identidades)
+}
+
+/// Fusiona los equipos observados por la captura como una fuente L2 más.
+///
+/// Un equipo ya conocido por su MAC no se duplica ni se le cambia la IP que
+/// confirmó el ARP: solo se le añade la fuente [`DiscoverySource::Capture`] y la
+/// identidad DHCP que traiga la observación. Los equipos nuevos se incorporan al
+/// ciclo (podrán provocar el evento `new`).
+fn fusionar_observados(
+    hosts: &mut Vec<Host>,
+    observados: Vec<ObservedHost>,
+    macs_locales: &HashSet<String>,
+) {
+    for observado in observados {
+        let Some(mac) = oui::normalize_mac(&observado.mac) else {
+            continue;
+        };
+        if !es_mac_utilizable(&mac) || macs_locales.contains(&mac) {
+            continue;
+        }
+        if let Some(host) = hosts.iter_mut().find(|host| host.mac == mac) {
+            anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Capture);
+            aplicar_dhcp_observado(host, observado.dhcp.as_ref());
+            continue;
+        }
+        let mut host = Host::new(mac, observado.ip);
+        host.discovery_sources.push(DiscoverySource::Capture);
+        aplicar_dhcp_observado(&mut host, observado.dhcp.as_ref());
+        hosts.push(host);
+    }
+}
+
+/// Aplica la identidad capturada (DHCP y User-Agent) a los equipos ya conocidos.
+///
+/// Las entradas llegan por MAC (identidad DHCP) y por IP (User-Agent y DHCP con
+/// IP): se busca primero la MAC y, si no hay, la IP. La identidad DHCP solo se
+/// atribuye cuando la MAC coincide, para no pasarle la huella de un equipo a
+/// otro en un cambio de IP.
+fn fusionar_identidad(hosts: &mut [Host], identidades: &[IdentidadCapturada]) {
+    for (mac, ip, senales) in identidades {
+        let por_mac = mac
+            .as_deref()
+            .and_then(oui::normalize_mac)
+            .and_then(|mac| hosts.iter().position(|host| host.mac == mac));
+        let indice = match por_mac {
+            Some(indice) => Some(indice),
+            None => match ip {
+                Some(ip) => hosts.iter().position(|host| IpAddr::V4(host.ip) == *ip),
+                None => None,
+            },
+        };
+        let Some(indice) = indice else {
+            continue;
+        };
+        let host = &mut hosts[indice];
+        if let Some(dhcp) = &senales.dhcp {
+            let mac_coincide = dhcp
+                .mac
+                .as_deref()
+                .and_then(oui::normalize_mac)
+                .map(|mac| mac == host.mac)
+                .unwrap_or(true);
+            if mac_coincide {
+                aplicar_dhcp_observado(host, Some(dhcp));
+            }
+        }
+        if let Some(user_agent) = &senales.user_agent {
+            host.user_agent = Some(user_agent.clone());
+        }
+    }
+}
+
+/// Vuelca la identidad DHCP de una observación capturada en el equipo.
+fn aplicar_dhcp_observado(host: &mut Host, dhcp: Option<&DhcpObservation>) {
+    let Some(dhcp) = dhcp else {
+        return;
+    };
+    if let Some(fingerprint) = dhcp.fingerprint.as_deref() {
+        host.dhcp_fingerprint = Some(fingerprint.to_string());
+    }
+    if let Some(vendor) = dhcp.vendor.as_deref() {
+        host.dhcp_vendor = Some(vendor.to_string());
+    }
+    if let Some(hostname) = dhcp.hostname.as_deref() {
+        host.dhcp_hostname = Some(hostname.to_string());
+        // El nombre DHCP capturado entra en la precedencia al nivel de lease.
+        host.dhcp_name = Some(hostname.to_string());
+    }
+}
+
+/// Señales de identidad de un equipo para la puntuación combinada de SO.
+fn senales_os(host: &Host) -> OsSignals {
+    let mut senales = OsSignals::default();
+    // La familia de F2 solo existe si superó el umbral; sus puntos son la
+    // puntuación obtenida (mínimo el umbral, 4).
+    if let Some(familia) = host.os_family {
+        senales.push(OsSource::Tcp, familia, host.fingerprint_score.max(4));
+    }
+    for (familia, puntos) in dhcp_ident::os_hints(
+        host.dhcp_vendor.as_deref(),
+        host.dhcp_fingerprint.as_deref(),
+    ) {
+        senales.push(OsSource::Dhcp, familia, puntos);
+    }
+    for (familia, puntos) in &host.model_os {
+        senales.push(OsSource::Model, *familia, *puntos);
+    }
+    if let Some(ua) = host.user_agent.as_deref() {
+        for (familia, puntos) in useragent::hints(ua).os {
+            senales.push(OsSource::UserAgent, familia, puntos);
+        }
+    }
+    senales
+}
+
 /// Acumulado de registros mDNS para una IP.
 #[derive(Debug, Default)]
 struct MdnsAgg {
     hostname: Option<String>,
+    cast_name: Option<String>,
+    model: Option<models_ident::ModelHint>,
     services: Vec<DetectedService>,
     mdns_services: Vec<String>,
 }
@@ -601,6 +884,18 @@ fn agregar_mdns(registros: &[crate::discovery::mdns::MdnsRecord]) -> HashMap<Ipv
             if !acumulado.mdns_services.contains(&servicio.service_type) {
                 acumulado.mdns_services.push(servicio.service_type.clone());
             }
+            // Los TXT del servicio pueden anunciar el modelo (§7.12) y el
+            // nombre amigable de Google Cast (`fn`, nivel mDNS de la
+            // precedencia de hostname).
+            if !servicio.txt.is_empty() {
+                if acumulado.model.is_none() {
+                    acumulado.model =
+                        models_ident::from_mdns_txt(&servicio.service_type, &servicio.txt);
+                }
+                if acumulado.cast_name.is_none() {
+                    acumulado.cast_name = models_ident::cast_friendly_name(&servicio.txt);
+                }
+            }
             let Some(puerto) = servicio.port else {
                 continue;
             };
@@ -628,11 +923,14 @@ fn agregar_mdns(registros: &[crate::discovery::mdns::MdnsRecord]) -> HashMap<Ipv
 }
 
 /// Aplica a los hosts las fuentes pasivas de F2 (mDNS, SSDP, DHCP, NetBIOS y UPnP).
+///
+/// `passive_only` selecciona la precedencia de hostname del modo pasivo (§7.15).
 fn aplicar_fuentes_pasivas(
     hosts: &mut [Host],
     pasivo: &PassiveData,
     upnp: &[UpnpDevice],
     netbios: &HashMap<String, crate::discovery::netbios::NetbiosInfo>,
+    passive_only: bool,
 ) {
     let mdns = agregar_mdns(&pasivo.mdns);
     let upnp_por_ip: HashMap<Ipv4Addr, &crate::discovery::ssdp::UpnpDescription> = upnp
@@ -647,8 +945,13 @@ fn aplicar_fuentes_pasivas(
 
     for host in hosts.iter_mut() {
         if let Some(acumulado) = mdns.get(&host.ip) {
+            // El nombre amigable de Cast (`fn`) vive al nivel de mDNS: manda
+            // sobre el hostname .local si ambos están anunciados.
             if host.mdns_name.is_none() {
-                host.mdns_name = acumulado.hostname.clone();
+                host.mdns_name = acumulado
+                    .cast_name
+                    .clone()
+                    .or_else(|| acumulado.hostname.clone());
             }
             for servicio in &acumulado.mdns_services {
                 if !host.mdns_services.contains(servicio) {
@@ -657,6 +960,9 @@ fn aplicar_fuentes_pasivas(
             }
             for servicio in &acumulado.services {
                 fusionar_servicio(&mut host.services, servicio.clone());
+            }
+            if let Some(pista) = &acumulado.model {
+                fusionar_modelo(host, pista);
             }
             anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Mdns);
         }
@@ -685,17 +991,40 @@ fn aplicar_fuentes_pasivas(
                     host.upnp_types.push(tipo.clone());
                 }
             }
+            if let Some(pista) = models_ident::from_upnp(descripcion) {
+                fusionar_modelo(host, &pista);
+            }
             anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Ssdp);
         } else if ssdp_ips.contains(&host.ip) {
             anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Ssdp);
         }
 
-        host.hostname = hostname_precedence(
-            host.mdns_name.as_deref(),
-            host.netbios_name.as_deref(),
-            host.dhcp_name.as_deref(),
-            host.reverse_dns_name.as_deref(),
-        );
+        let dhcp = host.dhcp_name.as_deref().or(host.dhcp_hostname.as_deref());
+        host.hostname = if passive_only {
+            hostname_precedence_pasivo(host.mdns_name.as_deref(), dhcp)
+        } else {
+            hostname_precedence(
+                host.mdns_name.as_deref(),
+                host.netbios_name.as_deref(),
+                dhcp,
+                host.reverse_dns_name.as_deref(),
+            )
+        };
+    }
+}
+
+/// Fusiona una pista de modelo (mDNS o UPnP) sin duplicar señales.
+fn fusionar_modelo(host: &mut Host, pista: &models_ident::ModelHint) {
+    if host.model.is_none() {
+        host.model = pista.model.clone();
+    }
+    for (familia, puntos) in &pista.os {
+        if !host.model_os.contains(&(*familia, *puntos)) {
+            host.model_os.push((*familia, *puntos));
+        }
+    }
+    if host.model_device_type.is_none() {
+        host.model_device_type = pista.device_type;
     }
 }
 
@@ -734,6 +1063,7 @@ fn aplicar_escaneo_activo(hosts: &mut [Host], escaneo: &HostActiveScan) {
     if escaneo.fingerprint_attempted {
         host.fingerprint_attempted = true;
         host.os_family = escaneo.os_family;
+        host.fingerprint_score = escaneo.os_score;
         host.last_fingerprint = escaneo.last_fingerprint.clone();
     }
     anyadir_fuente(&mut host.discovery_sources, DiscoverySource::Portscan);
@@ -741,6 +1071,16 @@ fn aplicar_escaneo_activo(hosts: &mut [Host], escaneo: &HostActiveScan) {
 
 /// Heurística para distinguir un televisor de un dispositivo de streaming.
 fn parece_televisor(host: &Host) -> bool {
+    // Un User-Agent de TV (Tizen, Web0S o SMART-TV) lo dice explícitamente y
+    // manda sobre el nombre del equipo (§7.12).
+    if host
+        .user_agent
+        .as_deref()
+        .map(|ua| useragent::hints(ua).is_tv)
+        .unwrap_or(false)
+    {
+        return true;
+    }
     let nombre = host.hostname.as_deref().unwrap_or("").to_lowercase();
     const INDICIOS_STREAMING: &[&str] = &[
         "chromecast",
@@ -790,6 +1130,36 @@ fn parece_televisor(host: &Host) -> bool {
                 .mdns_services
                 .iter()
                 .any(|servicio| servicio.contains("_airplay")))
+}
+
+/// Clasifica el tipo automático de F4: las reglas de modelo y User-Agent van
+/// antes que las de hostname de F2 (§7.12).
+///
+/// Las señales que la especificación coloca antes del nombre (gateway,
+/// impresora, cámara, TV/streaming y NAS) siguen mandando sobre la pista; si no
+/// hay ninguna, la pista de F4 sustituye a la clasificación por hostname.
+fn clasificar_tipo(host: &Host, contexto: DeviceCtx) -> DeviceType {
+    let Some(pista) = tipo_por_modelo_o_user_agent(host) else {
+        return classify::device_type(&contexto);
+    };
+    let mut sin_hostname = contexto;
+    sin_hostname.hostname = None;
+    let base = classify::device_type(&sin_hostname);
+    if base == DeviceType::Unknown {
+        pista
+    } else {
+        base
+    }
+}
+
+/// Tipo de equipo sugerido por el modelo anunciado o por el User-Agent.
+fn tipo_por_modelo_o_user_agent(host: &Host) -> Option<DeviceType> {
+    if let Some(tipo) = host.model_device_type {
+        return Some(tipo);
+    }
+    host.user_agent
+        .as_deref()
+        .and_then(|ua| useragent::hints(ua).device_type)
 }
 
 /// Merge determinista de los resultados ARP y de /proc/net/arp.
@@ -1117,6 +1487,22 @@ pub fn reconcile(
         .collect();
     let macs_actuales: HashSet<String> = report.hosts.iter().map(|host| host.mac.clone()).collect();
 
+    // Identidad persistida de los equipos conocidos, para la regla de rotación
+    // de MAC privada de mac_changed v2 (§7.13).
+    let identidades_conocidas: Vec<mac_ident::DeviceIdentity> = previos
+        .iter()
+        .map(|device| mac_ident::DeviceIdentity {
+            id: device.id,
+            mac: device.mac.clone(),
+            dhcp_fingerprint: device.dhcp_fingerprint.clone(),
+            dhcp_hostname: device.dhcp_hostname.clone(),
+            seen_this_cycle: macs_actuales.contains(&device.mac),
+        })
+        .collect();
+    // Equipos cuya MAC ya se ha fusionado en este ciclo: no pueden ser
+    // candidatos de otra fusión (nunca se fusiona dos veces el mismo equipo).
+    let mut fusionados: HashSet<i64> = HashSet::new();
+
     // 3) Altas y cambios.
     let mut vistos: HashSet<String> = HashSet::new();
     let mut nuevos = 0usize;
@@ -1139,18 +1525,19 @@ pub fn reconcile(
             }
         };
 
-        // Cambio de identidad: misma IP, MAC nueva y MAC antigua desaparecida.
+        // Cambio de identidad de mac_changed v2 (§7.13): primero la rotación
+        // de MAC privada con la misma identidad DHCP y después la toma de IP de
+        // F1, que no se aplica si las huellas DHCP se contradicen.
         if !previos_por_mac.contains_key(&host.mac) {
-            let candidato = previos
-                .iter()
-                .find(|device| {
-                    device.ip == host.ip.to_string()
-                        && device.mac != host.mac
-                        && !macs_actuales.contains(&device.mac)
-                        && device.is_online
-                })
-                .cloned();
-            if let Some(anterior) = candidato {
+            let candidato = candidato_cambio_identidad(
+                host,
+                &previos,
+                &previos_por_mac,
+                &identidades_conocidas,
+                &macs_actuales,
+                &fusionados,
+            );
+            if let Some((anterior, motivo)) = candidato {
                 if let Err(err) = repo.update_device_mac(anterior.id, &host.mac) {
                     errors.push(format!(
                         "No se pudo actualizar la MAC de {}: {err}",
@@ -1160,6 +1547,7 @@ pub fn reconcile(
                     let details = serde_json::json!({
                         "before": anterior.mac,
                         "after": host.mac,
+                        "reason": motivo,
                     })
                     .to_string();
                     if let Err(err) =
@@ -1172,6 +1560,7 @@ pub fn reconcile(
                         ip: host.ip.to_string(),
                         label: anterior.display_name().to_string(),
                     });
+                    fusionados.insert(anterior.id);
                     previos_por_mac.remove(&anterior.mac);
                     previos_por_mac.insert(
                         host.mac.clone(),
@@ -1223,7 +1612,7 @@ pub fn reconcile(
             upnp_types: host.upnp_types.clone(),
             is_tv: parece_televisor(host),
         };
-        let mut tipo = classify::device_type(&contexto);
+        let mut tipo = clasificar_tipo(host, contexto);
         // Evitar que un tipo ya conocido vuelva a "unknown" en un ciclo sin
         // evidencia nueva (p. ej. sin port scan): se conserva el anterior.
         if tipo == DeviceType::Unknown {
@@ -1260,6 +1649,9 @@ pub fn reconcile(
 
                 if cambios.is_new {
                     nuevos += 1;
+                    // `mac_random` permite a F6 bajar la severidad de un equipo
+                    // nuevo detectado en la captura detrás de una MAC privada.
+                    let mac_random = host.mac_random || mac_ident::is_private(&host.mac);
                     let details = serde_json::json!({
                         "before": serde_json::Value::Null,
                         "after": {
@@ -1267,6 +1659,7 @@ pub fn reconcile(
                             "hostname": host.hostname,
                             "vendor": host.vendor,
                         },
+                        "mac_random": mac_random,
                     })
                     .to_string();
                     if let Err(err) = repo.append_event(device_id, EventType::New, &details) {
@@ -1305,10 +1698,31 @@ pub fn reconcile(
                     });
                 }
 
-                // Fingerprint de SO: si se intentó y no superó el umbral, se deja NULL.
-                if host.fingerprint_attempted {
-                    if let Err(err) = repo.set_os_family(device_id, host.os_family) {
-                        errors.push(format!("No se pudo guardar os_family: {err}"));
+                // Identidad de F4: modelo, señales DHCP, User-Agent y SO
+                // combinado con su fuente. Los campos a None conservan el valor
+                // persistido (las señales llegan en ciclos distintos).
+                let identidad = IdentityUpdate {
+                    model: host.model.clone(),
+                    dhcp_fingerprint: host.dhcp_fingerprint.clone(),
+                    dhcp_vendor: host.dhcp_vendor.clone(),
+                    dhcp_hostname: host.dhcp_hostname.clone(),
+                    user_agent: host.user_agent.clone(),
+                    os_family: host.os_family,
+                    os_source: host.os_source,
+                };
+                if identidad != IdentityUpdate::default() {
+                    if let Err(err) = repo.set_device_identity(device_id, &identidad) {
+                        errors.push(format!(
+                            "No se pudo guardar la identidad de {}: {err}",
+                            host.ip
+                        ));
+                    }
+                }
+                // Fingerprint de SO: si se intentó y la puntuación combinada no
+                // supera el umbral, se deja NULL (regla de F2, §7.12).
+                if host.fingerprint_attempted && host.os_family.is_none() {
+                    if let Err(err) = repo.set_os_family(device_id, None) {
+                        errors.push(format!("No se pudo limpiar os_family: {err}"));
                     }
                 }
                 if let Some(fingerprint) = &host.last_fingerprint {
@@ -1501,6 +1915,79 @@ pub fn reconcile(
         pruned_services,
         errors,
     })
+}
+
+/// Elige el equipo conocido al que pertenece una MAC nueva de mac_changed v2.
+///
+/// Primero la regla A de rotación de MAC privada (misma huella y mismo nombre
+/// DHCP, un único candidato no visto en el ciclo); después la heurística de
+/// toma de IP de F1, que no se aplica si las huellas DHCP de los dos equipos se
+/// contradicen. Con varios candidatos no se fusiona identidad: el equipo sale
+/// como nuevo (§7.13).
+fn candidato_cambio_identidad(
+    host: &Host,
+    previos: &[Device],
+    previos_por_mac: &HashMap<String, Device>,
+    identidades_conocidas: &[mac_ident::DeviceIdentity],
+    macs_actuales: &HashSet<String>,
+    fusionados: &HashSet<i64>,
+) -> Option<(Device, &'static str)> {
+    // Regla A: rotación de la MAC privada de un mismo equipo.
+    let identidad = mac_ident::DhcpIdentity {
+        mac: host.mac.clone(),
+        dhcp_fingerprint: host.dhcp_fingerprint.clone(),
+        dhcp_hostname: host.dhcp_hostname.clone(),
+    };
+    if let Some(id) = mac_ident::rotation_match(&identidad, identidades_conocidas) {
+        if !fusionados.contains(&id) {
+            if let Some(equipo) = previos_por_mac.values().find(|device| device.id == id) {
+                return Some((equipo.clone(), "rotation"));
+            }
+        }
+    }
+
+    // Regla B: la MAC nueva ocupa la IP de un equipo online que ha desaparecido.
+    let mut candidatos: Vec<&Device> = previos
+        .iter()
+        .filter(|device| {
+            device.ip == host.ip.to_string()
+                && device.mac != host.mac
+                && !macs_actuales.contains(&device.mac)
+                && device.is_online
+                && !fusionados.contains(&device.id)
+                && previos_por_mac.contains_key(&device.mac)
+        })
+        .collect();
+    if candidatos.len() != 1 {
+        return None;
+    }
+    let anterior = candidatos.remove(0);
+    if huellas_dhcp_compatibles(anterior, host) {
+        Some((anterior.clone(), "ip_takeover"))
+    } else {
+        None
+    }
+}
+
+/// Indica si las huellas DHCP del equipo anterior y del nuevo no se contradicen.
+///
+/// Solo se contradicen si los dos equipos tienen huella y es distinta (§7.13);
+/// sin evidencia DHCP suficiente se mantiene la toma de IP de F1.
+fn huellas_dhcp_compatibles(anterior: &Device, host: &Host) -> bool {
+    let anterior_huella = anterior
+        .dhcp_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|huella| !huella.is_empty());
+    let nueva_huella = host
+        .dhcp_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|huella| !huella.is_empty());
+    match (anterior_huella, nueva_huella) {
+        (Some(anterior), Some(nueva)) => anterior == nueva,
+        _ => true,
+    }
 }
 
 /// Fuentes de descubrimiento de F1 y F2 de un equipo, sin duplicados.
@@ -2042,6 +2529,7 @@ mod tests {
             &PassiveData::default(),
             &[],
             &HashMap::new(),
+            false,
         );
         assert_eq!(host.hostname.as_deref(), Some("equipo.lan"));
 
@@ -2068,6 +2556,7 @@ mod tests {
             &pasivo,
             &[],
             &HashMap::new(),
+            false,
         );
         assert_eq!(host.hostname.as_deref(), Some("impresora.local"));
         assert_eq!(host.mdns_services, vec!["_ipp._tcp".to_string()]);
@@ -2129,7 +2618,21 @@ mod tests {
 
         let mut state = ScanState::new(&[]);
         let mut discovery_state = DiscoveryState::disabled();
-        let informe = run_scan(&options, &mut state, &mut discovery_state, false).await;
+        let observado = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::identify::observed::ObservedHosts::default(),
+        ));
+        let identidad = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::identify::CaptureIdentityStore::new(),
+        ));
+        let informe = run_scan(
+            &options,
+            &mut state,
+            &mut discovery_state,
+            false,
+            &observado,
+            &identidad,
+        )
+        .await;
 
         assert!(informe.passive_only);
         assert!(!informe.privileged);
@@ -2153,5 +2656,793 @@ mod tests {
         assert!(state
             .select_for_active_scan(&informe.hosts, false)
             .is_empty());
+    }
+
+    // --- F4: captura como fuente de equipos, identidad y modo pasivo ---
+
+    /// Observación DHCP de prueba con identidad completa.
+    fn observacion_dhcp(
+        mac: &str,
+        ip: &str,
+        vendor: &str,
+        fingerprint: &str,
+        hostname: &str,
+    ) -> DhcpObservation {
+        DhcpObservation {
+            mac: Some(mac.to_string()),
+            ip: Some(ip.parse::<IpAddr>().unwrap()),
+            message_type: Some(1),
+            fingerprint: Some(fingerprint.to_string()),
+            vendor: Some(vendor.to_string()),
+            hostname: Some(hostname.to_string()),
+            client_id: None,
+        }
+    }
+
+    /// Servicio mDNS de prueba con su TXT.
+    fn servicio_mdns(
+        service_type: &str,
+        port: Option<u16>,
+        txt: &[(&str, &str)],
+    ) -> crate::discovery::mdns::MdnsService {
+        crate::discovery::mdns::MdnsService {
+            service_type: service_type.to_string(),
+            name: None,
+            port,
+            txt: txt
+                .iter()
+                .map(|(clave, valor)| ((*clave).to_string(), (*valor).to_string()))
+                .collect(),
+        }
+    }
+
+    /// Registro mDNS de prueba asociado a una IP.
+    fn registro_mdns(
+        ip: &str,
+        hostname: Option<&str>,
+        servicios: Vec<crate::discovery::mdns::MdnsService>,
+    ) -> crate::discovery::mdns::MdnsRecord {
+        crate::discovery::mdns::MdnsRecord {
+            ip: Some(ip.parse().unwrap()),
+            hostname: hostname.map(str::to_string),
+            services: servicios,
+            hinfo_os: None,
+        }
+    }
+
+    /// Equipo de prueba con la identidad DHCP de un móvil de MAC privada.
+    fn host_privado_con_dhcp(mac: &str, ip: &str) -> Host {
+        let mut host = host_de_prueba(mac, ip, None);
+        host.dhcp_fingerprint = Some("1,121,3,6,15,119".to_string());
+        host.dhcp_hostname = Some("iPhone-de-Marta".to_string());
+        host.dhcp_vendor = Some("Apple".to_string());
+        host.mac_random = true;
+        host
+    }
+
+    #[test]
+    fn los_equipos_observados_crean_y_completan_equipos_con_fuente_capture() {
+        let mut hosts = vec![host_de_prueba(
+            "3c:22:fb:11:22:33",
+            "192.168.1.50",
+            Some("impresora"),
+        )];
+        let ip_arp = hosts[0].ip;
+        let observados = vec![
+            ObservedHost {
+                mac: "3C-22-FB-11-22-33".to_string(),
+                ip: "192.168.1.51".parse().unwrap(),
+                source: crate::inference::ObservedSource::Frame,
+                dhcp: None,
+            },
+            ObservedHost {
+                mac: "da:a1:19:00:00:01".to_string(),
+                ip: "192.168.1.60".parse().unwrap(),
+                source: crate::inference::ObservedSource::Dhcp,
+                dhcp: Some(observacion_dhcp(
+                    "da:a1:19:00:00:01",
+                    "192.168.1.60",
+                    "android-dhcp-13",
+                    "1,3,6",
+                    "movil-De-Marta",
+                )),
+            },
+        ];
+        fusionar_observados(&mut hosts, observados, &HashSet::new());
+
+        assert_eq!(hosts.len(), 2, "el equipo ya conocido no se duplica");
+        let conocido = hosts
+            .iter()
+            .find(|host| host.mac == "3c:22:fb:11:22:33")
+            .expect("equipo del ARP");
+        assert_eq!(conocido.ip, ip_arp, "no se pisa la IP confirmada por ARP");
+        assert!(conocido
+            .discovery_sources
+            .contains(&DiscoverySource::Capture));
+        assert_eq!(conocido.hostname.as_deref(), Some("impresora"));
+
+        let nuevo = hosts
+            .iter()
+            .find(|host| host.mac == "da:a1:19:00:00:01")
+            .expect("equipo de la captura");
+        assert_eq!(nuevo.discovery_sources, vec![DiscoverySource::Capture]);
+        assert_eq!(nuevo.dhcp_fingerprint.as_deref(), Some("1,3,6"));
+        assert_eq!(nuevo.dhcp_vendor.as_deref(), Some("android-dhcp-13"));
+        assert_eq!(nuevo.dhcp_hostname.as_deref(), Some("movil-De-Marta"));
+        assert_eq!(nuevo.dhcp_name.as_deref(), Some("movil-De-Marta"));
+        assert!(mac_ident::is_private(&nuevo.mac));
+    }
+
+    #[test]
+    fn la_identidad_capturada_se_aplica_por_mac_y_por_ip_sin_mezclar_equipos() {
+        let mut hosts = vec![host_de_prueba("da:a1:19:00:00:02", "192.168.1.70", None)];
+        let ip: IpAddr = "192.168.1.70".parse().unwrap();
+        let identidades = vec![
+            (
+                Some("da:a1:19:00:00:02".to_string()),
+                None,
+                DeviceIdentitySignals {
+                    dhcp: Some(observacion_dhcp(
+                        "da:a1:19:00:00:02",
+                        "192.168.1.70",
+                        "MSFT 5.0",
+                        "1,3,6,15",
+                        "portatil",
+                    )),
+                    user_agent: None,
+                },
+            ),
+            (
+                None,
+                Some(ip),
+                DeviceIdentitySignals {
+                    dhcp: None,
+                    user_agent: Some("Mozilla/5.0 (X11; Linux x86_64) Firefox/121.0".to_string()),
+                },
+            ),
+        ];
+        fusionar_identidad(&mut hosts, &identidades);
+        assert_eq!(hosts[0].dhcp_fingerprint.as_deref(), Some("1,3,6,15"));
+        assert_eq!(hosts[0].dhcp_vendor.as_deref(), Some("MSFT 5.0"));
+        assert_eq!(hosts[0].dhcp_name.as_deref(), Some("portatil"));
+        assert_eq!(
+            hosts[0].user_agent.as_deref(),
+            Some("Mozilla/5.0 (X11; Linux x86_64) Firefox/121.0")
+        );
+
+        // Una identidad DHCP de otra MAC no se atribuye por IP.
+        let identidades = vec![(
+            None,
+            Some(ip),
+            DeviceIdentitySignals {
+                dhcp: Some(observacion_dhcp(
+                    "3c:22:fb:ff:ff:ff",
+                    "192.168.1.70",
+                    "udhcp 1.36",
+                    "1,3,6",
+                    "router",
+                )),
+                user_agent: None,
+            },
+        )];
+        fusionar_identidad(&mut hosts, &identidades);
+        assert_eq!(
+            hosts[0].dhcp_vendor.as_deref(),
+            Some("MSFT 5.0"),
+            "no se le pasa la huella de otro equipo"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_ciclo_fusiona_los_equipos_observados_por_la_captura() {
+        let mut filtro = crate::identify::observed::ObservedFilter::default();
+        filtro.networks.push((
+            "10.99.99.0".parse::<Ipv4Addr>().unwrap(),
+            "255.255.255.0".parse::<Ipv4Addr>().unwrap(),
+        ));
+        let observado = Arc::new(Mutex::new(ObservedHosts::new(filtro)));
+        let identidad = Arc::new(Mutex::new(CaptureIdentityStore::new()));
+        {
+            let mut buffer = observado.lock().expect("lock de observados");
+            assert!(buffer.push(ObservedHost {
+                mac: "da:a1:19:00:00:03".to_string(),
+                ip: "10.99.99.50".parse().unwrap(),
+                source: crate::inference::ObservedSource::Arp,
+                dhcp: None,
+            }));
+        }
+        {
+            let mut almacen = identidad.lock().expect("lock de identidad");
+            almacen.record_dhcp(observacion_dhcp(
+                "da:a1:19:00:00:03",
+                "10.99.99.50",
+                "MSFT 5.0",
+                "1,3,6,15",
+                "portatil",
+            ));
+        }
+
+        let options = ScanOptions {
+            privileged: false,
+            passive_only: true,
+            interfaces: vec!["almenara-interfaz-inexistente".to_string()],
+            ranges: Vec::new(),
+            timeout: Duration::ZERO,
+            concurrency: 4,
+            top_ports: vec![22],
+            dhcp_lease_paths: Vec::new(),
+            netbios_enabled: false,
+        };
+        let mut state = ScanState::new(&[]);
+        let mut discovery_state = DiscoveryState::disabled();
+        let informe = run_scan(
+            &options,
+            &mut state,
+            &mut discovery_state,
+            false,
+            &observado,
+            &identidad,
+        )
+        .await;
+
+        let host = informe
+            .hosts
+            .iter()
+            .find(|host| host.mac == "da:a1:19:00:00:03")
+            .expect("equipo creado desde la captura");
+        assert!(host.discovery_sources.contains(&DiscoverySource::Capture));
+        assert_eq!(host.dhcp_fingerprint.as_deref(), Some("1,3,6,15"));
+        assert_eq!(host.dhcp_vendor.as_deref(), Some("MSFT 5.0"));
+        assert_eq!(host.hostname.as_deref(), Some("portatil"));
+        assert!(host.mac_random);
+        assert!(observado.lock().expect("lock").is_empty());
+        assert!(identidad.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn las_senales_dhcp_modelo_y_user_agent_puntuan_el_so_y_su_fuente() {
+        // Criterio de aceptación: model=MacBookPro… → macOS y os_source = model.
+        let ip: Ipv4Addr = "192.168.1.30".parse().unwrap();
+        let mut host = Host::new("3c:22:fb:11:22:33", ip);
+        let pasivo = PassiveData {
+            mdns: vec![registro_mdns(
+                "192.168.1.30",
+                Some("mac-de-casa.local"),
+                vec![servicio_mdns(
+                    "_device-info._tcp",
+                    None,
+                    &[("model", "MacBookPro18,3")],
+                )],
+            )],
+            ..PassiveData::default()
+        };
+        aplicar_fuentes_pasivas(
+            std::slice::from_mut(&mut host),
+            &pasivo,
+            &[],
+            &HashMap::new(),
+            false,
+        );
+        host.combinar_os();
+        assert_eq!(host.model.as_deref(), Some("MacBookPro18,3"));
+        assert_eq!(host.os_family, Some(OsFamily::MacOs));
+        assert_eq!(host.os_source, Some(OsSource::Model));
+
+        // Huella DHCP de Windows + User-Agent de Windows: la huella DHCP aporta
+        // más puntos y queda como fuente.
+        let mut host = Host::new("3c:22:fb:11:22:44", ip);
+        host.dhcp_vendor = Some("MSFT 5.0".to_string());
+        host.dhcp_fingerprint = Some("1,3,6,15,119,252".to_string());
+        host.user_agent = Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120".to_string());
+        host.combinar_os();
+        assert_eq!(host.os_family, Some(OsFamily::Windows));
+        assert_eq!(host.os_source, Some(OsSource::Dhcp));
+
+        // La huella TCP de F2 se suma a la pista del User-Agent.
+        let mut host = Host::new("3c:22:fb:11:22:55", ip);
+        host.os_family = Some(OsFamily::MacOs);
+        host.fingerprint_score = 4;
+        host.user_agent =
+            Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15".to_string());
+        host.combinar_os();
+        assert_eq!(host.os_family, Some(OsFamily::MacOs));
+        assert_eq!(
+            host.os_source,
+            Some(OsSource::Tcp),
+            "la huella TCP aporta más puntos"
+        );
+    }
+
+    #[test]
+    fn el_nombre_fn_de_cast_y_el_dhcp_capturado_entran_en_la_precedencia() {
+        // `fn` de Google Cast (nivel mDNS) manda sobre DHCP y reverse DNS.
+        let mut host = Host::new("3c:22:fb:11:22:66", "192.168.1.40".parse().unwrap());
+        host.reverse_dns_name = Some("chromecast.lan".to_string());
+        host.hostname = Some("chromecast.lan".to_string());
+        host.dhcp_name = Some("dhcp-chromecast".to_string());
+        let pasivo = PassiveData {
+            mdns: vec![registro_mdns(
+                "192.168.1.40",
+                None,
+                vec![servicio_mdns(
+                    "_googlecast._tcp",
+                    None,
+                    &[("fn", "Salón TV"), ("md", "Chromecast Ultra")],
+                )],
+            )],
+            ..PassiveData::default()
+        };
+        aplicar_fuentes_pasivas(
+            std::slice::from_mut(&mut host),
+            &pasivo,
+            &[],
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(host.mdns_name.as_deref(), Some("Salón TV"));
+        assert_eq!(host.hostname.as_deref(), Some("Salón TV"));
+
+        // El nombre DHCP capturado (nivel de lease) manda sobre el reverse DNS.
+        assert_eq!(
+            hostname_precedence(None, None, Some("movil-dhcp"), Some("movil.lan")),
+            Some("movil-dhcp".to_string())
+        );
+
+        // En pasivo: mDNS/fn > DHCP > último conocido, sin NetBIOS ni reverse DNS.
+        assert_eq!(
+            hostname_precedence_pasivo(Some("Salón TV"), Some("tv-dhcp")),
+            Some("Salón TV".to_string())
+        );
+        assert_eq!(
+            hostname_precedence_pasivo(None, Some("tv-dhcp")),
+            Some("tv-dhcp".to_string())
+        );
+        assert_eq!(hostname_precedence_pasivo(None, None), None);
+    }
+
+    #[test]
+    fn el_modo_pasivo_desactiva_netbios_y_el_dns_inverso() {
+        let config = ScanConfig {
+            passive_only: true,
+            ..ScanConfig::default()
+        };
+        let options = ScanOptions::from_config(&config, true).expect("opciones válidas");
+        assert!(!options.netbios_enabled, "en pasivo no se consulta NetBIOS");
+        assert!(!netbios_habilitado(&options));
+        assert!(!dns_inverso_habilitado(&options));
+
+        let normal =
+            ScanOptions::from_config(&ScanConfig::default(), true).expect("opciones válidas");
+        assert!(normal.netbios_enabled);
+        assert!(netbios_habilitado(&normal));
+        assert!(dns_inverso_habilitado(&normal));
+
+        // La condición de run_scan vuelve a exigir el modo pasivo.
+        let forzado = ScanOptions {
+            passive_only: true,
+            netbios_enabled: true,
+            ..normal
+        };
+        assert!(!netbios_habilitado(&forzado));
+    }
+
+    #[test]
+    fn solo_se_resuelven_ips_de_subredes_locales() {
+        let redes = vec!["192.168.1.0/24".parse::<Ipv4Network>().unwrap()];
+        assert!(es_ip_de_subred_local(
+            "192.168.1.50".parse().unwrap(),
+            &redes
+        ));
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "203.0.113.9",
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.251",
+            "255.255.255.255",
+        ] {
+            assert!(
+                !es_ip_de_subred_local(ip.parse().unwrap(), &redes),
+                "{ip} no es una IP de la LAN"
+            );
+        }
+        assert!(
+            !es_ip_de_subred_local("192.168.1.50".parse().unwrap(), &[]),
+            "sin subredes no se resuelve nada"
+        );
+    }
+
+    #[test]
+    fn las_reglas_de_modelo_y_user_agent_van_antes_que_las_de_hostname() {
+        // El hostname sugiere iPhone, pero el modelo anuncia un MacBook: pc.
+        let mut host = Host::new("3c:22:fb:11:22:77", "192.168.1.45".parse().unwrap());
+        host.hostname = Some("iPhone-de-Marta".to_string());
+        host.model_device_type = Some(DeviceType::Pc);
+        let contexto = DeviceCtx {
+            hostname: host.hostname.clone(),
+            ..DeviceCtx::default()
+        };
+        assert_eq!(clasificar_tipo(&host, contexto), DeviceType::Pc);
+
+        // UA de TV: tv aunque el hostname no lo diga.
+        let mut host = Host::new("3c:22:fb:11:22:78", "192.168.1.46".parse().unwrap());
+        host.hostname = Some("tele-del-salon".to_string());
+        host.user_agent =
+            Some("Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/537.36".to_string());
+        let contexto = DeviceCtx {
+            hostname: host.hostname.clone(),
+            is_tv: parece_televisor(&host),
+            ..DeviceCtx::default()
+        };
+        assert_eq!(clasificar_tipo(&host, contexto), DeviceType::Tv);
+
+        // Sin pistas de F4, la clasificación por hostname de F2 sigue igual.
+        let mut host = Host::new("3c:22:fb:11:22:79", "192.168.1.47".parse().unwrap());
+        host.hostname = Some("iPhone-de-Marta".to_string());
+        let contexto = DeviceCtx {
+            hostname: host.hostname.clone(),
+            ..DeviceCtx::default()
+        };
+        assert_eq!(clasificar_tipo(&host, contexto), DeviceType::Mobile);
+    }
+
+    #[test]
+    fn el_modelo_anunciado_por_mdns_tambien_fija_el_tipo() {
+        let pasivo = PassiveData {
+            mdns: vec![
+                registro_mdns(
+                    "192.168.1.81",
+                    None,
+                    vec![servicio_mdns(
+                        "_googlecast._tcp",
+                        None,
+                        &[("md", "Chromecast Ultra")],
+                    )],
+                ),
+                registro_mdns(
+                    "192.168.1.82",
+                    None,
+                    vec![servicio_mdns(
+                        "_ipp._tcp",
+                        Some(631),
+                        &[("ty", "HP LaserJet 400")],
+                    )],
+                ),
+                registro_mdns(
+                    "192.168.1.83",
+                    None,
+                    vec![servicio_mdns(
+                        "_airplay._tcp",
+                        None,
+                        &[("model", "AppleTV6,2")],
+                    )],
+                ),
+            ],
+            ..PassiveData::default()
+        };
+        let mut hosts = vec![
+            Host::new("3c:22:fb:11:22:81", "192.168.1.81".parse().unwrap()),
+            Host::new("3c:22:fb:11:22:82", "192.168.1.82".parse().unwrap()),
+            Host::new("3c:22:fb:11:22:83", "192.168.1.83".parse().unwrap()),
+        ];
+        aplicar_fuentes_pasivas(&mut hosts, &pasivo, &[], &HashMap::new(), false);
+
+        let chromecast = &hosts[0];
+        assert_eq!(chromecast.model.as_deref(), Some("Chromecast Ultra"));
+        let contexto = DeviceCtx {
+            mdns_services: chromecast.mdns_services.clone(),
+            ..DeviceCtx::default()
+        };
+        assert_eq!(clasificar_tipo(chromecast, contexto), DeviceType::Streaming);
+
+        let impresora = &hosts[1];
+        assert_eq!(impresora.model.as_deref(), Some("HP LaserJet 400"));
+        let contexto = DeviceCtx {
+            mdns_services: impresora.mdns_services.clone(),
+            services: impresora
+                .services
+                .iter()
+                .filter_map(|servicio| servicio.service)
+                .collect(),
+            ..DeviceCtx::default()
+        };
+        assert_eq!(clasificar_tipo(impresora, contexto), DeviceType::Printer);
+
+        let appletv = &hosts[2];
+        let contexto = DeviceCtx {
+            mdns_services: appletv.mdns_services.clone(),
+            ..DeviceCtx::default()
+        };
+        assert_eq!(clasificar_tipo(appletv, contexto), DeviceType::Streaming);
+    }
+
+    #[test]
+    fn un_equipo_observado_por_la_captura_crea_equipo_con_fuente_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        // Solo lo ha visto la captura: sin fuentes de F1.
+        let mut host = Host::new("3c:22:fb:11:22:93", "192.168.1.98".parse().unwrap());
+        host.interface = Some("eth0".to_string());
+        host.discovery_sources.push(DiscoverySource::Capture);
+        let informe = informe_de_prueba(vec![host]);
+        let reconciliacion =
+            reconcile(&mut repo, &informe, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert_eq!(reconciliacion.new_devices, 1);
+        let dispositivo = &reconciliacion.devices[0];
+        assert!(reconciliacion
+            .events
+            .iter()
+            .any(|evento| evento.event_type == EventType::New));
+        let fuentes = repo.list_sources(dispositivo.id).unwrap();
+        let nombres: Vec<&str> = fuentes.iter().map(|fila| fila.source.as_str()).collect();
+        assert!(
+            nombres.contains(&"capture"),
+            "la fuente capture debe persistirse: {nombres:?}"
+        );
+    }
+
+    #[test]
+    fn las_observaciones_de_la_captura_cuentan_como_visto_para_el_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(1);
+
+        let primera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host_de_prueba(
+                "3c:22:fb:11:22:94",
+                "192.168.1.99",
+                None,
+            )]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(primera.new_devices, 1);
+
+        // El único dato del ciclo es una observación de la captura: cuenta como
+        // visto y no se marca offline (el umbral es de un solo ciclo).
+        let mut capturado = Host::new("3c:22:fb:11:22:94", "192.168.1.99".parse().unwrap());
+        capturado.interface = Some("eth0".to_string());
+        capturado.discovery_sources.push(DiscoverySource::Capture);
+        let segunda = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![capturado]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(segunda.marked_offline, 0);
+        assert!(segunda.devices.iter().all(|device| device.is_online));
+
+        // Sin observaciones, el siguiente ciclo sí lo marca offline.
+        let tercera = reconcile(
+            &mut repo,
+            &informe_de_prueba(Vec::new()),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(tercera.marked_offline, 1);
+    }
+
+    #[test]
+    fn la_identidad_de_f4_se_persiste_en_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        let mut host = host_de_prueba("3c:22:fb:11:22:95", "192.168.1.100", None);
+        host.model = Some("MacBookPro18,3".to_string());
+        host.dhcp_fingerprint = Some("1,121,3,6".to_string());
+        host.dhcp_vendor = Some("Apple".to_string());
+        host.dhcp_hostname = Some("mac-de-casa".to_string());
+        host.user_agent = Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)".to_string());
+        host.os_family = Some(OsFamily::MacOs);
+        host.os_source = Some(OsSource::Model);
+        let reconciliacion = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        let device_id = reconciliacion.devices[0].id;
+        let dispositivo = repo
+            .get_device_by_mac("3c:22:fb:11:22:95")
+            .unwrap()
+            .expect("equipo persistido");
+        assert_eq!(dispositivo.model.as_deref(), Some("MacBookPro18,3"));
+        assert_eq!(dispositivo.dhcp_fingerprint.as_deref(), Some("1,121,3,6"));
+        assert_eq!(dispositivo.dhcp_vendor.as_deref(), Some("Apple"));
+        assert_eq!(dispositivo.dhcp_hostname.as_deref(), Some("mac-de-casa"));
+        assert_eq!(
+            dispositivo.user_agent.as_deref(),
+            Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        );
+        assert_eq!(dispositivo.os_family.as_deref(), Some("macos"));
+        assert_eq!(dispositivo.os_source.as_deref(), Some("model"));
+        assert_eq!(device_id, dispositivo.id);
+    }
+
+    #[test]
+    fn la_rotacion_de_mac_privada_conserva_el_equipo_y_marca_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        let primero = informe_de_prueba(vec![host_privado_con_dhcp(
+            "da:a1:19:00:00:01",
+            "192.168.1.90",
+        )]);
+        let primera = reconcile(&mut repo, &primero, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert_eq!(primera.new_devices, 1);
+        let device_id = primera.devices[0].id;
+
+        // Otra MAC privada con la misma huella y nombre DHCP, con la anterior
+        // sin verse en el ciclo: se conserva el equipo.
+        let segundo = informe_de_prueba(vec![host_privado_con_dhcp(
+            "da:a1:19:00:00:02",
+            "192.168.1.90",
+        )]);
+        let segunda = reconcile(&mut repo, &segundo, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert_eq!(segunda.devices.len(), 1, "se conserva el equipo");
+        assert_eq!(segunda.devices[0].id, device_id);
+        assert_eq!(segunda.devices[0].mac, "da:a1:19:00:00:02");
+        assert!(segunda
+            .events
+            .iter()
+            .any(|evento| evento.event_type == EventType::MacChanged));
+        let guardados = repo.list_events(device_id).unwrap();
+        let mac_changed = guardados
+            .iter()
+            .find(|evento| evento.event_type == EventType::MacChanged)
+            .expect("mac_changed persistido");
+        assert!(
+            mac_changed.details.contains("\"reason\":\"rotation\""),
+            "{}",
+            mac_changed.details
+        );
+    }
+
+    #[test]
+    fn con_varios_candidatos_de_rotacion_no_se_fusiona_y_sale_new_con_mac_random() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        let inicial = informe_de_prueba(vec![
+            host_privado_con_dhcp("da:a1:19:00:00:11", "192.168.1.91"),
+            host_privado_con_dhcp("da:a1:19:00:00:12", "192.168.1.92"),
+        ]);
+        let primera = reconcile(&mut repo, &inicial, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert_eq!(primera.devices.len(), 2);
+
+        let otra = informe_de_prueba(vec![host_privado_con_dhcp(
+            "da:a1:19:00:00:13",
+            "192.168.1.93",
+        )]);
+        let segunda = reconcile(&mut repo, &otra, &mut tracker, 90, STALE_FUTURO).unwrap();
+        assert_eq!(
+            segunda.devices.len(),
+            3,
+            "con varios candidatos no se fusiona identidad"
+        );
+        assert!(!segunda
+            .events
+            .iter()
+            .any(|evento| evento.event_type == EventType::MacChanged));
+        let nuevo = segunda
+            .devices
+            .iter()
+            .find(|device| device.mac == "da:a1:19:00:00:13")
+            .expect("equipo nuevo");
+        let eventos = repo.list_events(nuevo.id).unwrap();
+        let new = eventos
+            .iter()
+            .find(|evento| evento.event_type == EventType::New)
+            .expect("evento new persistido");
+        assert!(
+            new.details.contains("\"mac_random\":true"),
+            "{}",
+            new.details
+        );
+    }
+
+    #[test]
+    fn la_toma_de_ip_no_se_aplica_si_las_huellas_dhcp_se_contradicen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        let mut antiguo = host_de_prueba("3c:22:fb:11:22:90", "192.168.1.95", None);
+        antiguo.dhcp_fingerprint = Some("1,3,6,15,119,252".to_string());
+        let primera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![antiguo]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(primera.devices.len(), 1);
+
+        let mut nuevo = host_de_prueba("3c:22:fb:44:55:66", "192.168.1.95", None);
+        nuevo.dhcp_fingerprint = Some("1,121,3,6".to_string());
+        let segunda = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![nuevo]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(
+            segunda.devices.len(),
+            2,
+            "con huellas DHCP contradictorias no se fusiona"
+        );
+        assert!(!segunda
+            .events
+            .iter()
+            .any(|evento| evento.event_type == EventType::MacChanged));
+        assert!(segunda
+            .events
+            .iter()
+            .any(|evento| evento.event_type == EventType::New));
+    }
+
+    #[test]
+    fn la_toma_de_ip_compatible_marca_ip_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repo::init(&dir.path().join("data.db")).unwrap();
+        let mut tracker = OnlineTracker::new(3);
+
+        let primera = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host_de_prueba(
+                "3c:22:fb:11:22:91",
+                "192.168.1.96",
+                None,
+            )]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(primera.devices.len(), 1);
+        let device_id = primera.devices[0].id;
+
+        let segunda = reconcile(
+            &mut repo,
+            &informe_de_prueba(vec![host_de_prueba(
+                "3c:22:fb:44:55:67",
+                "192.168.1.96",
+                None,
+            )]),
+            &mut tracker,
+            90,
+            STALE_FUTURO,
+        )
+        .unwrap();
+        assert_eq!(segunda.devices.len(), 1, "se conserva el equipo");
+        assert_eq!(segunda.devices[0].mac, "3c:22:fb:44:55:67");
+        let guardados = repo.list_events(device_id).unwrap();
+        let mac_changed = guardados
+            .iter()
+            .find(|evento| evento.event_type == EventType::MacChanged)
+            .expect("mac_changed persistido");
+        assert!(
+            mac_changed.details.contains("\"reason\":\"ip_takeover\""),
+            "{}",
+            mac_changed.details
+        );
     }
 }

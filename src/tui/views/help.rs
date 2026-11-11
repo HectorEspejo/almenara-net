@@ -1,5 +1,5 @@
-//! Pestaña Ayuda: keybindings, pestañas, captura de tráfico, modos de
-//! descubrimiento y aviso legal.
+//! Pestaña Ayuda: keybindings, pestañas, captura, inferencia y privacidad,
+//! modos de descubrimiento, atribución de datos y aviso legal.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -19,7 +19,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let mut lineas: Vec<Line> = Vec::new();
     lineas.push(Line::from(Span::styled(
         format!(
-            "Almenara v{} — Fase 3: tráfico en vivo (pasivo + local)",
+            "Almenara v{} — Fase 4: protocolos, apps y top talkers",
             env!("CARGO_PKG_VERSION")
         ),
         app.theme.title,
@@ -37,15 +37,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     lineas.push(Line::from(""));
     lineas.push(Line::from(Span::styled("Pestañas", app.theme.accent)));
     lineas.push(Line::from(Span::styled(
-        "  Equipos       inventario (plana o agrupada) y detalle master-detail con Enter",
+        "  Equipos       inventario (plana o agrupada), identidad ampliada y detalle",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Tráfico       ranking top-10 por consumo en la ventana de 60 s",
+        "  Tráfico       ranking por equipo, destino, app, categoría, protocolo o proceso",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Conexiones    tabla plana ordenable y filtrable; [v] muestra cabeceras",
+        "  Conexiones    rol cliente/servidor, nombre del servidor, app y proceso local",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
@@ -54,48 +54,100 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     )));
 
     lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled("Tráfico", app.theme.accent)));
     lineas.push(Line::from(Span::styled(
-        "Vista de equipos",
-        app.theme.accent,
-    )));
-    lineas.push(Line::from(vec![
-        Span::styled("  Vista actual: ", app.theme.accent),
-        Span::styled(app.list_view.label(), app.theme.normal),
-        Span::styled("  [g] alterna plana / agrupada", app.theme.dim),
-    ]));
-    lineas.push(Line::from(Span::styled(
-        "  Agrupada: cabeceras por categoría (Infraestructura, Puestos y servidores, …)",
+        "  g      agrupar: equipo → destino → app → categoría → protocolo → proceso",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Tipo manual: [t] cicla automático → gateway → printer → … → unknown → automático",
+        "  w      ventana: 60 s → 5 min → sesión (no se guarda; arranca en 60 s)",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Detalle: Enter abre el panel (mitad derecha ≥100 columnas, completa por debajo);",
+        "  Enter  ¿quién lo usa? en destino/app/categoría/protocolo; en proceso abre",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "           Tab alterna el foco lista/detalle y Esc cierra el panel.",
+        "         Conexiones filtradas; en equipo, su detalle completo",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  s      ordenar el ranking: ↓, ↑, total o equipos",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  El pie muestra siempre «sin identificar: N %» y la visibilidad honesta de",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  la red conmutada: solo se ve el tráfico propio y la difusión.",
+        app.theme.dim,
+    )));
+
+    lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled("Conexiones", app.theme.accent)));
+    lineas.push(Line::from(Span::styled(
+        "  Prot. · Equipo (cliente o LAN) · Destino (servidor) · App · ↑ · ↓ · Edad;",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  a partir de 100 columnas se añade el Estado. Sin rol, la fila va en orden",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  canónico con «?» delante del destino.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  i      alternar nombres ⇄ IPs (no se persiste)",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  v      detalle: cabeceras IP/TCP, rol, fuentes del nombre y de la app,",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "         JA4 y proceso local",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  /      buscar por servidor, app, proceso, IP o equipo",
         app.theme.normal,
     )));
 
     lineas.push(Line::from(""));
     lineas.push(Line::from(Span::styled(
-        "Iconos por tipo",
+        "Inferencia y privacidad",
         app.theme.accent,
     )));
     lineas.push(Line::from(Span::styled(
-        "  [⌂] gateway   [▣] pc/server   [▯] móvil/tablet   [●] iot",
+        "  Almenara lee cabeceras DNS/TLS/HTTP/QUIC y los primeros bytes de cada",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  [P] impresora [C] cámara      [▶] tv/streaming   [?] desconocido",
+        "  conexión para ponerle nombre. No guarda el contenido. Los dominios son,",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  ○    offline",
-        app.theme.offline,
+        "  en la práctica, historial de navegación: se borran al cerrarse la conexión",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  o al caducar (24 h como máximo). El payload nunca se persiste.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(vec![
+        Span::styled("  Para desactivarla: ", app.theme.normal),
+        Span::styled("[inference] enabled = false", app.theme.accent),
+        Span::styled(" en config.toml", app.theme.normal),
+    ]));
+    lineas.push(Line::from(Span::styled(
+        "  Con la inferencia apagada solo quedan etiquetas por servicio de F2, ASN,",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  puerto y proceso local; la barra muestra «inferencia: desactivada».",
+        app.theme.dim,
     )));
 
     lineas.push(Line::from(""));
@@ -118,18 +170,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Filtro: [capture].filter con BPF clásico adjunto al socket (SO_ATTACH_FILTER);",
-        app.theme.normal,
-    )));
-    lineas.push(Line::from(Span::styled(
-        "          vacío = sin filtro. Si el filtro no compila se avisa y se captura sin él.",
-        app.theme.normal,
-    )));
-    lineas.push(Line::from(Span::styled(
-        "  Límite: [capture].max_pps (0 = sin límite). Se avisa una vez por minuto al alcanzarlo.",
-        app.theme.normal,
-    )));
-    lineas.push(Line::from(Span::styled(
         "  Requiere CAP_NET_RAW: sudo setcap cap_net_raw+ep target/debug/almenara",
         app.theme.normal,
     )));
@@ -146,23 +186,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Visibilidad honesta: en red conmutada se ve todo el tráfico propio y el",
+        "  Ventanas en memoria: 60 s y 5 min; la de sesión no se guarda (el histórico",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  broadcast; del unicast entre terceros solo lo que llegue a esta interfaz.",
+        "  llega en la fase 5). passive_only permite captura pasiva: escuchar no",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Ventanas en memoria: 60 s (1 punto/s) y 5 min (punto cada 5 s); parten a cero.",
-        app.theme.normal,
-    )));
-    lineas.push(Line::from(Span::styled(
-        "  El último snapshot por equipo (TRAFFIC_SNAPSHOT) se usa como semilla al reabrir.",
-        app.theme.normal,
-    )));
-    lineas.push(Line::from(Span::styled(
-        "  passive_only permite captura pasiva: escuchar no emite tráfico.",
+        "  emite tráfico.",
         app.theme.normal,
     )));
 
@@ -173,7 +205,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  pasivo         [scan] passive_only = true; sin tráfico activo (captura pasiva sí)",
+        "  pasivo         solo escucha: sin escaneos, sin NetBIOS, sin DNS inverso;",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "                 la captura, la lectura de /proc y los leases DHCP siguen activos",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
@@ -206,19 +242,48 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.warning,
     )));
     lineas.push(Line::from(Span::styled(
-        "  El payload de los paquetes NUNCA se persiste: con inspect_payload = false se",
+        "  El payload de los paquetes NUNCA se persiste: se descarta en el hilo de",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  descarta al instante; con true solo se extraen QNAME de DNS y SNI de TLS.",
+        "  captura tras extraer la etiqueta. Solo se guardan etiquetas derivadas.",
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Datos técnicos guardados solo en local (SQLite): IP, MAC, hostname, fabricante,",
+        "  Dominios, SNI, Host y User-Agent solo aparecen en logs de nivel debug.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Datos técnicos guardados solo en local (SQLite): IP, MAC, hostname, modelo,",
         app.theme.dim,
     )));
     lineas.push(Line::from(Span::styled(
-        "  familia de SO, puertos/servicios y metadatos de conexiones (5-tuple y bytes).",
+        "  fabricante, familia de SO, huella DHCP, puertos/servicios y metadatos de",
+        app.theme.dim,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  conexiones (5-tuple, bytes, etiquetas y JA4).",
+        app.theme.dim,
+    )));
+
+    lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled(
+        "Datos y licencias",
+        app.theme.accent,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  IP Geolocation by DB-IP (db-ip.com), CC BY 4.0 · Public Suffix List",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  (Mozilla, MPL 2.0) · catálogo de apps propio · huellas JA4 (FoxIO, BSD-3)",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        format!(
+            "  Almenara v{} — Fase 4. Detalle de fuentes en data/FUENTES.md",
+            env!("CARGO_PKG_VERSION")
+        ),
         app.theme.dim,
     )));
 
@@ -231,7 +296,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_f4 {
     use crate::capabilities::Capabilities;
     use crate::config::Config;
     use crate::tui::app::App;
@@ -239,12 +304,27 @@ mod tests {
     use ratatui::Terminal;
     use std::path::PathBuf;
 
-    fn dibujar(app: &App, ancho: u16, alto: u16) -> String {
-        let backend = TestBackend::new(ancho, alto);
+    fn app_prueba(passive: bool) -> App {
+        let mut config = Config::default();
+        config.scan.passive_only = passive;
+        App::new(
+            config,
+            PathBuf::from("/tmp/config.toml"),
+            PathBuf::from("/tmp/data.db"),
+            Capabilities {
+                raw_sockets: true,
+                detail: "CAP_NET_RAW detectada".to_string(),
+            },
+            None,
+        )
+    }
+
+    fn texto(app: &App) -> String {
+        let backend = TestBackend::new(200, 140);
         let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
         terminal
             .draw(|frame| super::draw(frame, app, frame.area()))
-            .expect("dibujado de la ayuda");
+            .expect("dibujado de Ayuda");
         terminal
             .backend()
             .buffer()
@@ -254,70 +334,46 @@ mod tests {
             .collect()
     }
 
-    fn app_prueba(raw: bool) -> App {
-        App::new(
-            Config::default(),
-            PathBuf::from("/tmp/config.toml"),
-            PathBuf::from("/tmp/data.db"),
-            Capabilities {
-                raw_sockets: raw,
-                detail: if raw {
-                    "CAP_NET_RAW detectada".to_string()
-                } else {
-                    "sin CAP_NET_RAW".to_string()
-                },
-            },
-            None,
-        )
-    }
-
     #[test]
-    fn ayuda_incluye_atajos_estado_y_aviso_legal() {
+    fn la_ayuda_documenta_las_teclas_nuevas_de_f4() {
         let app = app_prueba(false);
-        let contenido = dibujar(&app, 130, 70);
-        assert!(contenido.contains("Navegación"));
-        assert!(contenido.contains("Shift-Tab"));
-        assert!(contenido.contains("degradado"));
-        assert!(contenido.contains("Aviso legal") || contenido.contains("aviso legal"));
-        assert!(contenido.contains("redes propias"));
-        assert!(contenido.contains("Fase 3"));
-        assert!(contenido.contains("[v]"));
+        let contenido = texto(&app);
+        for tecla in [
+            "g (Tráfico)",
+            "w (Tráfico)",
+            "i (Conexiones)",
+            "v (Conexiones)",
+            "Enter",
+        ] {
+            assert!(contenido.contains(tecla), "falta el atajo {tecla}");
+        }
+        assert!(contenido.contains("agrupar: equipo → destino → app"));
+        assert!(contenido.contains("ventana: 60 s → 5 min → sesión"));
+        assert!(contenido.contains("alternar nombres ⇄ IPs"));
     }
 
     #[test]
-    fn ayuda_documenta_vista_e_iconos() {
+    fn la_ayuda_explica_la_privacidad_de_la_inferencia() {
         let app = app_prueba(false);
-        let contenido = dibujar(&app, 130, 70);
-        assert!(contenido.contains("Vista actual"));
-        assert!(contenido.contains("plana"));
-        assert!(contenido.contains("agrupada"));
-        assert!(contenido.contains("Iconos por tipo"));
-        for icono in ["[⌂]", "[▣]", "[▯]", "[▶]", "[P]", "[C]", "[●]", "[?]", "○"] {
-            assert!(contenido.contains(icono), "falta el icono {icono}");
-        }
+        let contenido = texto(&app);
+        assert!(contenido.contains("Inferencia y privacidad"));
+        assert!(contenido.contains("No guarda el contenido"));
+        assert!(contenido.contains("historial de navegación"));
+        assert!(contenido.contains("[inference] enabled = false"));
+        assert!(contenido.contains("El payload nunca se persiste"));
+        assert!(contenido.contains("logs de nivel debug"));
     }
 
     #[test]
-    fn ayuda_describe_los_tres_modos() {
+    fn la_ayuda_redefine_el_modo_pasivo_y_atribuye_los_datos() {
         let app = app_prueba(true);
-        let contenido = dibujar(&app, 130, 70);
-        for modo in ["privilegiado", "pasivo", "degradado"] {
-            assert!(contenido.contains(modo), "falta el modo {modo}");
-        }
-        assert!(contenido.contains("Modo actual"));
-    }
-
-    #[test]
-    fn ayuda_documenta_la_captura_y_sus_limites() {
-        let app = app_prueba(true);
-        let contenido = dibujar(&app, 130, 80);
-        assert!(contenido.contains("Captura de tráfico"));
-        assert!(contenido.contains("CAP_NET_RAW"));
-        assert!(contenido.contains("max_pps"));
-        assert!(contenido.contains("SO_ATTACH_FILTER"));
-        assert!(contenido.contains("payload"));
-        assert!(contenido.contains("TRAFFIC_SNAPSHOT"));
-        assert!(contenido.contains("passive_only"));
-        assert!(contenido.contains("visibilidad") || contenido.contains("Visibilidad"));
+        let contenido = texto(&app);
+        assert!(contenido
+            .contains("pasivo         solo escucha: sin escaneos, sin NetBIOS, sin DNS inverso"));
+        assert!(contenido.contains("IP Geolocation by DB-IP (db-ip.com), CC BY 4.0"));
+        assert!(contenido.contains("Public Suffix List"));
+        assert!(contenido.contains("MPL 2.0"));
+        assert!(contenido.contains("Almenara v0.4.0 — Fase 4"));
+        assert!(contenido.contains("Fase 4: protocolos, apps y top talkers"));
     }
 }

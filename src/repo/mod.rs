@@ -31,6 +31,8 @@ pub mod events;
 pub mod interfaces;
 pub mod migrations;
 #[allow(dead_code)]
+pub mod names;
+#[allow(dead_code)]
 pub mod traffic_snapshot;
 
 use std::path::{Path, PathBuf};
@@ -43,10 +45,12 @@ use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, Row};
 
 use crate::classify::{DeviceType, OsFamily};
 use crate::error::{Error, Result};
+use crate::identify::OsSource;
+use crate::inference::names::NameEntry;
 
 pub use connections::{Connection, ConnectionProtocol, ConnectionUpdate};
 pub use device_services::{DeviceService, Protocol, ServiceUpsert};
-pub use devices::{ChangeSet, Device, DeviceUpsert};
+pub use devices::{ChangeSet, Device, DeviceUpsert, IdentityUpdate};
 pub use discovery_sources::{DiscoverySource, DiscoverySourceRow};
 pub use events::{DeviceEvent, EventType};
 pub use interfaces::Interface;
@@ -63,7 +67,8 @@ const SQL_SELECCION_INTERFAZ: &str =
 const SQL_SELECCION_DISPOSITIVO: &str =
     "SELECT id, mac, ip, hostname, vendor, interface_id, device_type, is_online,
             first_seen, last_seen, alias, notes, os_family, device_type_manual,
-            last_fingerprint FROM DEVICES";
+            last_fingerprint, model, dhcp_fingerprint, dhcp_vendor, dhcp_hostname,
+            user_agent, os_source FROM DEVICES";
 
 /// Repositorio SQLite de Almenara.
 #[derive(Debug)]
@@ -524,12 +529,101 @@ impl Repo {
     }
 }
 
+// API de persistencia de la Fase 4: caché de nombres e identidad de equipos.
+#[allow(dead_code)]
+impl Repo {
+    /// Persiste las entradas nuevas o refrescadas de la caché de nombres (§7.7).
+    ///
+    /// Devuelve cuántas entradas se han escrito. La caducidad no se filtra
+    /// aquí: el mismo ciclo de 5 s llama después a Repo::prune_names.
+    pub fn upsert_names(&mut self, entradas: &[NameEntry]) -> Result<usize> {
+        names::upsert(&self.conn, entradas)
+    }
+
+    /// Lista las entradas de NAME_CACHE vigentes en el instante indicado.
+    ///
+    /// Se usa al arrancar en caliente; el equipo que hizo cada consulta no se
+    /// persiste, así que las entradas vuelven con `requester = None`.
+    pub fn list_names(&self, ahora: SystemTime) -> Result<Vec<NameEntry>> {
+        names::list(&self.conn, ahora)
+    }
+
+    /// Purga las entradas de NAME_CACHE caducadas en el instante indicado.
+    pub fn prune_names(&mut self, ahora: SystemTime) -> Result<usize> {
+        names::prune(&self.conn, ahora)
+    }
+
+    /// Actualiza la identidad de un dispositivo con las señales de la captura.
+    ///
+    /// Los campos a None conservan el valor anterior, porque las señales llegan
+    /// en momentos distintos (huella DHCP, modelo mDNS/UPnP, User-Agent) y no
+    /// deben pisarse entre sí. Cuando llega una familia de SO nueva se escribe
+    /// también su fuente (`os_source`), que puede quedar a NULL. Los textos se
+    /// recortan y se truncan a los máximos de §3.
+    pub fn set_device_identity(&mut self, device_id: i64, upd: &IdentityUpdate) -> Result<()> {
+        let model = texto_identidad(upd.model.as_deref(), MAX_MODEL);
+        let dhcp_fingerprint = normalizar_texto_opcional(upd.dhcp_fingerprint.as_deref());
+        let dhcp_vendor = texto_identidad(upd.dhcp_vendor.as_deref(), MAX_DHCP_TEXTO);
+        let dhcp_hostname = texto_identidad(upd.dhcp_hostname.as_deref(), MAX_DHCP_TEXTO);
+        let user_agent = texto_identidad(upd.user_agent.as_deref(), MAX_USER_AGENT);
+
+        self.conn.execute(
+            "UPDATE DEVICES SET
+                 model = COALESCE(?1, model),
+                 dhcp_fingerprint = COALESCE(?2, dhcp_fingerprint),
+                 dhcp_vendor = COALESCE(?3, dhcp_vendor),
+                 dhcp_hostname = COALESCE(?4, dhcp_hostname),
+                 user_agent = COALESCE(?5, user_agent),
+                 os_family = CASE WHEN ?6 IS NULL THEN os_family ELSE ?6 END,
+                 os_source = CASE WHEN ?6 IS NULL THEN os_source ELSE ?7 END
+             WHERE id = ?8",
+            params![
+                model,
+                dhcp_fingerprint,
+                dhcp_vendor,
+                dhcp_hostname,
+                user_agent,
+                upd.os_family.map(OsFamily::as_str),
+                upd.os_source.map(OsSource::as_str),
+                device_id
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// Longitud máxima de DEVICES.model (§3).
+const MAX_MODEL: usize = 64;
+/// Longitud máxima de los textos DHCP saneados de DEVICES (§3).
+const MAX_DHCP_TEXTO: usize = 64;
+/// Longitud máxima de DEVICES.user_agent (§3).
+const MAX_USER_AGENT: usize = 256;
+
 /// Marca temporal actual en RFC 3339 UTC con precisión de segundos.
 ///
 /// Es el formato único de la capa de persistencia; lo usan las migraciones y
 /// todas las operaciones que guardan fechas.
 pub(crate) fn ahora_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Convierte un instante a RFC 3339 UTC con precisión de segundos.
+///
+/// Es la conversión inversa de [rfc3339_a_instante]; la usan los DAOs que
+/// manejan fechas tipadas como SystemTime (por ejemplo NAME_CACHE).
+pub(crate) fn instante_a_rfc3339(instante: SystemTime) -> String {
+    let fecha: chrono::DateTime<Utc> = instante.into();
+    fecha.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Convierte una fecha RFC 3339 al instante correspondiente.
+///
+/// Devuelve None si el texto no es una fecha RFC 3339 válida (dato corrupto en
+/// la base de datos); nunca entra en pánico.
+pub(crate) fn rfc3339_a_instante(texto: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(texto)
+        .ok()
+        .map(|fecha| fecha.with_timezone(&Utc).into())
 }
 
 /// Reconstruye una interfaz a partir de una fila de SQL_SELECCION_INTERFAZ.
@@ -564,6 +658,12 @@ fn fila_a_dispositivo(fila: &Row<'_>) -> rusqlite::Result<Device> {
         os_family: fila.get(12)?,
         device_type_manual: fila.get(13)?,
         last_fingerprint: fila.get(14)?,
+        model: fila.get(15)?,
+        dhcp_fingerprint: fila.get(16)?,
+        dhcp_vendor: fila.get(17)?,
+        dhcp_hostname: fila.get(18)?,
+        user_agent: fila.get(19)?,
+        os_source: fila.get(20)?,
     })
 }
 
@@ -575,10 +675,19 @@ fn normalizar_texto_opcional(valor: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Normaliza un texto opcional de identidad y lo trunca a un máximo de
+/// caracteres (no de bytes), como piden las columnas de DEVICES en §3.
+fn texto_identidad(valor: Option<&str>, maximo: usize) -> Option<String> {
+    normalizar_texto_opcional(valor).map(|texto| texto.chars().take(maximo).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::identify::OsSource;
+    use crate::inference::names::NameEntry;
+    use crate::inference::NameSource;
     use rusqlite::params;
     use tempfile::{tempdir, TempDir};
 
@@ -639,7 +748,7 @@ mod tests {
 
         assert!(ruta.exists(), "debe existir el fichero de base de datos");
         assert_eq!(repo.path(), ruta.as_path());
-        assert_eq!(repo.schema_version().expect("leer versión"), 3);
+        assert_eq!(repo.schema_version().expect("leer versión"), 4);
         assert_eq!(repo.count_devices().expect("contar dispositivos"), 0);
     }
 
@@ -649,11 +758,11 @@ mod tests {
         let ruta = directorio.path().join("data.db");
 
         let primera = Repo::init(&ruta).expect("primer init");
-        assert_eq!(primera.schema_version().expect("leer versión"), 3);
+        assert_eq!(primera.schema_version().expect("leer versión"), 4);
         drop(primera);
 
         let segunda = Repo::init(&ruta).expect("segundo init sobre el mismo fichero");
-        assert_eq!(segunda.schema_version().expect("leer versión"), 3);
+        assert_eq!(segunda.schema_version().expect("leer versión"), 4);
     }
 
     #[test]
@@ -668,12 +777,13 @@ mod tests {
                  WHERE type = 'table'
                    AND name IN ('INTERFACES', 'DEVICES', 'DEVICE_EVENTS',
                                  'DEVICE_SERVICES', 'DISCOVERY_SOURCES',
-                                 'SCHEMA_MIGRATIONS', 'TRAFFIC_SNAPSHOT', 'CONNECTIONS')",
+                                 'SCHEMA_MIGRATIONS', 'TRAFFIC_SNAPSHOT',
+                                 'CONNECTIONS', 'NAME_CACHE')",
                 [],
                 |fila| fila.get(0),
             )
             .expect("contar tablas del esquema");
-        assert_eq!(tablas, 8, "deben existir las ocho tablas del esquema");
+        assert_eq!(tablas, 9, "deben existir las nueve tablas del esquema");
 
         let modo: String = repo
             .connection()
@@ -1066,7 +1176,7 @@ mod tests {
 
         // El segundo repositorio se abre con el primero aún vivo (modo WAL).
         let mut segundo = Repo::init(&ruta).expect("segundo repositorio sobre el mismo fichero");
-        assert_eq!(segundo.schema_version().expect("leer versión"), 3);
+        assert_eq!(segundo.schema_version().expect("leer versión"), 4);
         assert_eq!(segundo.list_interfaces().expect("listar").len(), 1);
 
         segundo
@@ -1362,6 +1472,14 @@ mod tests {
             state: Some("ESTABLISHED".to_string()),
             bytes_in: 100,
             bytes_out: 200,
+            client_is_src: Some(true),
+            app_protocol: Some("tls".to_string()),
+            server_name: Some("example.com".to_string()),
+            name_source: Some("sni".to_string()),
+            app: Some("ejemplo".to_string()),
+            category: Some("otros".to_string()),
+            app_source: Some("domain".to_string()),
+            ja4: Some("t13d1516h2_8daaf6152771_02713d6af862".to_string()),
         };
         let id_conexion = repo
             .upsert_connection(&conexion)
@@ -1375,6 +1493,17 @@ mod tests {
         assert_eq!(conexiones[0].protocol, ConnectionProtocol::Tcp);
         assert_eq!(conexiones[0].src_port, Some(40_000));
         assert_eq!(conexiones[0].dst_port, Some(443));
+        assert_eq!(conexiones[0].client_is_src, Some(true));
+        assert_eq!(conexiones[0].app_protocol.as_deref(), Some("tls"));
+        assert_eq!(conexiones[0].server_name.as_deref(), Some("example.com"));
+        assert_eq!(conexiones[0].name_source.as_deref(), Some("sni"));
+        assert_eq!(conexiones[0].app.as_deref(), Some("ejemplo"));
+        assert_eq!(conexiones[0].category.as_deref(), Some("otros"));
+        assert_eq!(conexiones[0].app_source.as_deref(), Some("domain"));
+        assert_eq!(
+            conexiones[0].ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_02713d6af862")
+        );
 
         // El update por 5-tuple conserva el id y first_seen.
         let mut actualizada = conexion.clone();
@@ -1463,5 +1592,181 @@ mod tests {
         let restantes = repo.list_connections(None).expect("listar conexiones");
         assert_eq!(restantes.len(), 1);
         assert_eq!(restantes[0].protocol, ConnectionProtocol::Udp);
+    }
+
+    /// Entrada de la caché de nombres con instantes fijos para las pruebas.
+    fn entrada_nombre(ip: &str, nombre: &str, source: NameSource, ahora: SystemTime) -> NameEntry {
+        NameEntry {
+            ip: ip.parse().expect("IP de prueba"),
+            name: nombre.to_string(),
+            source,
+            first_seen: ahora,
+            last_seen: ahora,
+            expires_at: ahora + Duration::from_secs(3_600),
+            requester: None,
+        }
+    }
+
+    #[test]
+    fn upsert_list_names_y_prune_names_desde_el_repo() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let mut repo = repo_temporal(&directorio);
+
+        let ahora = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let vigente = NameEntry {
+            requester: Some("192.168.1.50".parse().expect("IP de prueba")),
+            ..entrada_nombre("93.184.216.34", "example.com", NameSource::Dns, ahora)
+        };
+        let caducada = NameEntry {
+            expires_at: ahora - Duration::from_secs(1),
+            ..entrada_nombre("10.0.0.2", "viejo.local", NameSource::Sni, ahora)
+        };
+        assert_eq!(
+            repo.upsert_names(&[vigente.clone(), caducada])
+                .expect("persistir caché de nombres"),
+            2
+        );
+
+        // La carga en caliente solo devuelve las vigentes y sin requester.
+        let cargadas = repo.list_names(ahora).expect("listar vigentes");
+        assert_eq!(cargadas.len(), 1);
+        assert_eq!(cargadas[0].ip, vigente.ip);
+        assert_eq!(cargadas[0].name, "example.com");
+        assert_eq!(cargadas[0].source, NameSource::Dns);
+        assert_eq!(cargadas[0].first_seen, ahora);
+        assert!(
+            cargadas[0].requester.is_none(),
+            "el equipo que preguntó no se persiste"
+        );
+
+        // La purga borra la caducada y es idempotente.
+        assert_eq!(repo.prune_names(ahora).expect("purgar caducadas"), 1);
+        assert_eq!(repo.prune_names(ahora).expect("segunda purga"), 0);
+        assert_eq!(repo.list_names(ahora).expect("listar tras purgar").len(), 1);
+        // Pasado el TTL, la vigente también deja de cargarse.
+        assert!(repo
+            .list_names(ahora + Duration::from_secs(3_600))
+            .expect("listar más tarde")
+            .is_empty());
+    }
+
+    #[test]
+    fn set_device_identity_persiste_y_conserva_las_senales_que_no_llegan() {
+        let directorio = tempdir().expect("crear directorio temporal");
+        let (mut repo, id) = repo_con_dispositivo(&directorio);
+
+        let identidad = IdentityUpdate {
+            model: Some("  MacBookPro18,3  ".to_string()),
+            dhcp_fingerprint: Some("1,3,6,15,119,252".to_string()),
+            dhcp_vendor: Some("MSFT 5.0".to_string()),
+            dhcp_hostname: Some("portatil-hx".to_string()),
+            user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()),
+            os_family: Some(OsFamily::Windows),
+            os_source: Some(OsSource::Dhcp),
+        };
+        repo.set_device_identity(id, &identidad)
+            .expect("guardar identidad");
+
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.model.as_deref(), Some("MacBookPro18,3"));
+        assert_eq!(
+            dispositivo.dhcp_fingerprint.as_deref(),
+            Some("1,3,6,15,119,252")
+        );
+        assert_eq!(dispositivo.dhcp_vendor.as_deref(), Some("MSFT 5.0"));
+        assert_eq!(dispositivo.dhcp_hostname.as_deref(), Some("portatil-hx"));
+        assert!(dispositivo
+            .user_agent
+            .as_deref()
+            .expect("user agent")
+            .contains("Windows NT"));
+        assert_eq!(dispositivo.os_family.as_deref(), Some("windows"));
+        assert_eq!(dispositivo.os_source.as_deref(), Some("dhcp"));
+
+        // Una señal aislada (User-Agent) no borra las anteriores.
+        repo.set_device_identity(
+            id,
+            &IdentityUpdate {
+                user_agent: Some("curl/8.5.0".to_string()),
+                ..IdentityUpdate::default()
+            },
+        )
+        .expect("actualizar solo el User-Agent");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.model.as_deref(), Some("MacBookPro18,3"));
+        assert_eq!(dispositivo.dhcp_hostname.as_deref(), Some("portatil-hx"));
+        assert_eq!(dispositivo.user_agent.as_deref(), Some("curl/8.5.0"));
+        assert_eq!(dispositivo.os_family.as_deref(), Some("windows"));
+
+        // Una familia nueva actualiza también la fuente que la justifica.
+        repo.set_device_identity(
+            id,
+            &IdentityUpdate {
+                os_family: Some(OsFamily::MacOs),
+                os_source: Some(OsSource::Model),
+                ..IdentityUpdate::default()
+            },
+        )
+        .expect("cambiar la familia de SO");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.os_family.as_deref(), Some("macos"));
+        assert_eq!(dispositivo.os_source.as_deref(), Some("model"));
+
+        // Sin fuente, una familia nueva deja os_source a NULL.
+        repo.set_device_identity(
+            id,
+            &IdentityUpdate {
+                os_family: Some(OsFamily::Linux),
+                ..IdentityUpdate::default()
+            },
+        )
+        .expect("familia sin fuente");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.os_family.as_deref(), Some("linux"));
+        assert_eq!(dispositivo.os_source, None);
+
+        // Los textos se truncan a los máximos de §3.
+        repo.set_device_identity(
+            id,
+            &IdentityUpdate {
+                model: Some("m".repeat(100)),
+                dhcp_vendor: Some("v".repeat(100)),
+                dhcp_hostname: Some("h".repeat(100)),
+                user_agent: Some("u".repeat(300)),
+                ..IdentityUpdate::default()
+            },
+        )
+        .expect("guardar textos largos");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.model.as_deref().map(str::len), Some(64));
+        assert_eq!(dispositivo.dhcp_vendor.as_deref().map(str::len), Some(64));
+        assert_eq!(dispositivo.dhcp_hostname.as_deref().map(str::len), Some(64));
+        assert_eq!(dispositivo.user_agent.as_deref().map(str::len), Some(256));
+
+        // Una identidad vacía y un id inexistente no fallan ni cambian nada.
+        repo.set_device_identity(id, &IdentityUpdate::default())
+            .expect("identidad vacía");
+        repo.set_device_identity(9_999, &identidad)
+            .expect("id inexistente");
+        let dispositivo = repo
+            .get_device_by_mac(MAC_PRIMERA)
+            .expect("buscar")
+            .expect("existe");
+        assert_eq!(dispositivo.model.as_deref().map(str::len), Some(64));
     }
 }

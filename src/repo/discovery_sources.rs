@@ -1,8 +1,9 @@
 //! DAO de fuentes de descubrimiento (tabla DISCOVERY_SOURCES).
 //!
 //! Registra qué métodos han visto a cada dispositivo: arp, icmp, mdns, ssdp,
-//! dhcp, netbios y portscan. No tiene ciclo de vida propio: se purga con el
-//! dispositivo (FK ON DELETE CASCADE).
+//! dhcp, netbios, portscan y capture (equipos observados en la captura de F4).
+//! No tiene ciclo de vida propio: se purga con el dispositivo (FK ON DELETE
+//! CASCADE). El valor `capture` no necesita cambio de esquema (§3).
 
 use rusqlite::{params, Connection, Row};
 
@@ -25,11 +26,13 @@ pub enum DiscoverySource {
     Netbios,
     /// Port scan TCP CONNECT.
     Portscan,
+    /// Equipo observado en la captura (ARP, DHCP o tramas IPv4, §7.14).
+    Capture,
 }
 
 impl DiscoverySource {
     /// Todas las fuentes, en el orden de la especificación.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Arp,
         Self::Icmp,
         Self::Mdns,
@@ -37,6 +40,7 @@ impl DiscoverySource {
         Self::Dhcp,
         Self::Netbios,
         Self::Portscan,
+        Self::Capture,
     ];
 
     /// Representación persistida.
@@ -49,6 +53,7 @@ impl DiscoverySource {
             Self::Dhcp => "dhcp",
             Self::Netbios => "netbios",
             Self::Portscan => "portscan",
+            Self::Capture => "capture",
         }
     }
 
@@ -69,6 +74,7 @@ impl DiscoverySource {
             Self::Dhcp => "DHCP",
             Self::Netbios => "NetBIOS",
             Self::Portscan => "puertos",
+            Self::Capture => "captura",
         }
     }
 }
@@ -134,12 +140,18 @@ mod tests {
             assert_eq!(DiscoverySource::from_str(fuente.as_str()), Some(fuente));
         }
         assert_eq!(DiscoverySource::from_str("snmp"), None);
-        assert_eq!(DiscoverySource::ALL.len(), 7);
+        assert_eq!(
+            DiscoverySource::from_str("capture"),
+            Some(DiscoverySource::Capture)
+        );
+        assert_eq!(DiscoverySource::ALL.len(), 8);
     }
 
     #[test]
     fn etiquetas_visibles() {
         assert_eq!(DiscoverySource::Mdns.label(), "mDNS");
         assert_eq!(DiscoverySource::Portscan.label(), "puertos");
+        assert_eq!(DiscoverySource::Capture.as_str(), "capture");
+        assert_eq!(DiscoverySource::Capture.label(), "captura");
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "almenara"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Monitor de red en TUI para Linux: descubre y lista los equipos de la red local"
+description = "Monitor de red en TUI para Linux: descubre los equipos de la red local y pone nombre al tráfico (protocolos, apps y top talkers)"
 license = "MIT"
 
 [dependencies]
@@ -14,13 +14,19 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6"
 futures = "0.3"
 hickory-proto = { version = "0.26", features = ["mdns"] }
+hkdf = "0.12"
+maxminddb = "0.26"
 libc = "0.2"
+psl = "2"
 nix = { version = "0.31", features = ["socket", "poll", "net", "fs", "time"] }
 ouidb = { package = "macaddr-ouidb", version = "0.3.1", default-features = false, features = ["std"] }
 pnet = "0.35"
+aes = "0.8"
+aes-gcm = "0.10"
 ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -30,15 +30,31 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "Enter",
-        description: "abrir el detalle del equipo seleccionado (master-detail)",
+        description: "detalle del equipo; en Tráfico, «¿quién lo usa?», proceso o detalle",
     },
     KeyHelp {
         keys: "Tab (detalle)",
         description: "alternar el foco entre la lista y el panel de detalle",
     },
     KeyHelp {
-        keys: "v",
-        description: "cabeceras IP/TCP de la conexión seleccionada (pestaña Conexiones)",
+        keys: "g (Equipos)",
+        description: "alternar la lista plana / agrupada por categoría",
+    },
+    KeyHelp {
+        keys: "g (Tráfico)",
+        description: "agrupar: equipo → destino → app → categoría → protocolo → proceso",
+    },
+    KeyHelp {
+        keys: "w (Tráfico)",
+        description: "ventana: 60 s → 5 min → sesión (no se guarda; arranca en 60 s)",
+    },
+    KeyHelp {
+        keys: "i (Conexiones)",
+        description: "alternar nombres ⇄ IPs (sin persistir)",
+    },
+    KeyHelp {
+        keys: "v (Conexiones)",
+        description: "detalle: cabeceras, rol, fuentes, JA4 y proceso local",
     },
     KeyHelp {
         keys: "s / f (Conexiones)",
@@ -46,11 +62,11 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "/",
-        description: "buscar por IP, MAC, hostname, fabricante o alias",
+        description: "buscar equipos; en Conexiones, por servidor, app o proceso",
     },
     KeyHelp {
         keys: "s",
-        description: "ordenar por columna (cicla ascendente/descendente)",
+        description: "ordenar por columna o, en Tráfico, el ranking (↓, ↑, total, equipos)",
     },
     KeyHelp {
         keys: "f",
@@ -59,10 +75,6 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     KeyHelp {
         keys: "r",
         description: "rescaneo manual",
-    },
-    KeyHelp {
-        keys: "g",
-        description: "alternar la lista plana / agrupada por categoría (pestaña Equipos)",
     },
     KeyHelp {
         keys: "t",
@@ -86,7 +98,7 @@ pub const HELP_ROWS: &[KeyHelp] = &[
     },
     KeyHelp {
         keys: "Esc",
-        description: "cerrar cabeceras, detalle o búsqueda; volver a Equipos",
+        description: "cerrar paneles, detalle o búsqueda; volver a Equipos",
     },
 ];
 
@@ -102,32 +114,48 @@ pub const FOOTER_OTROS: [&str; 2] = [
     "[?]ayuda [q]salir",
 ];
 
-/// Pie de teclas de la pestaña Tráfico (ranking top-10).
+/// Pie de teclas de la pestaña Tráfico (ranking de F4).
 pub const FOOTER_TRAFICO: [&str; 2] = [
-    "[hjkl]mover [Enter]detalle [Tab]pestaña [1-7]atajo",
-    "[?]ayuda [q]salir",
+    "[hjkl]mover [g]agrupar [w]ventana [s]orden [Enter]¿quién?",
+    "[/]buscar [Tab]pestaña [Esc]cerrar [?]ayuda [q]salir",
 ];
 
-/// Pie de teclas de la pestaña Conexiones (tabla plana).
+/// Pie de teclas con el panel «¿Quién lo usa?» abierto.
+pub const FOOTER_TRAFICO_PANEL: [&str; 2] = [
+    "[hjkl]mover panel [Enter]detalle [Esc]cerrar panel",
+    "[g]agrupar [w]ventana [?]ayuda [q]salir",
+];
+
+/// Pie de teclas de la pestaña Conexiones (tabla plana de F4).
 pub const FOOTER_CONEXIONES: [&str; 2] = [
-    "[hjkl]mover [v]cabeceras [s]orden [f]filtro",
-    "[Tab/Shift-Tab]pestañas [Esc]cerrar [1-7]atajo [?]ayuda",
+    "[hjkl]mover [i]nombres/IPs [v]detalle [s]orden [f]filtro",
+    "[/]buscar [Tab]pestañas [Esc]cerrar [1-7]atajo [?]ayuda",
 ];
 
 /// Pie de teclas del panel de detalle master-detail.
 pub const FOOTER_DETALLE: [&str; 2] = [
     "[hjkl]mover [Tab]panel [Esc]cerrar detalle",
-    "[?]ayuda [q]salir",
+    "[j/k]desplazar [v]conexión [?]ayuda [q]salir",
 ];
 
-/// Pie de teclas que corresponde a una pestaña (y al detalle abierto).
-pub fn footer_para(tab: crate::tui::app::Tab, detalle_abierto: bool) -> &'static [&'static str; 2] {
+/// Pie de teclas que corresponde a una pestaña (y al detalle o panel abiertos).
+pub fn footer_para(
+    tab: crate::tui::app::Tab,
+    detalle_abierto: bool,
+    quien_abierto: bool,
+) -> &'static [&'static str; 2] {
     if detalle_abierto {
         return &FOOTER_DETALLE;
     }
     match tab {
         crate::tui::app::Tab::Equipos => &FOOTER_EQUIPOS,
-        crate::tui::app::Tab::Trafico => &FOOTER_TRAFICO,
+        crate::tui::app::Tab::Trafico => {
+            if quien_abierto {
+                &FOOTER_TRAFICO_PANEL
+            } else {
+                &FOOTER_TRAFICO
+            }
+        }
         crate::tui::app::Tab::Conexiones => &FOOTER_CONEXIONES,
         _ => &FOOTER_OTROS,
     }
@@ -141,7 +169,7 @@ mod tests {
     fn hay_un_atajo_para_cada_accion_requerida() {
         let claves: Vec<&str> = HELP_ROWS.iter().map(|fila| fila.keys).collect();
         for requerida in [
-            "Tab", "1-7", "/", "s", "f", "r", "g", "t", "?", "q", "Esc", "Enter", "v",
+            "Tab", "1-7", "/", "s", "f", "r", "g", "t", "?", "q", "Esc", "Enter", "v", "w", "i",
         ] {
             assert!(
                 claves.iter().any(|clave| clave.contains(requerida)),
@@ -150,7 +178,12 @@ mod tests {
         }
         assert!(FOOTER_EQUIPOS.iter().any(|linea| linea.contains("rescan")));
         assert!(FOOTER_OTROS.iter().any(|linea| linea.contains("pestañas")));
-        for footer in [FOOTER_TRAFICO, FOOTER_CONEXIONES, FOOTER_DETALLE] {
+        for footer in [
+            FOOTER_TRAFICO,
+            FOOTER_TRAFICO_PANEL,
+            FOOTER_CONEXIONES,
+            FOOTER_DETALLE,
+        ] {
             assert!(
                 footer.iter().any(|linea| linea.contains("[?]ayuda")),
                 "los pies deben recordar la ayuda"
@@ -158,7 +191,13 @@ mod tests {
         }
         assert!(FOOTER_CONEXIONES
             .iter()
-            .any(|linea| linea.contains("[v]cabeceras")));
+            .any(|linea| linea.contains("[v]detalle")));
+        assert!(FOOTER_TRAFICO
+            .iter()
+            .any(|linea| linea.contains("[g]agrupar")));
+        assert!(FOOTER_TRAFICO
+            .iter()
+            .any(|linea| linea.contains("[w]ventana")));
     }
 
     #[test]
@@ -167,6 +206,7 @@ mod tests {
             .iter()
             .chain(FOOTER_OTROS.iter())
             .chain(FOOTER_TRAFICO.iter())
+            .chain(FOOTER_TRAFICO_PANEL.iter())
             .chain(FOOTER_CONEXIONES.iter())
             .chain(FOOTER_DETALLE.iter());
         for linea in todos {

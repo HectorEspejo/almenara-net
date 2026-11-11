@@ -23,20 +23,23 @@ pub mod afpacket;
 pub mod aggregate;
 pub mod bpf;
 pub mod conntrack;
-pub mod dns;
 pub mod parser;
 pub mod process;
-pub mod sni;
 pub mod windows;
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::config::CaptureConfig;
+use crate::config::{CaptureConfig, InferenceConfig};
 use crate::error::{Error, Result};
+use crate::identify::observed::{ObservedFilter, ObservedHosts};
+use crate::identify::CaptureIdentityStore;
+use crate::inference::role::ListenSet;
+use crate::inference::{Evidence, FlowInspector, InferenceCounters, ObservedHost, ObservedSource};
 
 /// Tamaño total del anillo TPACKET_V3 por interfaz: 64 MB.
 pub const RING_BYTES: usize = 64 * 1024 * 1024;
@@ -299,10 +302,6 @@ pub struct PacketMeta {
     pub tcp_flags: Option<TcpFlags>,
     /// Copia de cabeceras (IP + transporte) para el panel de la tecla v.
     pub headers: Option<HeaderSnapshot>,
-    /// QNAME de una consulta DNS (solo si la atribución está activa).
-    pub dns_qname: Option<String>,
-    /// SNI de un ClientHello TLS (solo si la atribución está activa).
-    pub sni: Option<String>,
 }
 
 impl PacketMeta {
@@ -325,6 +324,75 @@ impl PacketMeta {
     pub fn is_ipv6(&self) -> bool {
         matches!(self.dst_ip, IpAddr::V6(_))
     }
+}
+
+/// Información de una trama ARP (EtherType 0x0806).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArpInfo {
+    /// Código de operación (1 = petición, 2 = respuesta).
+    pub opcode: u16,
+    /// MAC del emisor.
+    pub sender_mac: [u8; 6],
+    /// IP del emisor.
+    pub sender_ip: Ipv4Addr,
+    /// MAC del destinatario (cero en una petición).
+    pub target_mac: [u8; 6],
+    /// IP del destinatario.
+    pub target_ip: Ipv4Addr,
+}
+
+impl ArpInfo {
+    /// Trama ARP de petición o respuesta (se ignoran RARP y otras).
+    pub fn es_peticion_o_respuesta(&self) -> bool {
+        self.opcode == 1 || self.opcode == 2
+    }
+}
+
+/// Trama IPv4/IPv6 parseada, con la localización del payload en la trama.
+///
+/// El rango `payload` apunta dentro de la trama original: el hilo de captura lo
+/// pasa al FlowInspector y lo descarta inmediatamente después.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedIpFrame {
+    /// Metadatos del paquete (sin payload).
+    pub meta: PacketMeta,
+    /// Rango del payload de transporte dentro de la trama.
+    pub payload: std::ops::Range<usize>,
+    /// MAC de origen Ethernet.
+    pub src_mac: [u8; 6],
+    /// MAC de destino Ethernet.
+    pub dst_mac: [u8; 6],
+}
+
+impl ParsedIpFrame {
+    /// Devuelve el payload de transporte dentro de la trama capturada.
+    pub fn payload<'a>(&self, frame: &'a [u8]) -> &'a [u8] {
+        let inicio = self.payload.start.min(frame.len());
+        let fin = self.payload.end.min(frame.len());
+        &frame[inicio..fin]
+    }
+}
+
+/// Trama ARP parseada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedArpFrame {
+    /// Información ARP.
+    pub arp: ArpInfo,
+    /// MAC de origen Ethernet.
+    pub src_mac: [u8; 6],
+    /// MAC de destino Ethernet.
+    pub dst_mac: [u8; 6],
+}
+
+/// Resultado de parsear una trama Ethernet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedFrame {
+    /// Trama IPv4 o IPv6.
+    Ip(ParsedIpFrame),
+    /// Trama ARP.
+    Arp(ParsedArpFrame),
+    /// Trama de un EtherType no soportado: se descarta en silencio.
+    Ignorada(String),
 }
 
 /// Indica si una IP es de difusión o multidifusión.
@@ -396,6 +464,8 @@ pub struct CaptureStats {
     pub drops: u64,
     /// Paquetes con cabecera mal formada o truncada.
     pub parse_errors: u64,
+    /// Contadores del motor de inferencia (Fase 4).
+    pub inference: InferenceCounters,
 }
 
 /// Configuración del anillo TPACKET_V3.
@@ -433,6 +503,12 @@ pub struct CaptureInterface {
     pub name: String,
     /// IPv4 principal de la interfaz, si tiene.
     pub ipv4: Option<Ipv4Addr>,
+    /// MAC de la interfaz, si tiene.
+    pub mac: Option<String>,
+    /// Máscara de red IPv4, si tiene.
+    pub netmask: Option<Ipv4Addr>,
+    /// Puerto de enlace por defecto asociado, si lo hay.
+    pub gateway: Option<Ipv4Addr>,
 }
 
 impl CaptureInterface {
@@ -441,12 +517,39 @@ impl CaptureInterface {
         Self {
             name: name.into(),
             ipv4,
+            mac: None,
+            netmask: None,
+            gateway: None,
+        }
+    }
+
+    /// Construye la interfaz de captura con todos sus datos de red.
+    pub fn with_details(
+        name: impl Into<String>,
+        ipv4: Option<Ipv4Addr>,
+        mac: Option<String>,
+        netmask: Option<Ipv4Addr>,
+        gateway: Option<Ipv4Addr>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ipv4,
+            mac,
+            netmask,
+            gateway,
         }
     }
 
     /// IP local de la interfaz como IpAddr, si existe.
     pub fn ip(&self) -> Option<IpAddr> {
         self.ipv4.map(IpAddr::V4)
+    }
+
+    /// Subred local como (red, máscara), si se conocen IP y máscara.
+    pub fn red_local(&self) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        let ip = self.ipv4?;
+        let mascara = self.netmask?;
+        Some((Ipv4Addr::from(u32::from(ip) & u32::from(mascara)), mascara))
     }
 }
 
@@ -457,6 +560,10 @@ struct SharedStats {
     drops: AtomicU64,
     parse_errors: AtomicU64,
     limit_drops: AtomicU64,
+    inference_errors: AtomicU64,
+    reassembly_drops: AtomicU64,
+    quic_errors: AtomicU64,
+    labelled_flows: AtomicU64,
     pps: Vec<Arc<AtomicU64>>,
 }
 
@@ -467,10 +574,26 @@ impl SharedStats {
             drops: AtomicU64::new(0),
             parse_errors: AtomicU64::new(0),
             limit_drops: AtomicU64::new(0),
+            inference_errors: AtomicU64::new(0),
+            reassembly_drops: AtomicU64::new(0),
+            quic_errors: AtomicU64::new(0),
+            labelled_flows: AtomicU64::new(0),
             pps: (0..interfaces)
                 .map(|_| Arc::new(AtomicU64::new(0)))
                 .collect(),
         })
+    }
+
+    /// Suma los contadores de inferencia de un hilo.
+    fn acumular_inferencia(&self, total: &InferenceCounters) {
+        self.inference_errors
+            .fetch_add(total.inference_errors, Ordering::Relaxed);
+        self.reassembly_drops
+            .fetch_add(total.reassembly_drops, Ordering::Relaxed);
+        self.quic_errors
+            .fetch_add(total.quic_errors, Ordering::Relaxed);
+        self.labelled_flows
+            .fetch_add(total.labelled_flows, Ordering::Relaxed);
     }
 
     fn pps_total(&self) -> u64 {
@@ -518,35 +641,111 @@ impl PpsLimiter {
     }
 }
 
+/// Configuración de la inspección de la Fase 4 para los hilos de captura.
+///
+/// Los hilos comparten el conjunto de puertos en escucha (rol cliente/servidor),
+/// el almacén de identidad DHCP y el buffer de equipos observados con la tarea
+/// de tráfico y con el ciclo de escaneo.
+pub struct CaptureInference {
+    /// Configuración de `[inference]`.
+    pub config: InferenceConfig,
+    /// IPs propias del host (para el rol y la atribución de proceso).
+    pub local_ips: HashSet<IpAddr>,
+    /// Sockets en LISTEN del host, actualizados por la tarea de tráfico.
+    pub listening: Arc<RwLock<ListenSet>>,
+    /// Identidad capturada (DHCP y User-Agent) para el ciclo de escaneo.
+    pub identity: Arc<Mutex<CaptureIdentityStore>>,
+    /// Equipos observados en la captura (fuente L2 de F4).
+    pub observed: Arc<Mutex<ObservedHosts>>,
+    /// Filtro de equipos observados.
+    pub observed_filter: ObservedFilter,
+}
+
+impl CaptureInference {
+    /// Crea la configuración de inspección con los almacenes compartidos.
+    pub fn new(
+        config: InferenceConfig,
+        local_ips: HashSet<IpAddr>,
+        listening: Arc<RwLock<ListenSet>>,
+        identity: Arc<Mutex<CaptureIdentityStore>>,
+        observed: Arc<Mutex<ObservedHosts>>,
+        observed_filter: ObservedFilter,
+    ) -> Self {
+        Self {
+            config,
+            local_ips,
+            listening,
+            identity,
+            observed,
+            observed_filter,
+        }
+    }
+}
+
+/// Lote de paquetes y evidencias que viaja del hilo de captura al agregador.
+#[derive(Debug, Default)]
+pub struct CaptureBatch {
+    /// Paquetes capturados (sin payload).
+    pub packets: Vec<PacketMeta>,
+    /// Evidencias extraídas por el FlowInspector de la interfaz.
+    pub evidence: Vec<Evidence>,
+}
+
+/// Resultado de drenar los hilos de captura.
+#[derive(Debug, Default)]
+pub struct CaptureDrain {
+    /// Paquetes capturados desde la última llamada.
+    pub packets: Vec<PacketMeta>,
+    /// Evidencias extraídas desde la última llamada.
+    pub evidence: Vec<Evidence>,
+}
+
+/// Formatea una MAC de 6 bytes como `aa:bb:cc:dd:ee:ff`.
+pub fn formatear_mac(bytes: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
+}
+
 /// Estado de un hilo de captura (un socket por interfaz).
 struct HiloCaptura {
     socket: afpacket::AfPacketSocket,
     parser: parser::Parser,
-    tx: SyncSender<Vec<PacketMeta>>,
+    tx: SyncSender<CaptureBatch>,
     shared: Arc<SharedStats>,
     limitador: Arc<PpsLimiter>,
     parar: Arc<AtomicBool>,
     pps: Arc<AtomicU64>,
+    inspector: FlowInspector,
+    identity: Arc<Mutex<CaptureIdentityStore>>,
+    observed: Arc<Mutex<ObservedHosts>>,
+    observed_filter: ObservedFilter,
+    observados_vistos: HashSet<(String, Ipv4Addr)>,
+    contadores_previos: InferenceCounters,
 }
 
 /// Envía un lote al consumidor; si la cola está llena se descartan los paquetes.
-fn enviar_lote(tx: &SyncSender<Vec<PacketMeta>>, datos: Vec<PacketMeta>, shared: &SharedStats) {
-    let cantidad = datos.len() as u64;
-    match tx.try_send(datos) {
+fn enviar_lote(tx: &SyncSender<CaptureBatch>, lote: CaptureBatch, shared: &SharedStats) {
+    let cantidad = lote.packets.len() as u64;
+    match tx.try_send(lote) {
         Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            shared.drops.fetch_add(cantidad, Ordering::Relaxed);
-        }
-        Err(TrySendError::Disconnected(_)) => {
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
             shared.drops.fetch_add(cantidad, Ordering::Relaxed);
         }
     }
 }
 
 impl HiloCaptura {
-    /// Bucle del hilo: poll del anillo, parseo, límite de pps y lotes.
+    /// Bucle del hilo: poll del anillo, parseo, inspección, límite de pps y lotes.
+    ///
+    /// El payload solo vive dentro de `parse_frame`/`inspect`: al hilo del
+    /// agregador solo viajan los metadatos y las evidencias derivadas.
     fn ejecutar(mut self) {
-        let mut lote: Vec<PacketMeta> = Vec::with_capacity(BATCH_SIZE);
+        let mut lote = CaptureBatch {
+            packets: Vec::with_capacity(BATCH_SIZE),
+            evidence: Vec::new(),
+        };
         let mut inicio_segundo = Instant::now();
         let mut paquetes_segundo = 0u64;
         let Self {
@@ -557,6 +756,12 @@ impl HiloCaptura {
             limitador,
             parar,
             pps,
+            inspector,
+            identity,
+            observed,
+            observed_filter,
+            observados_vistos,
+            contadores_previos,
         } = &mut self;
 
         while !parar.load(Ordering::Relaxed) {
@@ -567,25 +772,95 @@ impl HiloCaptura {
                     shared.limit_drops.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                match parser.parse(trama) {
-                    Ok(meta) => lote.push(meta),
+                let ahora = Instant::now();
+                match parser.parse_frame(trama) {
+                    Ok(ParsedFrame::Ip(paquete)) => {
+                        let payload = paquete.payload(trama);
+                        let evidencias = inspector.inspect(&paquete.meta, payload, ahora);
+                        procesar_evidencias(
+                            evidencias,
+                            identity,
+                            observed,
+                            observed_filter,
+                            observados_vistos,
+                            &mut lote.evidence,
+                        );
+                        // Equipo observado por una trama IPv4 de la subred local.
+                        if let IpAddr::V4(ip) = paquete.meta.src_ip {
+                            observar_equipo(
+                                paquete.src_mac,
+                                ip,
+                                ObservedSource::Frame,
+                                None,
+                                observed,
+                                observed_filter,
+                                observados_vistos,
+                            );
+                        }
+                        lote.packets.push(paquete.meta);
+                    }
+                    Ok(ParsedFrame::Arp(marco)) => {
+                        if marco.arp.es_peticion_o_respuesta() {
+                            observar_equipo(
+                                marco.arp.sender_mac,
+                                marco.arp.sender_ip,
+                                ObservedSource::Arp,
+                                None,
+                                observed,
+                                observed_filter,
+                                observados_vistos,
+                            );
+                        }
+                    }
+                    Ok(ParsedFrame::Ignorada(_)) => {}
                     Err(error) => {
                         if !error.ignorable {
                             shared.parse_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
-                if lote.len() >= BATCH_SIZE {
-                    let datos = std::mem::replace(&mut lote, Vec::with_capacity(BATCH_SIZE));
+                if lote.packets.len() >= BATCH_SIZE {
+                    let datos = std::mem::replace(
+                        &mut lote,
+                        CaptureBatch {
+                            packets: Vec::with_capacity(BATCH_SIZE),
+                            evidence: Vec::new(),
+                        },
+                    );
                     enviar_lote(tx, datos, shared);
                 }
             });
 
-            if !lote.is_empty() {
-                let datos = std::mem::take(&mut lote);
+            if !lote.packets.is_empty() || !lote.evidence.is_empty() {
+                let datos = std::mem::replace(
+                    &mut lote,
+                    CaptureBatch {
+                        packets: Vec::with_capacity(BATCH_SIZE),
+                        evidence: Vec::new(),
+                    },
+                );
                 enviar_lote(tx, datos, shared);
-                lote = Vec::with_capacity(BATCH_SIZE);
             }
+
+            // Temporizadores de los reensamblados y contadores de inferencia.
+            inspector.tick(Instant::now());
+            let totales = inspector.counters();
+            let incremento = InferenceCounters {
+                reassembly_drops: totales
+                    .reassembly_drops
+                    .saturating_sub(contadores_previos.reassembly_drops),
+                inference_errors: totales
+                    .inference_errors
+                    .saturating_sub(contadores_previos.inference_errors),
+                quic_errors: totales
+                    .quic_errors
+                    .saturating_sub(contadores_previos.quic_errors),
+                labelled_flows: totales
+                    .labelled_flows
+                    .saturating_sub(contadores_previos.labelled_flows),
+            };
+            *contadores_previos = totales;
+            shared.acumular_inferencia(&incremento);
 
             match resultado {
                 Ok(salida) => {
@@ -605,18 +880,92 @@ impl HiloCaptura {
             }
         }
 
-        if !lote.is_empty() {
-            let datos = std::mem::take(&mut lote);
-            enviar_lote(tx, datos, shared);
+        if !lote.packets.is_empty() || !lote.evidence.is_empty() {
+            enviar_lote(tx, lote, shared);
         }
         pps.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Enruta las evidencias: las de equipo/identidad van a los almacenes
+/// compartidos y el resto al agregador.
+fn procesar_evidencias(
+    evidencias: Vec<Evidence>,
+    identity: &Arc<Mutex<CaptureIdentityStore>>,
+    observed: &Arc<Mutex<ObservedHosts>>,
+    observed_filter: &ObservedFilter,
+    observados_vistos: &mut HashSet<(String, Ipv4Addr)>,
+    destino: &mut Vec<Evidence>,
+) {
+    for evidencia in evidencias {
+        match evidencia {
+            Evidence::Host(equipo) => {
+                if observados_vistos.insert((equipo.mac.clone(), equipo.ip)) {
+                    if let Ok(mut almacen) = observed.lock() {
+                        almacen.push(equipo);
+                    }
+                } else if let Ok(mut almacen) = observed.lock() {
+                    // Deduplicación por MAC + IP en el propio buffer.
+                    almacen.push(equipo);
+                }
+            }
+            Evidence::Dhcp(identidad) => {
+                if let Ok(mut almacen) = identity.lock() {
+                    almacen.record_dhcp(identidad);
+                }
+            }
+            Evidence::Flow(flujo) => {
+                // El User-Agent de HTTP en claro identifica al equipo cliente.
+                if let (Some(ua), Some(ip)) = (flujo.user_agent.clone(), flujo.client_ip) {
+                    if let Ok(mut almacen) = identity.lock() {
+                        almacen.record_user_agent(ip, ua);
+                    }
+                }
+                destino.push(Evidence::Flow(flujo));
+            }
+            otra => destino.push(otra),
+        }
+    }
+    let _ = observed_filter;
+}
+
+/// Registra un equipo observado si el filtro lo acepta (con dedup local barata).
+fn observar_equipo(
+    mac: [u8; 6],
+    ip: Ipv4Addr,
+    origen: ObservedSource,
+    dhcp: Option<crate::inference::DhcpObservation>,
+    observed: &Arc<Mutex<ObservedHosts>>,
+    filtro: &ObservedFilter,
+    vistos: &mut HashSet<(String, Ipv4Addr)>,
+) {
+    if ip.is_unspecified() || ip.is_broadcast() {
+        return;
+    }
+    let equipo = ObservedHost {
+        mac: formatear_mac(mac),
+        ip,
+        source: origen,
+        dhcp,
+    };
+    if !filtro.accepts(&equipo) {
+        return;
+    }
+    if !vistos.insert((equipo.mac.clone(), equipo.ip)) && origen != ObservedSource::Arp {
+        return;
+    }
+    if vistos.len() > 8192 {
+        vistos.clear();
+    }
+    if let Ok(mut almacen) = observed.lock() {
+        almacen.push(equipo);
     }
 }
 
 /// Captura de tráfico en vivo sobre una o varias interfaces.
 #[derive(Debug)]
 pub struct Capture {
-    receivers: Vec<Receiver<Vec<PacketMeta>>>,
+    receivers: Vec<Receiver<CaptureBatch>>,
     shared: Arc<SharedStats>,
     parar: Arc<AtomicBool>,
     handles: Vec<std::thread::JoinHandle<()>>,
@@ -631,7 +980,11 @@ impl Capture {
     /// Si el filtro BPF no compila se registra un aviso y se captura sin filtro
     /// (el error queda disponible en [Capture::bpf_error]). Si no hay permisos
     /// suficientes (CAP_NET_RAW) devuelve un error claro.
-    pub fn start(config: &CaptureConfig, interfaces: Vec<CaptureInterface>) -> Result<Self> {
+    pub fn start(
+        config: &CaptureConfig,
+        interfaces: Vec<CaptureInterface>,
+        inferencia: CaptureInference,
+    ) -> Result<Self> {
         if !config.enabled {
             return Err(Error::Capture(
                 "la captura está deshabilitada en la configuración".to_string(),
@@ -663,11 +1016,9 @@ impl Capture {
             },
         };
 
-        let parser = parser::Parser::new(parser::ParserOptions {
-            inspect_payload: config.inspect_payload,
-            dns_attribution: config.dns_attribution,
-            sni_attribution: config.sni_attribution,
-        });
+        // Fase 4: toda la extracción la hace el FlowInspector del hilo de
+        // captura; el parser solo decodifica cabeceras y localiza el payload.
+        let parser = parser::Parser::new();
         let anillo = RingConfig::default();
         let shared = SharedStats::new(interfaces.len());
         let limitador = Arc::new(PpsLimiter::new(config.max_pps));
@@ -683,7 +1034,7 @@ impl Capture {
                         interfaz.name
                     ))
                 })?;
-            let (tx, rx) = sync_channel::<Vec<PacketMeta>>(BATCH_CAPACITY);
+            let (tx, rx) = sync_channel::<CaptureBatch>(BATCH_CAPACITY);
             let hilo = HiloCaptura {
                 socket,
                 parser,
@@ -692,6 +1043,16 @@ impl Capture {
                 limitador: Arc::clone(&limitador),
                 parar: Arc::clone(&parar),
                 pps: Arc::clone(&shared.pps[indice]),
+                inspector: FlowInspector::new(
+                    &inferencia.config,
+                    inferencia.local_ips.clone(),
+                    Arc::clone(&inferencia.listening),
+                ),
+                identity: Arc::clone(&inferencia.identity),
+                observed: Arc::clone(&inferencia.observed),
+                observed_filter: inferencia.observed_filter.clone(),
+                observados_vistos: HashSet::new(),
+                contadores_previos: InferenceCounters::default(),
             };
             let nombre = format!("almenara-captura-{}", interfaz.name);
             let handle = std::thread::Builder::new()
@@ -715,15 +1076,16 @@ impl Capture {
         })
     }
 
-    /// Paquetes capturados desde la última llamada.
-    pub fn drain(&self) -> Vec<PacketMeta> {
-        let mut paquetes = Vec::new();
+    /// Paquetes y evidencias capturados desde la última llamada.
+    pub fn drain(&self) -> CaptureDrain {
+        let mut drenado = CaptureDrain::default();
         for receptor in &self.receivers {
             while let Ok(lote) = receptor.try_recv() {
-                paquetes.extend(lote);
+                drenado.packets.extend(lote.packets);
+                drenado.evidence.extend(lote.evidence);
             }
         }
-        paquetes
+        drenado
     }
 
     /// Contadores actuales de la captura.
@@ -733,6 +1095,12 @@ impl Capture {
             total: self.shared.total.load(Ordering::Relaxed),
             drops: self.shared.drops.load(Ordering::Relaxed),
             parse_errors: self.shared.parse_errors.load(Ordering::Relaxed),
+            inference: InferenceCounters {
+                reassembly_drops: self.shared.reassembly_drops.load(Ordering::Relaxed),
+                inference_errors: self.shared.inference_errors.load(Ordering::Relaxed),
+                quic_errors: self.shared.quic_errors.load(Ordering::Relaxed),
+                labelled_flows: self.shared.labelled_flows.load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -794,8 +1162,6 @@ mod tests {
             len: 60,
             tcp_flags: None,
             headers: None,
-            dns_qname: None,
-            sni: None,
         }
     }
 
@@ -898,6 +1264,95 @@ mod tests {
         let sin_ip = CaptureInterface::new("wlan0", None);
         assert_eq!(sin_ip.ip(), None);
     }
+
+    #[test]
+    fn parse_frame_localiza_el_payload_y_las_macs() {
+        // Ethernet + IPv4 + TCP sin payload: 14 + 20 + 20.
+        let mut trama = Vec::new();
+        trama.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        trama.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        trama.extend_from_slice(&0x0800u16.to_be_bytes());
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&40u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&[192, 168, 1, 10]);
+        ip[16..20].copy_from_slice(&[192, 168, 1, 20]);
+        trama.extend_from_slice(&ip);
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 5 << 4;
+        trama.extend_from_slice(&tcp);
+        trama.extend_from_slice(b"HOLA");
+        // Ajustamos la longitud total IP a 20 + 20 + 4.
+        let total = 44u16.to_be_bytes();
+        trama[16..18].copy_from_slice(&total);
+
+        let parser = parser::Parser::with_defaults();
+        match parser.parse_frame(&trama).expect("trama parseable") {
+            ParsedFrame::Ip(paquete) => {
+                assert_eq!(paquete.meta.dst_port, Some(443));
+                assert_eq!(formatear_mac(paquete.src_mac), "02:00:00:00:00:01");
+                assert_eq!(paquete.payload(&trama), b"HOLA");
+            }
+            otro => panic!("esperaba una trama IP: {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_reconoce_arp() {
+        let mut trama = Vec::new();
+        trama.extend_from_slice(&[0xff; 6]); // destino broadcast
+        trama.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        trama.extend_from_slice(&0x0806u16.to_be_bytes());
+        trama.extend_from_slice(&1u16.to_be_bytes()); // Ethernet
+        trama.extend_from_slice(&0x0800u16.to_be_bytes()); // IPv4
+        trama.push(6); // hlen
+        trama.push(4); // plen
+        trama.extend_from_slice(&1u16.to_be_bytes()); // petición
+        trama.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        trama.extend_from_slice(&[192, 168, 1, 50]);
+        trama.extend_from_slice(&[0x00; 6]);
+        trama.extend_from_slice(&[192, 168, 1, 1]);
+
+        let parser = parser::Parser::with_defaults();
+        match parser.parse_frame(&trama).expect("ARP parseable") {
+            ParsedFrame::Arp(marco) => {
+                assert_eq!(marco.arp.opcode, 1);
+                assert_eq!(marco.arp.sender_ip, Ipv4Addr::new(192, 168, 1, 50));
+                assert_eq!(marco.arp.target_ip, Ipv4Addr::new(192, 168, 1, 1));
+                assert!(marco.arp.es_peticion_o_respuesta());
+            }
+            otro => panic!("esperaba una trama ARP: {otro:?}"),
+        }
+        // El parser clásico sigue ignorando el ARP sin contarlo como error.
+        let error = parser.parse(&trama).expect_err("el ARP no es una conexión");
+        assert!(error.ignorable);
+    }
+
+    #[test]
+    fn red_local_se_deriva_de_ip_y_mascara() {
+        let interfaz = CaptureInterface::with_details(
+            "eth0",
+            Some(Ipv4Addr::new(192, 168, 1, 10)),
+            Some("02:00:00:00:00:01".to_string()),
+            Some(Ipv4Addr::new(255, 255, 255, 0)),
+            Some(Ipv4Addr::new(192, 168, 1, 1)),
+        );
+        assert_eq!(
+            interfaz.red_local(),
+            Some((
+                Ipv4Addr::new(192, 168, 1, 0),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ))
+        );
+        assert_eq!(
+            formatear_mac([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            "aa:bb:cc:dd:ee:ff"
+        );
+    }
 }
 
 /// Replay condicional de un fichero pcap capturado como fixture.
@@ -949,7 +1404,7 @@ mod replay_pcap {
             .collect();
         assert_eq!(metas[0].protocol, super::Protocol::Tcp);
         assert_eq!(metas[0].dst_port, Some(443));
-        assert_eq!(metas[3].dns_qname.as_deref(), Some("example.com"));
+        assert_eq!(metas[3].protocol, super::Protocol::Udp);
         assert!(metas[4].is_ipv6());
 
         // El filtro BPF clásico discrimina el tráfico TCP del puerto 443.

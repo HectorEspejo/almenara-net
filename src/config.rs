@@ -67,6 +67,8 @@ pub struct Config {
     pub storage: StorageConfig,
     /// Parámetros de interfaz.
     pub ui: UiConfig,
+    /// Parámetros del motor de inferencia (Fase 4).
+    pub inference: InferenceConfig,
 }
 
 /// Sección [scan] de la configuración.
@@ -133,14 +135,18 @@ pub struct CaptureConfig {
     pub enabled: bool,
     /// Expresión de filtro BPF clásico; vacía = sin filtro.
     pub filter: String,
-    /// Inspecciona el payload para extraer DNS/SNI. Nunca se persiste ni se copia.
-    pub inspect_payload: bool,
     /// Límite de paquetes por segundo (0 = sin límite).
     pub max_pps: u64,
-    /// Extrae el QNAME de las consultas DNS del puerto 53.
-    pub dns_attribution: bool,
-    /// Extrae el SNI de los ClientHello TLS del puerto 443.
-    pub sni_attribution: bool,
+    /// Clave obsoleta de F3: se ignora con un aviso único (la inferencia se
+    /// controla con `[inference].enabled`). `None` si no aparece en el fichero.
+    #[serde(default, skip_serializing)]
+    pub inspect_payload: Option<bool>,
+    /// Clave obsoleta de F3: se ignora con un aviso único.
+    #[serde(default, skip_serializing)]
+    pub dns_attribution: Option<bool>,
+    /// Clave obsoleta de F3: se ignora con un aviso único.
+    #[serde(default, skip_serializing)]
+    pub sni_attribution: Option<bool>,
 }
 
 impl Default for CaptureConfig {
@@ -148,10 +154,10 @@ impl Default for CaptureConfig {
         Self {
             enabled: true,
             filter: String::new(),
-            inspect_payload: false,
             max_pps: 0,
-            dns_attribution: true,
-            sni_attribution: true,
+            inspect_payload: None,
+            dns_attribution: None,
+            sni_attribution: None,
         }
     }
 }
@@ -185,6 +191,8 @@ pub struct UiConfig {
     pub no_color: bool,
     /// Vista de la lista de equipos: plana o agrupada por categoría.
     pub list_view: ListView,
+    /// Agrupación del ranking de la pestaña Tráfico (Fase 4).
+    pub traffic_group: TrafficGroup,
 }
 
 impl Default for UiConfig {
@@ -193,6 +201,7 @@ impl Default for UiConfig {
             theme: "default".to_string(),
             no_color: false,
             list_view: ListView::Flat,
+            traffic_group: TrafficGroup::Device,
         }
     }
 }
@@ -232,6 +241,133 @@ impl ListView {
             Self::Flat => "plana",
             Self::Grouped => "agrupada",
         }
+    }
+}
+
+/// Sección [inference] de la configuración (Fase 4).
+///
+/// La inferencia lee cabeceras DNS/TLS/HTTP/QUIC y los primeros bytes de cada
+/// flujo para poner nombre al tráfico. El payload nunca se persiste. Con
+/// `enabled = false` solo quedan etiquetas por servicio de F2, ASN, puerto y
+/// proceso.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InferenceConfig {
+    /// Activa el motor de inferencia por defecto (ADR-37).
+    pub enabled: bool,
+    /// Ruta del fichero `apps.toml` del usuario (admite ~). `None` usa la ruta
+    /// por defecto `~/.config/almenara/apps.toml`.
+    pub apps_file: Option<String>,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            apps_file: None,
+        }
+    }
+}
+
+impl InferenceConfig {
+    /// Ruta efectiva del `apps.toml` del usuario, expandiendo la virgulilla.
+    ///
+    /// Devuelve `None` si la ruta configurada no es válida (se avisa en la carga).
+    pub fn apps_file_path(&self) -> Option<PathBuf> {
+        match &self.apps_file {
+            Some(ruta) => expand_tilde(ruta).ok(),
+            None => Some(config_dir().join(APP_NAME).join("apps.toml")),
+        }
+    }
+
+    /// Avisos de validación de la sección `[inference]`.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if let Some(ruta) = &self.apps_file {
+            if expand_tilde(ruta).is_err() {
+                avisos.push(format!(
+                    "inference.apps_file no es una ruta válida (\"{ruta}\"); se ignora el fichero de apps propias"
+                ));
+            }
+        }
+        avisos
+    }
+}
+
+/// Agrupación del ranking de la pestaña Tráfico (Fase 4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrafficGroup {
+    /// Rankin por equipo (comportamiento de Fase 3).
+    #[default]
+    Device,
+    /// Ranking por destino (dominio registrable, IP o equipo de la LAN).
+    Destination,
+    /// Ranking por app del catálogo.
+    App,
+    /// Ranking por categoría.
+    Category,
+    /// Ranking por protocolo de aplicación.
+    Protocol,
+    /// Ranking por proceso local del propio equipo.
+    Process,
+}
+
+#[allow(dead_code)]
+impl TrafficGroup {
+    /// Ciclo de agrupaciones de `g` en la pestaña Tráfico.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Device => Self::Destination,
+            Self::Destination => Self::App,
+            Self::App => Self::Category,
+            Self::Category => Self::Protocol,
+            Self::Protocol => Self::Process,
+            Self::Process => Self::Device,
+        }
+    }
+
+    /// Etiqueta visible de la agrupación.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Device => "equipo",
+            Self::Destination => "destino",
+            Self::App => "app",
+            Self::Category => "categoría",
+            Self::Protocol => "protocolo",
+            Self::Process => "proceso",
+        }
+    }
+
+    /// Representación persistida en `[ui].traffic_group`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Destination => "destination",
+            Self::App => "app",
+            Self::Category => "category",
+            Self::Protocol => "protocol",
+            Self::Process => "process",
+        }
+    }
+
+    /// Reconstruye la agrupación desde su representación persistida.
+    pub fn from_str(valor: &str) -> Option<Self> {
+        match valor.trim().to_ascii_lowercase().as_str() {
+            "device" | "equipo" => Some(Self::Device),
+            "destination" | "destino" => Some(Self::Destination),
+            "app" => Some(Self::App),
+            "category" | "categoria" | "categoría" => Some(Self::Category),
+            "protocol" | "protocolo" => Some(Self::Protocol),
+            "process" | "proceso" => Some(Self::Process),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TrafficGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -331,7 +467,11 @@ impl Config {
     pub fn load_or_default(path: Option<&Path>) -> (Self, Vec<String>) {
         match Self::load(path) {
             Ok(config) => {
-                let (config, avisos) = config.descartar_lease_paths_inexistentes();
+                let (mut config, mut avisos) = config.descartar_lease_paths_inexistentes();
+                avisos.extend(config.warnings());
+                // Las claves obsoletas de F3 se avisan una sola vez y se
+                // descartan: la inferencia se rige por [inference].enabled.
+                config.limpiar_claves_obsoletas();
                 (config, avisos)
             }
             Err(err) => (
@@ -341,6 +481,36 @@ impl Config {
                 )],
             ),
         }
+    }
+
+    /// Descarta las claves obsoletas de F3 ya avisadas.
+    fn limpiar_claves_obsoletas(&mut self) {
+        self.capture.inspect_payload = None;
+        self.capture.dns_attribution = None;
+        self.capture.sni_attribution = None;
+    }
+
+    /// Avisos de claves obsoletas y de secciones nuevas que no impiden arrancar.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        let obsoletas: &[(&str, &Option<bool>)] = &[
+            ("inspect_payload", &self.capture.inspect_payload),
+            ("dns_attribution", &self.capture.dns_attribution),
+            ("sni_attribution", &self.capture.sni_attribution),
+        ];
+        let presentes: Vec<&str> = obsoletas
+            .iter()
+            .filter(|(_, valor)| valor.is_some())
+            .map(|(nombre, _)| *nombre)
+            .collect();
+        if !presentes.is_empty() {
+            avisos.push(format!(
+                "Las claves [capture] {} ya no se usan: la inferencia se controla con [inference].enabled",
+                presentes.join(", ")
+            ));
+        }
+        avisos.extend(self.inference.warnings());
+        avisos
     }
 
     /// Descarta las rutas manuales de leases que no existen y devuelve avisos.
@@ -478,7 +648,7 @@ impl Config {
             })?;
         }
         let contenido = format!(
-            "# Configuración de Almenara (Fase 3)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n{}",
+            "# Configuración de Almenara (Fase 4)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n{}",
             self.to_toml()
         );
         std::fs::write(path, contenido)
@@ -512,7 +682,7 @@ fn write_default_file(path: &Path) -> Result<()> {
         })?;
     }
     let mut content = String::from(
-        "# Configuración de Almenara (Fase 3)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n",
+        "# Configuración de Almenara (Fase 4)\n# Los comentarios se pierden si la aplicación reescribe el fichero.\n\n",
     );
     content.push_str(&Config::default().to_toml());
     std::fs::write(path, content)
@@ -590,10 +760,10 @@ mod tests {
         assert_eq!(config.ui.list_view, ListView::Flat);
         assert!(config.capture.enabled);
         assert_eq!(config.capture.filter, "");
-        assert!(!config.capture.inspect_payload);
+        assert_eq!(config.capture.inspect_payload, None);
         assert_eq!(config.capture.max_pps, 0);
-        assert!(config.capture.dns_attribution);
-        assert!(config.capture.sni_attribution);
+        assert_eq!(config.capture.dns_attribution, None);
+        assert_eq!(config.capture.sni_attribution, None);
         assert!(!config.capture.has_filter());
         assert_eq!(config.capture.filter_label(), "(ninguno)");
         assert!(config.validate().is_ok());
@@ -748,10 +918,15 @@ no_color = true
         assert!(toml.contains("[capture]"));
         assert!(toml.contains("[storage]"));
         assert!(toml.contains("[ui]"));
-        assert!(toml.contains("inspect_payload = false"));
+        assert!(
+            !toml.contains("inspect_payload"),
+            "clave obsoleta fuera de la plantilla"
+        );
         assert!(toml.contains("max_pps = 0"));
-        assert!(toml.contains("dns_attribution = true"));
-        assert!(toml.contains("sni_attribution = true"));
+        assert!(!toml.contains("dns_attribution"));
+        assert!(!toml.contains("sni_attribution"));
+        assert!(toml.contains("[inference]"));
+        assert!(toml.contains("traffic_group = \"device\""));
         assert!(toml.contains("passive_only = false"));
         assert!(toml.contains("top_ports"));
         assert!(toml.contains("dhcp_lease_paths"));
@@ -878,10 +1053,10 @@ sni_attribution = false
         config.validate().expect("configuración válida");
         assert!(!config.capture.enabled);
         assert_eq!(config.capture.filter, "not port 22");
-        assert!(config.capture.inspect_payload);
+        assert_eq!(config.capture.inspect_payload, Some(true));
         assert_eq!(config.capture.max_pps, 5000);
-        assert!(!config.capture.dns_attribution);
-        assert!(!config.capture.sni_attribution);
+        assert_eq!(config.capture.dns_attribution, Some(false));
+        assert_eq!(config.capture.sni_attribution, Some(false));
         assert!(config.capture.has_filter());
         assert_eq!(config.capture.filter_label(), "not port 22");
     }
@@ -904,11 +1079,80 @@ sni_attribution = false
         let mut config = Config::default();
         config.capture.enabled = false;
         config.capture.filter = "tcp and port 443".to_string();
-        config.capture.inspect_payload = true;
         config.capture.max_pps = 1000;
         config.save(&path).expect("guardar configuración");
         let recargada = Config::load(Some(&path)).expect("recargar configuración");
         assert_eq!(recargada, config);
         assert_eq!(recargada.capture.filter_label(), "tcp and port 443");
+    }
+
+    #[test]
+    fn claves_obsoletas_de_fase_3_avisan_una_vez_y_se_ignoran() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[capture]\ninspect_payload = true\ndns_attribution = false\nsni_attribution = true\n\n[inference]\nenabled = false\n",
+        )
+        .unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert!(!config.inference.enabled, "manda [inference].enabled");
+        assert_eq!(config.capture.inspect_payload, None);
+        assert_eq!(config.capture.dns_attribution, None);
+        assert_eq!(config.capture.sni_attribution, None);
+        let obsoletas: Vec<&String> = avisos
+            .iter()
+            .filter(|aviso| aviso.contains("[inference].enabled"))
+            .collect();
+        assert_eq!(obsoletas.len(), 1, "un único aviso: {avisos:?}");
+        assert!(obsoletas[0].contains("inspect_payload"));
+        assert!(obsoletas[0].contains("dns_attribution"));
+        assert!(obsoletas[0].contains("sni_attribution"));
+    }
+
+    #[test]
+    fn traffic_group_invalido_usa_device_con_aviso() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\ntraffic_group = \"cuadricula\"\n").unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert_eq!(config.ui.traffic_group, TrafficGroup::Device);
+        assert_eq!(avisos.len(), 1);
+        assert!(avisos[0].contains("Configuración no válida"));
+    }
+
+    #[test]
+    fn inference_invalida_usa_defaults_con_aviso() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[inference]\nenabled = \"sí\"\n").unwrap();
+        let (config, avisos) = Config::load_or_default(Some(&path));
+        assert!(config.inference.enabled);
+        assert_eq!(avisos.len(), 1);
+        assert!(avisos[0].contains("Configuración no válida"));
+    }
+
+    #[test]
+    fn defaults_de_inference_y_traffic_group() {
+        let config = Config::default();
+        assert!(config.inference.enabled);
+        assert_eq!(config.inference.apps_file, None);
+        assert_eq!(config.ui.traffic_group, TrafficGroup::Device);
+        assert_eq!(TrafficGroup::Device.cycle(), TrafficGroup::Destination);
+        assert_eq!(TrafficGroup::from_str("app"), Some(TrafficGroup::App));
+        let ruta = config
+            .inference
+            .apps_file_path()
+            .expect("ruta de apps por defecto");
+        assert!(ruta.ends_with("apps.toml"));
+    }
+
+    #[test]
+    fn apps_file_invalido_avisa() {
+        let mut config = Config::default();
+        config.inference.apps_file = Some("~otro/apps.toml".to_string());
+        let avisos = config.warnings();
+        assert_eq!(avisos.len(), 1);
+        assert!(avisos[0].contains("apps_file"));
     }
 }

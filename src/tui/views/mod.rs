@@ -90,6 +90,7 @@ fn draw_input_line(frame: &mut Frame, app: &App, area: Rect) {
     };
     let etiqueta = match input.mode {
         InputMode::Search => "Buscar: ".to_string(),
+        InputMode::ConnectionSearch => "Buscar conexiones: ".to_string(),
         InputMode::Alias => {
             let ip = app
                 .devices
@@ -109,10 +110,9 @@ fn draw_input_line(frame: &mut Frame, app: &App, area: Rect) {
             format!("Notas de {ip}: ")
         }
     };
-    let ayuda = if input.mode == InputMode::Search {
-        "  [Enter] confirmar  [Esc] cancelar"
-    } else {
-        "  [Enter] guardar  [Esc] cancelar"
+    let ayuda = match input.mode {
+        InputMode::Search | InputMode::ConnectionSearch => "  [Enter] confirmar  [Esc] cancelar",
+        InputMode::Alias | InputMode::Notes => "  [Enter] guardar  [Esc] cancelar",
     };
     let linea = Line::from(vec![
         Span::styled(etiqueta, app.theme.accent),
@@ -212,7 +212,7 @@ fn draw_status_capture(frame: &mut Frame, app: &App, area: Rect) {
         || app.traffic.connections_total > 0;
     let global = if hay_datos {
         format!(
-            "↓ {}/s · ↑ {}/s · {} conexiones",
+            "↓ {} · ↑ {} · {} conexiones",
             formatear_bytes_por_segundo(entrada),
             formatear_bytes_por_segundo(salida),
             app.traffic.connections_total
@@ -282,7 +282,7 @@ fn etiqueta_fuente(fuente: &str) -> &str {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let atajos = crate::tui::keys::footer_para(app.tab, app.detail_open());
+    let atajos = crate::tui::keys::footer_para(app.tab, app.detail_open(), app.who_uses_open());
     let lineas: Vec<Line> = atajos
         .iter()
         .map(|linea| Line::from(Span::styled(*linea, app.theme.dim)))
@@ -334,8 +334,9 @@ mod tests {
     use crate::capabilities::Capabilities;
     use crate::capture::aggregate::DeviceTraffic;
     use crate::config::Config;
+    use crate::rankings::{Dimension, RankRow, Window};
     use crate::repo::devices::Device;
-    use crate::traffic::CaptureStatus;
+    use crate::traffic::{CaptureStatus, RankingView};
     use crate::tui::app::Tab;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -371,6 +372,12 @@ mod tests {
             os_family: None,
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 
@@ -498,6 +505,17 @@ mod tests {
     }
 
     #[test]
+    fn barra_muestra_el_estado_de_la_inferencia() {
+        let mut app = app_con_trafico();
+        app.traffic.capture.inference_enabled = true;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("inferencia: activa"));
+        app.traffic.capture.inference_enabled = false;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("inferencia: desactivada"));
+    }
+
+    #[test]
     fn barra_estrecha_muestra_captura_y_visibilidad_sin_fuentes() {
         let mut app = app_con_trafico();
         let texto = dibujar(&mut app, 80, 24);
@@ -558,10 +576,33 @@ mod tests {
         let mut app = app_con_trafico();
         app.tab = Tab::Conexiones;
         let texto = dibujar(&mut app, 120, 30);
-        assert!(texto.contains("[v]cabeceras"));
+        assert!(texto.contains("[i]nombres/IPs"));
+        assert!(texto.contains("[v]detalle"));
         app.tab = Tab::Trafico;
         let texto = dibujar(&mut app, 120, 30);
-        assert!(texto.contains("[Enter]detalle"));
+        assert!(texto.contains("[g]agrupar"));
+        assert!(texto.contains("[Enter]¿quién?"));
+        // Con el panel «¿Quién lo usa?» abierto el pie cambia.
+        app.traffic_group = Dimension::App;
+        app.traffic.rankings = vec![RankingView {
+            dimension: Dimension::App,
+            window: Window::Sixty,
+            rows: vec![RankRow {
+                key: "youtube".to_string(),
+                label: "YouTube".to_string(),
+                subtitle: Some("Vídeo".to_string()),
+                device_id: None,
+                bytes_down: 900,
+                bytes_up: 10,
+                devices: 1,
+                connections: 2,
+                series_60s: [0; 60],
+            }],
+        }];
+        app.open_who_uses();
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("[Esc]cerrar panel"));
+        app.close_who_uses();
         app.tab = Tab::Equipos;
         app.open_detail(1, Vec::new(), false);
         let texto = dibujar(&mut app, 120, 30);
@@ -573,8 +614,9 @@ mod tests {
         let mut app = app_con_trafico();
         app.tab = Tab::Trafico;
         let texto = dibujar(&mut app, 120, 30);
-        assert!(texto.contains("ranking en vivo"));
+        assert!(texto.contains("ranking por equipo"));
         assert!(texto.contains("sparkline 60 s"));
+        assert!(texto.contains("sin identificar:"));
     }
 
     #[test]

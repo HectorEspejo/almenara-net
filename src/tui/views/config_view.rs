@@ -39,6 +39,55 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
     ];
 
+    // Inferencia, catálogo y bases IP (Fase 4).
+    lineas.push(Line::from(Span::styled(
+        "Inferencia y datos (F4)",
+        app.theme.accent,
+    )));
+    let inferencia = if app.config.inference.enabled {
+        "activa"
+    } else {
+        "desactivada"
+    };
+    let apps_file = app
+        .config
+        .inference
+        .apps_file_path()
+        .map(|ruta| ruta.display().to_string())
+        .unwrap_or_else(|| "(ruta no válida)".to_string());
+    lineas.push(Line::from(vec![
+        Span::styled("  [inference] ", app.theme.accent),
+        Span::styled(format!("enabled = {inferencia}"), app.theme.normal),
+        Span::styled(format!(" · apps_file: {apps_file}"), app.theme.dim),
+    ]));
+    let catalogo = app.catalog_counts;
+    lineas.push(Line::from(vec![
+        Span::styled("  Catálogo de apps: ", app.theme.accent),
+        Span::styled(
+            format!(
+                "{} embebidas · {} propias · {} avisos",
+                catalogo.embedded_apps, catalogo.user_apps, catalogo.warnings
+            ),
+            app.theme.normal,
+        ),
+    ]));
+    let bases = app
+        .ipdb_date
+        .clone()
+        .map(|fecha| format!("DB-IP Lite {fecha}"))
+        .unwrap_or_else(|| "no disponibles".to_string());
+    lineas.push(Line::from(vec![
+        Span::styled("  Bases IP: ", app.theme.accent),
+        Span::styled(bases, app.theme.normal),
+    ]));
+    if !app.config.inference.enabled {
+        lineas.push(Line::from(Span::styled(
+            "  La inferencia está desactivada: solo hay etiquetas por servicio de F2, ASN, puerto y proceso.",
+            app.theme.warning,
+        )));
+    }
+    lineas.push(Line::from(""));
+
     // Fingerprint de SO por dispositivo (solo lectura): el detalle completo se
     // abre con Enter en la pestaña Equipos (panel master-detail de Fase 3).
     lineas.push(Line::from(Span::styled(
@@ -116,6 +165,12 @@ mod tests {
             os_family: os_family.map(str::to_string),
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 
@@ -165,5 +220,85 @@ mod tests {
         let app = app_prueba(Vec::new());
         let contenido = texto(&app, 110, 60);
         assert!(contenido.contains("todavía no hay equipos"));
+    }
+}
+
+#[cfg(test)]
+mod tests_f4 {
+    use crate::capabilities::Capabilities;
+    use crate::config::Config;
+    use crate::inference::catalog::CatalogCounts;
+    use crate::tui::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn app_prueba(inference: bool) -> App {
+        let mut config = Config::default();
+        config.inference.enabled = inference;
+        let mut app = App::new(
+            config,
+            PathBuf::from("/tmp/config.toml"),
+            PathBuf::from("/tmp/data.db"),
+            Capabilities {
+                raw_sockets: true,
+                detail: "CAP_NET_RAW detectada".to_string(),
+            },
+            None,
+        );
+        app.catalog_counts = CatalogCounts {
+            embedded_apps: 162,
+            user_apps: 2,
+            warnings: 1,
+        };
+        app.ipdb_date = Some("2026-11".to_string());
+        app
+    }
+
+    fn texto(app: &App, ancho: u16, alto: u16) -> String {
+        let backend = TestBackend::new(ancho, alto);
+        let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
+        terminal
+            .draw(|frame| super::draw(frame, app, frame.area()))
+            .expect("dibujado de Config");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn config_muestra_inferencia_catalogo_y_bases_ip() {
+        let app = app_prueba(true);
+        let contenido = texto(&app, 160, 60);
+        assert!(contenido.contains("Inferencia y datos (F4)"));
+        assert!(contenido.contains("[inference]"));
+        assert!(contenido.contains("enabled = activa"));
+        assert!(contenido.contains("apps_file:"));
+        assert!(contenido.contains("162 embebidas · 2 propias · 1 avisos"));
+        assert!(contenido.contains("DB-IP Lite 2026-11"));
+        // La plantilla TOML sigue mostrando la sección [inference].
+        assert!(contenido.contains("[inference]"));
+    }
+
+    #[test]
+    fn config_avisa_cuando_la_inferencia_esta_desactivada() {
+        let app = app_prueba(false);
+        let contenido = texto(&app, 160, 60);
+        assert!(contenido.contains("enabled = desactivada"));
+        assert!(contenido.contains("La inferencia está desactivada"));
+        assert!(contenido.contains("servicio de F2"));
+    }
+
+    #[test]
+    fn config_sin_fecha_de_bases_ip_avisa() {
+        let mut app = app_prueba(true);
+        app.ipdb_date = None;
+        let contenido = texto(&app, 160, 60);
+        assert!(contenido.contains("Bases IP:"));
+        assert!(contenido.contains("no disponibles"));
     }
 }

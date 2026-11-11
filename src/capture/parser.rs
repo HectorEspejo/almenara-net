@@ -14,8 +14,10 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
-use super::{dns, sni};
-use super::{HeaderSnapshot, PacketMeta, Protocol, TcpFlags};
+use super::{
+    ArpInfo, HeaderSnapshot, PacketMeta, ParsedArpFrame, ParsedFrame, ParsedIpFrame, Protocol,
+    TcpFlags,
+};
 
 /// Longitud de la cabecera Ethernet (sin VLAN).
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -27,6 +29,10 @@ const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_IPV6: u16 = 0x86DD;
 /// EtherType de VLAN 802.1Q.
 const ETHERTYPE_VLAN: u16 = 0x8100;
+/// EtherType de ARP.
+const ETHERTYPE_ARP: u16 = 0x0806;
+/// Longitud mínima de una trama ARP para Ethernet/IPv4.
+const ARP_MIN_LEN: usize = 28;
 
 /// Número de protocolo IP de ICMP.
 const IPPROTO_ICMP: u8 = 1;
@@ -55,86 +61,73 @@ const IP_RAW_LEN: usize = 40;
 const TRANSPORT_RAW_LEN: usize = 20;
 /// Máscara de los 9 bits de flags TCP (NS + los ocho clásicos).
 const MASCARA_FLAGS_TCP: u16 = 0x01FF;
-/// Puerto DNS.
-const PUERTO_DNS: u16 = 53;
-/// Puerto TLS/HTTPS.
-const PUERTO_TLS: u16 = 443;
 
-/// Opciones del parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParserOptions {
-    /// Fuerza la extracción de DNS/SNI aunque las atribuciones estén apagadas.
-    pub inspect_payload: bool,
-    /// Extrae el QNAME de las consultas DNS (puerto 53).
-    pub dns_attribution: bool,
-    /// Extrae el SNI de los ClientHello TLS (puerto 443).
-    pub sni_attribution: bool,
-}
-
-impl Default for ParserOptions {
-    fn default() -> Self {
-        Self {
-            inspect_payload: false,
-            dns_attribution: true,
-            sni_attribution: true,
-        }
-    }
-}
-
-/// Parser de tramas Ethernet.
-#[derive(Debug, Clone, Copy)]
-pub struct Parser {
-    options: ParserOptions,
-}
+/// Parser de tramas Ethernet (sin estado propio).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Parser;
 
 impl Parser {
-    /// Crea el parser con las opciones indicadas.
-    pub fn new(options: ParserOptions) -> Self {
-        Self { options }
+    /// Crea un parser de tramas.
+    pub fn new() -> Self {
+        Self
     }
 
-    /// Crea el parser con las opciones por defecto (sin inspeccionar payload,
-    /// con atribución DNS y SNI activa).
+    /// Constructor por defecto (equivalente a [Parser::new]).
     pub fn with_defaults() -> Self {
-        Self::new(ParserOptions::default())
+        Self
     }
 
-    /// Parsea una trama Ethernet completa.
+    /// Parsea una trama Ethernet completa y devuelve solo los metadatos.
     ///
     /// Devuelve [ParseError] con `ignorable = true` para las tramas que se
     /// descartan en silencio (EtherType no soportado, IP no IPv4/IPv6, fragmento
-    /// no inicial) y con `ignorable = false` para las mal formadas o truncadas.
+    /// no inicial, ARP) y con `ignorable = false` para las mal formadas o truncadas.
     pub fn parse(&self, frame: &[u8]) -> Result<PacketMeta, ParseError> {
-        if frame.len() < ETHERNET_HEADER_LEN {
-            return Err(ParseError::malformada(format!(
-                "trama truncada: cabecera Ethernet incompleta ({} bytes)",
-                frame.len()
-            )));
+        match self.parse_frame(frame)? {
+            ParsedFrame::Ip(ip) => Ok(ip.meta),
+            ParsedFrame::Arp(_) => Err(ParseError::ignorable(
+                "trama ARP: se procesa como equipo observado, no como conexión".to_string(),
+            )),
+            ParsedFrame::Ignorada(mensaje) => Err(ParseError::ignorable(mensaje)),
         }
-        let mut ethertype = leer_u16(frame, 12);
-        let mut offset = ETHERNET_HEADER_LEN;
-        if ethertype == ETHERTYPE_VLAN {
-            if frame.len() < offset + VLAN_TAG_LEN {
-                return Err(ParseError::malformada(format!(
-                    "trama truncada: etiqueta VLAN incompleta ({} bytes)",
-                    frame.len()
-                )));
-            }
-            // Se ignora el TCI (prioridad y VLAN id) y se sigue con el EtherType interior.
-            ethertype = leer_u16(frame, offset + 2);
-            offset += VLAN_TAG_LEN;
-        }
+    }
+
+    /// Parsea una trama Ethernet completa y localiza su payload.
+    ///
+    /// A diferencia de [Parser::parse], distingue las tramas ARP y devuelve el
+    /// rango del payload dentro de la trama original para que el FlowInspector
+    /// lo inspeccione en el hilo de captura. Ninguna copia del payload sale del
+    /// hilo: el rango caduca con la trama.
+    pub fn parse_frame(&self, frame: &[u8]) -> Result<ParsedFrame, ParseError> {
+        let (src_mac, dst_mac, ethertype, offset) = leer_cabecera_ethernet(frame)?;
         match ethertype {
-            ETHERTYPE_IPV4 => self.parse_ipv4(frame, offset),
-            ETHERTYPE_IPV6 => self.parse_ipv6(frame, offset),
-            otro => Err(ParseError::ignorable(format!(
+            ETHERTYPE_IPV4 => self
+                .parse_ipv4(frame, offset, src_mac, dst_mac)
+                .map(ParsedFrame::Ip),
+            ETHERTYPE_IPV6 => self
+                .parse_ipv6(frame, offset, src_mac, dst_mac)
+                .map(ParsedFrame::Ip),
+            ETHERTYPE_ARP => parse_arp(frame, offset).map(|arp| {
+                ParsedFrame::Arp(ParsedArpFrame {
+                    arp,
+                    src_mac,
+                    dst_mac,
+                })
+            }),
+            otro => Ok(ParsedFrame::Ignorada(format!(
                 "EtherType 0x{otro:04X} no soportado: se descarta"
             ))),
         }
     }
 
     /// Parsea un paquete IPv4 que empieza en `offset`.
-    fn parse_ipv4(&self, frame: &[u8], offset: usize) -> Result<PacketMeta, ParseError> {
+    fn parse_ipv4(
+        &self,
+        frame: &[u8],
+        offset: usize,
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+    ) -> Result<ParsedIpFrame, ParseError> {
         if frame.len() < offset + IPV4_MIN_HEADER_LEN {
             return Err(ParseError::malformada(format!(
                 "paquete IPv4 truncado: cabecera incompleta ({} bytes)",
@@ -209,24 +202,33 @@ impl Parser {
         headers.ip_raw[..copia].copy_from_slice(&frame[offset..offset + copia]);
         headers.ip_raw_len = copia as u8;
         transporte.volcar(&mut headers);
-        let (dns_qname, sni) = self.atribuir_payload(frame, &transporte);
-        Ok(PacketMeta {
-            timestamp: Instant::now(),
-            src_ip,
-            dst_ip,
-            src_port: transporte.src_port,
-            dst_port: transporte.dst_port,
-            protocol: transporte.protocol,
-            len: total_len as u32,
-            tcp_flags: transporte.tcp_flags,
-            headers: Some(headers),
-            dns_qname,
-            sni,
+        let payload = transporte.payload_start..transporte.payload_end;
+        Ok(ParsedIpFrame {
+            meta: PacketMeta {
+                timestamp: Instant::now(),
+                src_ip,
+                dst_ip,
+                src_port: transporte.src_port,
+                dst_port: transporte.dst_port,
+                protocol: transporte.protocol,
+                len: total_len as u32,
+                tcp_flags: transporte.tcp_flags,
+                headers: Some(headers),
+            },
+            payload,
+            src_mac,
+            dst_mac,
         })
     }
 
     /// Parsea un paquete IPv6 que empieza en `offset`.
-    fn parse_ipv6(&self, frame: &[u8], offset: usize) -> Result<PacketMeta, ParseError> {
+    fn parse_ipv6(
+        &self,
+        frame: &[u8],
+        offset: usize,
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+    ) -> Result<ParsedIpFrame, ParseError> {
         if frame.len() < offset + IPV6_HEADER_LEN {
             return Err(ParseError::malformada(format!(
                 "paquete IPv6 truncado: cabecera incompleta ({} bytes)",
@@ -274,19 +276,22 @@ impl Parser {
             .copy_from_slice(&frame[offset..offset + IPV6_HEADER_LEN]);
         headers.ip_raw_len = IPV6_HEADER_LEN as u8;
         transporte.volcar(&mut headers);
-        let (dns_qname, sni) = self.atribuir_payload(frame, &transporte);
-        Ok(PacketMeta {
-            timestamp: Instant::now(),
-            src_ip,
-            dst_ip,
-            src_port: transporte.src_port,
-            dst_port: transporte.dst_port,
-            protocol: transporte.protocol,
-            len: total_len as u32,
-            tcp_flags: transporte.tcp_flags,
-            headers: Some(headers),
-            dns_qname,
-            sni,
+        let payload = transporte.payload_start..transporte.payload_end;
+        Ok(ParsedIpFrame {
+            meta: PacketMeta {
+                timestamp: Instant::now(),
+                src_ip,
+                dst_ip,
+                src_port: transporte.src_port,
+                dst_port: transporte.dst_port,
+                protocol: transporte.protocol,
+                len: total_len as u32,
+                tcp_flags: transporte.tcp_flags,
+                headers: Some(headers),
+            },
+            payload,
+            src_mac,
+            dst_mac,
         })
     }
 
@@ -362,47 +367,6 @@ impl Parser {
             }
             Protocol::Other => Ok(Self::transporte_otro(start, len)),
         }
-    }
-
-    /// Extrae el QNAME de DNS y/o el SNI de TLS del payload, sin copiarlo.
-    ///
-    /// El slice de payload solo vive dentro de esta función. Solo se examina si
-    /// el paquete es TCP/UDP y el puerto es 53 (DNS) o 443 (TLS) y la opción
-    /// correspondiente está activa.
-    fn atribuir_payload(
-        &self,
-        frame: &[u8],
-        transporte: &TransportInfo,
-    ) -> (Option<String>, Option<String>) {
-        let es_tcp = transporte.protocol == Protocol::Tcp;
-        let es_udp = transporte.protocol == Protocol::Udp;
-        if !(es_tcp || es_udp) {
-            return (None, None);
-        }
-        let inicio = transporte.payload_start;
-        let fin = transporte.payload_end;
-        if fin < inicio || fin > frame.len() {
-            return (None, None);
-        }
-        let payload = &frame[inicio..fin];
-        let puerto_dns =
-            transporte.src_port == Some(PUERTO_DNS) || transporte.dst_port == Some(PUERTO_DNS);
-        let mut dns_qname = None;
-        if puerto_dns && (self.options.inspect_payload || self.options.dns_attribution) {
-            if es_udp {
-                dns_qname = dns::extract(payload).map(|info| info.qname);
-            } else if payload.len() >= 2 {
-                // DNS sobre TCP antepone una longitud de 2 bytes al mensaje.
-                dns_qname = dns::extract(&payload[2..]).map(|info| info.qname);
-            }
-        }
-        let mut sni = None;
-        let puerto_tls =
-            transporte.src_port == Some(PUERTO_TLS) || transporte.dst_port == Some(PUERTO_TLS);
-        if es_tcp && puerto_tls && (self.options.inspect_payload || self.options.sni_attribution) {
-            sni = sni::extract(payload);
-        }
-        (dns_qname, sni)
     }
 
     /// Cabecera TCP: puertos, seq/ack, flags 9 bits y payload.
@@ -530,12 +494,6 @@ impl Parser {
     }
 }
 
-impl Default for Parser {
-    fn default() -> Self {
-        Self::with_defaults()
-    }
-}
-
 /// Atajo que parsea con las opciones por defecto.
 ///
 /// Forma parte de la API del contrato; la captura crea su propio [Parser] para
@@ -627,6 +585,76 @@ fn leer_u16(frame: &[u8], pos: usize) -> u16 {
 /// Lee un entero de 32 bits en orden de red.
 fn leer_u32(frame: &[u8], pos: usize) -> u32 {
     u32::from_be_bytes([frame[pos], frame[pos + 1], frame[pos + 2], frame[pos + 3]])
+}
+
+/// Lee la cabecera Ethernet (con VLAN opcional): MACs, EtherType y offset.
+fn leer_cabecera_ethernet(frame: &[u8]) -> Result<([u8; 6], [u8; 6], u16, usize), ParseError> {
+    if frame.len() < ETHERNET_HEADER_LEN {
+        return Err(ParseError::malformada(format!(
+            "trama truncada: cabecera Ethernet incompleta ({} bytes)",
+            frame.len()
+        )));
+    }
+    let mut dst_mac = [0u8; 6];
+    let mut src_mac = [0u8; 6];
+    dst_mac.copy_from_slice(&frame[0..6]);
+    src_mac.copy_from_slice(&frame[6..12]);
+    let mut ethertype = leer_u16(frame, 12);
+    let mut offset = ETHERNET_HEADER_LEN;
+    if ethertype == ETHERTYPE_VLAN {
+        if frame.len() < offset + VLAN_TAG_LEN {
+            return Err(ParseError::malformada(format!(
+                "trama truncada: etiqueta VLAN incompleta ({} bytes)",
+                frame.len()
+            )));
+        }
+        ethertype = leer_u16(frame, offset + 2);
+        offset += VLAN_TAG_LEN;
+    }
+    Ok((src_mac, dst_mac, ethertype, offset))
+}
+
+/// Parsea una trama ARP para Ethernet/IPv4 (petición o respuesta).
+fn parse_arp(frame: &[u8], offset: usize) -> Result<ArpInfo, ParseError> {
+    if frame.len() < offset + ARP_MIN_LEN {
+        return Err(ParseError::malformada(format!(
+            "trama ARP truncada: {} bytes disponibles de {ARP_MIN_LEN} mínimos",
+            frame.len().saturating_sub(offset)
+        )));
+    }
+    let hardware = leer_u16(frame, offset);
+    let protocolo = leer_u16(frame, offset + 2);
+    let hlen = frame[offset + 4];
+    let plen = frame[offset + 5];
+    if hardware != 1 || protocolo != ETHERTYPE_IPV4 || hlen != 6 || plen != 4 {
+        return Err(ParseError::ignorable(format!(
+            "trama ARP de hardware/protocolo no soportado (htype={hardware}, ptype=0x{protocolo:04X})"
+        )));
+    }
+    let opcode = leer_u16(frame, offset + 6);
+    let mut sender_mac = [0u8; 6];
+    sender_mac.copy_from_slice(&frame[offset + 8..offset + 14]);
+    let sender_ip = Ipv4Addr::new(
+        frame[offset + 14],
+        frame[offset + 15],
+        frame[offset + 16],
+        frame[offset + 17],
+    );
+    let mut target_mac = [0u8; 6];
+    target_mac.copy_from_slice(&frame[offset + 18..offset + 24]);
+    let target_ip = Ipv4Addr::new(
+        frame[offset + 24],
+        frame[offset + 25],
+        frame[offset + 26],
+        frame[offset + 27],
+    );
+    Ok(ArpInfo {
+        opcode,
+        sender_mac,
+        sender_ip,
+        target_mac,
+        target_ip,
+    })
 }
 
 #[cfg(test)]
@@ -784,52 +812,6 @@ mod tests {
         trama
     }
 
-    fn consulta_dns(nombre: &str) -> Vec<u8> {
-        let mut mensaje = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        for etiqueta in nombre.split('.') {
-            mensaje.push(etiqueta.len() as u8);
-            mensaje.extend_from_slice(etiqueta.as_bytes());
-        }
-        mensaje.push(0);
-        mensaje.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
-        mensaje.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
-        mensaje
-    }
-
-    fn client_hello_con_sni(nombre: &str) -> Vec<u8> {
-        let mut entrada = vec![0x00];
-        entrada.extend_from_slice(&(nombre.len() as u16).to_be_bytes());
-        entrada.extend_from_slice(nombre.as_bytes());
-        let mut lista = Vec::new();
-        lista.extend_from_slice(&(entrada.len() as u16).to_be_bytes());
-        lista.extend_from_slice(&entrada);
-        let mut extension = vec![0x00, 0x00];
-        extension.extend_from_slice(&(lista.len() as u16).to_be_bytes());
-        extension.extend_from_slice(&lista);
-
-        let mut cuerpo = Vec::new();
-        cuerpo.extend_from_slice(&[0x03, 0x03]); // versión legacy TLS 1.2
-        cuerpo.extend_from_slice(&[0x11; 32]); // random
-        cuerpo.push(0); // session_id vacío
-        cuerpo.extend_from_slice(&2u16.to_be_bytes());
-        cuerpo.extend_from_slice(&[0x13, 0x01]);
-        cuerpo.push(1);
-        cuerpo.push(0); // compresión null
-        cuerpo.extend_from_slice(&(extension.len() as u16).to_be_bytes());
-        cuerpo.extend_from_slice(&extension);
-
-        let mut handshake = vec![0x01];
-        handshake.push((cuerpo.len() >> 16) as u8);
-        handshake.push((cuerpo.len() >> 8) as u8);
-        handshake.push(cuerpo.len() as u8);
-        handshake.extend_from_slice(&cuerpo);
-
-        let mut registro = vec![0x16, 0x03, 0x01];
-        registro.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        registro.extend_from_slice(&handshake);
-        registro
-    }
-
     // ---- Ethernet / IPv4 / IPv6 / transporte ----
 
     #[test]
@@ -873,7 +855,6 @@ mod tests {
         assert_eq!(meta.dst_port, Some(123));
         assert_eq!(meta.len, 31);
         assert!(meta.tcp_flags.is_none());
-        assert!(meta.dns_qname.is_none());
         let cabeceras = meta.headers.expect("cabeceras");
         assert_eq!(cabeceras.transport_raw_len, 8);
         assert_eq!(cabeceras.tcp_flags, 0);
@@ -1153,117 +1134,14 @@ mod tests {
         assert!(error.ignorable);
     }
 
-    // ---- DNS y SNI ----
-
-    #[test]
-    fn extrae_el_qname_dns_en_udp_puerto_53() {
-        let trama = paquete_ipv4(
-            IPPROTO_UDP,
-            IP_A,
-            IP_B,
-            &udp(50_000, 53, &consulta_dns("example.com")),
-        );
-        let meta = Parser::with_defaults()
-            .parse(&trama)
-            .expect("consulta DNS válida");
-        assert_eq!(meta.dns_qname.as_deref(), Some("example.com"));
-        assert!(meta.sni.is_none());
-    }
-
-    #[test]
-    fn extrae_el_qname_dns_en_tcp_con_prefijo_de_longitud() {
-        let consulta = consulta_dns("ejemplo.local");
-        let mut carga = Vec::new();
-        carga.extend_from_slice(&(consulta.len() as u16).to_be_bytes());
-        carga.extend_from_slice(&consulta);
-        let mut tcp = cabecera_tcp(50_000, 53, 10, 20, 0x18, 1_000);
-        tcp.extend_from_slice(&carga);
-        let trama = paquete_ipv4(IPPROTO_TCP, IP_A, IP_B, &tcp);
-        let meta = Parser::with_defaults()
-            .parse(&trama)
-            .expect("DNS sobre TCP");
-        assert_eq!(meta.dns_qname.as_deref(), Some("ejemplo.local"));
-    }
-
-    #[test]
-    fn sin_dns_attribution_no_se_extrae_el_qname() {
-        let parser = Parser::new(ParserOptions {
-            inspect_payload: false,
-            dns_attribution: false,
-            sni_attribution: false,
-        });
-        let trama = paquete_ipv4(
-            IPPROTO_UDP,
-            IP_A,
-            IP_B,
-            &udp(50_000, 53, &consulta_dns("example.com")),
-        );
-        let meta = parser.parse(&trama).expect("consulta DNS válida");
-        assert!(meta.dns_qname.is_none());
-    }
-
-    #[test]
-    fn inspect_payload_fuerza_la_extraccion_de_dns() {
-        let parser = Parser::new(ParserOptions {
-            inspect_payload: true,
-            dns_attribution: false,
-            sni_attribution: false,
-        });
-        let trama = paquete_ipv4(
-            IPPROTO_UDP,
-            IP_A,
-            IP_B,
-            &udp(50_000, 53, &consulta_dns("example.com")),
-        );
-        let meta = parser.parse(&trama).expect("consulta DNS válida");
-        assert_eq!(meta.dns_qname.as_deref(), Some("example.com"));
-    }
-
-    #[test]
-    fn extrae_el_sni_en_tcp_puerto_443() {
-        let trama = trama_tcp(
-            IP_A,
-            IP_B,
-            50_000,
-            443,
-            0x18,
-            &client_hello_con_sni("example.com"),
-        );
-        let meta = Parser::with_defaults()
-            .parse(&trama)
-            .expect("ClientHello válido");
-        assert_eq!(meta.sni.as_deref(), Some("example.com"));
-        assert!(meta.dns_qname.is_none());
-    }
-
-    #[test]
-    fn sin_sni_attribution_no_se_extrae_el_sni() {
-        let parser = Parser::new(ParserOptions {
-            inspect_payload: false,
-            dns_attribution: true,
-            sni_attribution: false,
-        });
-        let trama = trama_tcp(
-            IP_A,
-            IP_B,
-            50_000,
-            443,
-            0x18,
-            &client_hello_con_sni("example.com"),
-        );
-        let meta = parser.parse(&trama).expect("ClientHello válido");
-        assert!(meta.sni.is_none());
-    }
-
     #[test]
     fn el_payload_no_aparece_en_los_metadatos() {
-        let mut consulta = consulta_dns("example.com");
+        let mut consulta = vec![0u8; 12];
         consulta.extend_from_slice(b"MARCADOR_SECRETO_DEL_PAYLOAD");
         let trama = paquete_ipv4(IPPROTO_UDP, IP_A, IP_B, &udp(50_000, 53, &consulta));
         let meta = Parser::with_defaults()
             .parse(&trama)
-            .expect("consulta DNS válida");
-        assert_eq!(meta.dns_qname.as_deref(), Some("example.com"));
+            .expect("trama UDP válida");
         let volcado = format!("{meta:?}");
         assert!(!volcado.contains("MARCADOR"));
         // PacketMeta está pensado para no almacenar payload: su tamaño es fijo y pequeño.

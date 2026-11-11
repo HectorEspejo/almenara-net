@@ -1,9 +1,12 @@
-//! Pestaña Tráfico: ranking top-10 por consumo en la ventana de 60 s.
+//! Pestaña Tráfico: ranking por equipo, destino, app, categoría, protocolo o
+//! proceso (Fase 4), con ventana de 60 s, 5 min o sesión, panel «¿Quién lo usa?»
+//! y pie con los totales y el porcentaje sin identificar.
 //!
-//! La fila muestra el icono y nombre del equipo, su tipo, los ritmos de entrada
-//! y salida del último segundo, el total de la ventana de 60 s y una sparkline
-//! de esa misma ventana. Al arrancar sin captura se muestra el último snapshot
-//! persistido (TRAFFIC_SNAPSHOT) y un aviso claro si falta CAP_NET_RAW.
+//! Las filas las publica el agregador de tráfico (top 50 por dimensión y
+//! ventana); la TUI solo las reordena con «s» y las pinta. La agrupación (g) se
+//! persiste en [ui].traffic_group; la ventana (w) no se persiste y arranca en
+//! 60 s. Sin datos se muestra un mensaje claro y, si no hay captura, el aviso de
+//! F3 con la semilla de TRAFFIC_SNAPSHOT.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -11,8 +14,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::capture::aggregate::DeviceTraffic;
 use crate::classify::DeviceType;
+use crate::rankings::{Dimension, RankRow, Window};
 use crate::traffic::{formatear_bytes, formatear_bytes_por_segundo, sparkline};
 use crate::tui::app::App;
 use crate::tui::theme::device_icon;
@@ -21,61 +24,110 @@ use crate::tui::theme::device_icon;
 pub const TOP_RANKING: usize = 10;
 /// Puntos de sparkline que se muestran como mínimo en pantallas estrechas.
 const SPARK_ANCHO_MIN: u16 = 10;
+/// Filas máximas visibles del panel «¿Quién lo usa?».
+const MAX_FILAS_QUIEN: usize = 8;
 
-/// Anchos de las columnas del ranking.
-#[derive(Debug, Clone, Copy)]
-struct Columnas {
-    numero: u16,
-    dispositivo: u16,
-    tipo: u16,
-    entrada: u16,
-    salida: u16,
-    total: u16,
-    sparkline: u16,
+/// Cabeceras de cada agrupación (§6, notas de UX).
+fn cabeceras(dimension: Dimension) -> Vec<&'static str> {
+    match dimension {
+        Dimension::Device => vec![
+            "#",
+            "Dispositivo",
+            "Tipo",
+            "↓ in",
+            "↑ out",
+            "Total",
+            "sparkline 60 s",
+        ],
+        Dimension::Destination => vec![
+            "#",
+            "Destino",
+            "Organización · país",
+            "↓ bajada",
+            "↑ subida",
+            "Equipos",
+        ],
+        Dimension::App => vec![
+            "#",
+            "App",
+            "Categoría",
+            "↓ bajada",
+            "↑ subida",
+            "Equipos",
+            "sparkline 60 s",
+        ],
+        Dimension::Category => vec!["#", "Categoría", "↓ bajada", "↑ subida", "Apps", "Equipos"],
+        Dimension::Protocol => vec!["#", "Protocolo", "↓ bajada", "↑ subida", "Conexiones"],
+        Dimension::Process => vec!["#", "Proceso (pid)", "↓ bajada", "↑ subida", "Conexiones"],
+    }
 }
 
-impl Columnas {
-    /// Reparte el ancho disponible para que quepa en 80 columnas.
-    fn para(ancho: u16) -> Self {
-        let base: [u16; 7] = [2, 16, 7, 9, 9, 9, 14];
-        let fijo: u16 = base.iter().sum::<u16>() + 6;
-        let extra = ancho.saturating_sub(fijo);
-        let extra_dispositivo = extra / 2;
-        let extra_sparkline = extra - extra_dispositivo;
-        Self {
-            numero: base[0],
-            dispositivo: base[1] + extra_dispositivo,
-            tipo: base[2],
-            entrada: base[3],
-            salida: base[4],
-            total: base[5],
-            sparkline: base[6].saturating_add(extra_sparkline),
+/// Anchos base de las columnas y columnas flexibles de cada agrupación.
+fn anchos_base(dimension: Dimension) -> (Vec<u16>, Vec<usize>) {
+    match dimension {
+        Dimension::Device => (vec![2, 16, 7, 9, 9, 9, 14], vec![1]),
+        Dimension::Destination => (vec![2, 16, 18, 9, 9, 7], vec![1, 2]),
+        Dimension::App => (vec![2, 16, 13, 9, 9, 7, 10], vec![1, 2, 6]),
+        Dimension::Category => (vec![2, 16, 9, 9, 7, 7], vec![1]),
+        Dimension::Protocol => (vec![2, 14, 9, 9, 10], vec![1]),
+        Dimension::Process => (vec![2, 18, 9, 9, 10], vec![1]),
+    }
+}
+
+/// Restricciones de ancho de una agrupación para el ancho disponible.
+///
+/// El espacio sobrante se reparte entre las columnas flexibles (nombre,
+/// organización o sparkline) para que 80 columnas sea siempre el mínimo.
+fn constraints(dimension: Dimension, ancho: u16) -> Vec<Constraint> {
+    let (mut bases, flexibles) = anchos_base(dimension);
+    let separaciones = bases.len().saturating_sub(1) as u16;
+    let fijo: u16 = bases.iter().sum::<u16>() + separaciones;
+    let extra = ancho.saturating_sub(fijo);
+    if !flexibles.is_empty() {
+        let cuota = extra / flexibles.len() as u16;
+        let resto = extra % flexibles.len() as u16;
+        for (posicion, indice) in flexibles.iter().enumerate() {
+            let suma = cuota + u16::from(posicion == 0) * resto;
+            if let Some(ancho_columna) = bases.get_mut(*indice) {
+                *ancho_columna = ancho_columna.saturating_add(suma);
+            }
         }
     }
+    bases.into_iter().map(Constraint::Length).collect()
+}
 
-    fn constraints(self) -> Vec<Constraint> {
-        vec![
-            Constraint::Length(self.numero),
-            Constraint::Length(self.dispositivo),
-            Constraint::Length(self.tipo),
-            Constraint::Length(self.entrada),
-            Constraint::Length(self.salida),
-            Constraint::Length(self.total),
-            Constraint::Length(self.sparkline),
-        ]
+/// Ancho de la columna de sparkline (0 si la agrupación no la tiene).
+fn ancho_sparkline(dimension: Dimension, ancho: u16) -> u16 {
+    let (bases, flexibles) = anchos_base(dimension);
+    let separaciones = bases.len().saturating_sub(1) as u16;
+    let fijo: u16 = bases.iter().sum::<u16>() + separaciones;
+    let extra = ancho.saturating_sub(fijo);
+    let con_sparkline = bases.len() - 1;
+    let mut base_spark = bases[con_sparkline];
+    if flexibles.contains(&con_sparkline) {
+        let cuota = extra / flexibles.len() as u16;
+        let resto = extra % flexibles.len() as u16;
+        let posicion = flexibles
+            .iter()
+            .position(|indice| *indice == con_sparkline)
+            .unwrap_or(0);
+        base_spark = base_spark.saturating_add(cuota + u16::from(posicion == 0) * resto);
     }
+    base_spark
 }
 
 /// Dibuja la pestaña Tráfico.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
-    let titulo = if app.traffic.capture.active {
-        format!(
-            "Tráfico — ranking en vivo (ventana 60 s) · {}",
-            app.traffic.capture.summary()
-        )
-    } else {
-        "Tráfico — ranking en vivo (ventana 60 s)".to_string()
-    };
+    let pista = format!(
+        "[g] {} · [w] {} · [s] {}",
+        app.traffic_group.label(),
+        app.traffic_window.label(),
+        app.rank_sort.label()
+    );
+    let titulo = format!(
+        "Tráfico — ranking por {} · ventana {pista}",
+        app.traffic_group.label()
+    );
     let bloque = Block::bordered()
         .border_style(app.theme.border)
         .title(Span::styled(titulo, app.theme.title));
@@ -88,112 +140,83 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let filas_ranking = app.traffic_rows();
-    if filas_ranking.is_empty() {
-        let mensaje = if app.traffic.capture.active {
-            "Capturando… aún no se ha observado tráfico IP (en red conmutada solo se ve el propio y la difusión)"
+    let filas = app.ranking_rows();
+    let zonas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(interior);
+    let (area_ranking, area_panel) = if app.who_uses_open() {
+        let alto_panel = alto_panel_quien(app).min(zonas[0].height.saturating_sub(2));
+        let alto_panel = alto_panel.max(3);
+        let sub =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(alto_panel)]).split(zonas[0]);
+        (sub[0], Some(sub[1]))
+    } else {
+        (zonas[0], None)
+    };
+
+    if filas.is_empty() {
+        let mensaje = "Sin tráfico en esta ventana";
+        let ayuda = if app.traffic.capture.active {
+            "(esperando al primer ciclo de captura)"
         } else {
-            "Todavía no hay tráfico capturado"
+            "(la captura está deshabilitada; revisa la pestaña Ayuda)"
         };
-        let paragraph =
-            Paragraph::new(Span::styled(mensaje, app.theme.dim)).alignment(Alignment::Center);
-        let filas = Layout::vertical([
+        let parrafo = Paragraph::new(vec![
+            Line::from(Span::styled(mensaje, app.theme.dim)),
+            Line::from(Span::styled(ayuda, app.theme.dim)),
+        ])
+        .alignment(Alignment::Center);
+        let vertical = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Fill(1),
         ])
-        .split(interior);
-        frame.render_widget(paragraph, filas[1]);
-        return;
+        .split(area_ranking);
+        frame.render_widget(parrafo, vertical[1]);
+    } else {
+        draw_ranking(frame, app, &filas, area_ranking);
     }
-
-    let zonas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(interior);
-    draw_ranking(frame, app, &filas_ranking, zonas[0]);
+    if let Some(area) = area_panel {
+        draw_quien_lo_usa(frame, app, area);
+    }
     draw_resumen(frame, app, zonas[1]);
 }
 
-fn draw_ranking(frame: &mut Frame, app: &mut App, filas_ranking: &[DeviceTraffic], area: Rect) {
-    let columnas = Columnas::para(area.width);
-    let cabecera = Row::new(vec![
-        "#",
-        "Dispositivo",
-        "Tipo",
-        "↓ in",
-        "↑ out",
-        "Total",
-        "sparkline 60 s",
-    ])
-    .style(app.theme.accent);
+fn draw_ranking(frame: &mut Frame, app: &mut App, filas_ranking: &[RankRow], area: Rect) {
+    let dimension = app.traffic_group;
+    let window = app.traffic_window;
+    let cabecera = Row::new(cabeceras(dimension)).style(app.theme.accent);
+    let ancho_spark = ancho_sparkline(dimension, area.width);
+
+    let dispositivos: Vec<(i64, String, String)> = app
+        .devices
+        .iter()
+        .map(|device| {
+            let (icono, _estilo) = device_icon(device, &app.theme);
+            (
+                device.id,
+                icono.to_string(),
+                device.display_name().to_string(),
+            )
+        })
+        .collect();
 
     let filas: Vec<Row> = filas_ranking
         .iter()
         .take(TOP_RANKING)
         .enumerate()
-        .map(|(posicion, estadisticas)| {
-            let es_host = estadisticas.device_id == crate::traffic::DEVICE_ID_HOST;
-            let dispositivo = app
-                .devices
-                .iter()
-                .find(|device| device.id == estadisticas.device_id);
-            let (icono, estilo_icono) = if es_host {
-                ("", app.theme.accent)
-            } else {
-                match dispositivo {
-                    Some(device) => device_icon(device, &app.theme),
-                    None => ("[?]", app.theme.dim),
-                }
-            };
-            let nombre = if es_host {
-                "[host]".to_string()
-            } else {
-                dispositivo
-                    .map(|device| device.display_name().to_string())
-                    .unwrap_or_else(|| format!("equipo {}", estadisticas.device_id))
-            };
-            let tipo = if es_host {
-                "host"
-            } else {
-                dispositivo
-                    .map(|device| {
-                        DeviceType::from_str(device.effective_device_type())
-                            .unwrap_or(DeviceType::Unknown)
-                            .label()
-                    })
-                    .unwrap_or("?")
-            };
-            let estilo_nombre = if es_host {
-                app.theme.accent.add_modifier(Modifier::BOLD)
-            } else {
-                app.theme.normal
-            };
-            let total = estadisticas.bytes_in.saturating_add(estadisticas.bytes_out);
-            let serie = serie_total(estadisticas);
-            let ancho_spark = usize::from(columnas.sparkline.max(SPARK_ANCHO_MIN));
-            let puntos = serie.len().saturating_sub(ancho_spark);
-            let dibujo = sparkline(&serie[puntos..]);
-
-            Row::new(vec![
-                Cell::from(Span::styled(format!("{}", posicion + 1), app.theme.dim)),
-                Cell::from(Line::from(vec![
-                    Span::styled(icono, estilo_icono),
-                    Span::styled(format!(" {nombre}"), estilo_nombre),
-                ])),
-                Cell::from(Span::styled(tipo, app.theme.dim)),
-                Cell::from(Span::styled(
-                    formatear_bytes_por_segundo(estadisticas.rate_in),
-                    app.theme.online,
-                )),
-                Cell::from(Span::styled(
-                    formatear_bytes_por_segundo(estadisticas.rate_out),
-                    app.theme.accent.add_modifier(Modifier::BOLD),
-                )),
-                Cell::from(Span::styled(formatear_bytes(total), app.theme.normal)),
-                Cell::from(Span::styled(dibujo, app.theme.accent)),
-            ])
+        .map(|(posicion, fila)| {
+            let numero = Cell::from(Span::styled(format!("{}", posicion + 1), app.theme.dim));
+            match dimension {
+                Dimension::Device => fila_equipo(app, fila, numero, ancho_spark, &dispositivos),
+                Dimension::Destination => fila_destino(app, fila, numero, window),
+                Dimension::App => fila_app(app, fila, numero, window, ancho_spark),
+                Dimension::Category => fila_categoria(app, fila, numero, window),
+                Dimension::Protocol => fila_protocolo(app, fila, numero, window),
+                Dimension::Process => fila_proceso(app, fila, numero, window),
+            }
         })
         .collect();
 
-    let tabla = Table::new(filas, columnas.constraints())
+    let tabla = Table::new(filas, constraints(dimension, area.width))
         .header(cabecera)
         .column_spacing(1)
         .row_highlight_style(app.theme.selected)
@@ -204,26 +227,398 @@ fn draw_ranking(frame: &mut Frame, app: &mut App, filas_ranking: &[DeviceTraffic
     frame.render_stateful_widget(tabla, area, &mut app.traffic_table_state);
 }
 
+/// Nombre visible de un equipo del ranking (con [host] para el tráfico propio).
+fn nombre_equipo(app: &App, device_id: Option<i64>, etiqueta: &str) -> String {
+    match device_id {
+        Some(crate::traffic::DEVICE_ID_HOST) => "[host]".to_string(),
+        Some(id) => app
+            .devices
+            .iter()
+            .find(|device| device.id == id)
+            .map(|device| device.display_name().to_string())
+            .unwrap_or_else(|| etiqueta.to_string()),
+        None => etiqueta.to_string(),
+    }
+}
+
+fn celda_equipo(
+    app: &App,
+    fila: &RankRow,
+    dispositivos: &[(i64, String, String)],
+) -> Cell<'static> {
+    let device_id = fila.device_id;
+    let es_host = device_id == Some(crate::traffic::DEVICE_ID_HOST);
+    let (icono, estilo_icono) = if es_host {
+        ("", app.theme.accent)
+    } else {
+        match device_id.and_then(|id| dispositivos.iter().find(|(ident, _, _)| *ident == id)) {
+            Some((_, icono, _)) => (icono.as_str(), app.theme.accent),
+            None => ("[?]", app.theme.dim),
+        }
+    };
+    let nombre = nombre_equipo(app, device_id, &fila.label);
+    let estilo_nombre = if es_host {
+        app.theme.accent.add_modifier(Modifier::BOLD)
+    } else {
+        app.theme.normal
+    };
+    Cell::from(Line::from(vec![
+        Span::styled(icono.to_string(), estilo_icono),
+        Span::styled(format!(" {nombre}"), estilo_nombre),
+    ]))
+}
+
+fn fila_equipo(
+    app: &App,
+    fila: &RankRow,
+    numero: Cell<'static>,
+    ancho_spark: u16,
+    dispositivos: &[(i64, String, String)],
+) -> Row<'static> {
+    let estadisticas = fila.device_id.and_then(|id| app.traffic.device_stats(id));
+    let tipo = match fila.device_id {
+        Some(crate::traffic::DEVICE_ID_HOST) => "host".to_string(),
+        Some(id) => app
+            .devices
+            .iter()
+            .find(|device| device.id == id)
+            .map(|device| {
+                DeviceType::from_str(device.effective_device_type())
+                    .unwrap_or(DeviceType::Unknown)
+                    .label()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "?".to_string()),
+        None => "?".to_string(),
+    };
+    let (tasa_bajada, tasa_subida) = match &estadisticas {
+        Some(estadisticas) => (estadisticas.rate_in, estadisticas.rate_out),
+        None => (
+            app.bytes_por_segundo_en_ventana(fila.bytes_down, app.traffic_window),
+            app.bytes_por_segundo_en_ventana(fila.bytes_up, app.traffic_window),
+        ),
+    };
+    let serie: Vec<u64> = match &estadisticas {
+        Some(estadisticas) => estadisticas
+            .series_60s_in
+            .iter()
+            .zip(estadisticas.series_60s_out.iter())
+            .map(|(entrada, salida)| entrada.saturating_add(*salida))
+            .collect(),
+        None => fila.series_60s.to_vec(),
+    };
+    let dibujo = dibujar_sparkline(&serie, ancho_spark);
+    Row::new(vec![
+        numero,
+        celda_equipo(app, fila, dispositivos),
+        Cell::from(Span::styled(tipo, app.theme.dim)),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(tasa_bajada),
+            app.theme.online,
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(tasa_subida),
+            app.theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes(fila.total()),
+            app.theme.normal,
+        )),
+        Cell::from(Span::styled(dibujo, app.theme.accent)),
+    ])
+}
+
+fn fila_destino(app: &App, fila: &RankRow, numero: Cell<'static>, window: Window) -> Row<'static> {
+    let subtitulo = fila
+        .subtitle
+        .clone()
+        .filter(|texto| !texto.trim().is_empty())
+        .unwrap_or_else(|| "—".to_string());
+    Row::new(vec![
+        numero,
+        Cell::from(Span::styled(fila.label.clone(), app.theme.normal)),
+        Cell::from(Span::styled(subtitulo, app.theme.dim)),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_down, window)),
+            app.theme.online,
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_up, window)),
+            app.theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(fila.devices.to_string(), app.theme.dim)),
+    ])
+}
+
+fn fila_app(
+    app: &App,
+    fila: &RankRow,
+    numero: Cell<'static>,
+    window: Window,
+    ancho_spark: u16,
+) -> Row<'static> {
+    let categoria = fila
+        .subtitle
+        .clone()
+        .filter(|texto| !texto.trim().is_empty())
+        .unwrap_or_else(|| "—".to_string());
+    let dibujo = dibujar_sparkline(&fila.series_60s, ancho_spark);
+    Row::new(vec![
+        numero,
+        Cell::from(Span::styled(fila.label.clone(), app.theme.normal)),
+        Cell::from(Span::styled(categoria, app.theme.dim)),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_down, window)),
+            app.theme.online,
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_up, window)),
+            app.theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(fila.devices.to_string(), app.theme.dim)),
+        Cell::from(Span::styled(dibujo, app.theme.accent)),
+    ])
+}
+
+fn fila_categoria(
+    app: &App,
+    fila: &RankRow,
+    numero: Cell<'static>,
+    window: Window,
+) -> Row<'static> {
+    let apps = contar_apps_de_categoria(app, fila, window);
+    let texto_apps = match apps {
+        Some(cuantas) => cuantas.to_string(),
+        None => "—".to_string(),
+    };
+    Row::new(vec![
+        numero,
+        Cell::from(Span::styled(fila.label.clone(), app.theme.normal)),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_down, window)),
+            app.theme.online,
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_up, window)),
+            app.theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(texto_apps, app.theme.dim)),
+        Cell::from(Span::styled(fila.devices.to_string(), app.theme.dim)),
+    ])
+}
+
+fn fila_protocolo(
+    app: &App,
+    fila: &RankRow,
+    numero: Cell<'static>,
+    window: Window,
+) -> Row<'static> {
+    Row::new(vec![
+        numero,
+        Cell::from(Span::styled(fila.label.clone(), app.theme.normal)),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_down, window)),
+            app.theme.online,
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_up, window)),
+            app.theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(fila.connections.to_string(), app.theme.dim)),
+    ])
+}
+
+fn fila_proceso(app: &App, fila: &RankRow, numero: Cell<'static>, window: Window) -> Row<'static> {
+    let proceso = if fila.label.trim().is_empty() {
+        fila.key.clone()
+    } else {
+        fila.label.clone()
+    };
+    Row::new(vec![
+        numero,
+        Cell::from(Span::styled(proceso, app.theme.normal)),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_down, window)),
+            app.theme.online,
+        )),
+        Cell::from(Span::styled(
+            formatear_bytes_por_segundo(app.bytes_por_segundo_en_ventana(fila.bytes_up, window)),
+            app.theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(fila.connections.to_string(), app.theme.dim)),
+    ])
+}
+
+/// Cuenta las apps distintas de una categoría a partir del ranking de apps.
+///
+/// El ranking publica las métricas de categoría con equipos y conexiones; el
+/// número de apps se deduce de las filas de la dimensión app de la misma ventana
+/// (categoría corta en el subtítulo). Si no hay forma de deducirlo devuelve None
+/// y la celda muestra «—».
+fn contar_apps_de_categoria(app: &App, fila: &RankRow, window: Window) -> Option<u32> {
+    let apps = app.traffic.rank_rows(Dimension::App, window);
+    if apps.is_empty() {
+        return None;
+    }
+    let mut claves: Vec<&str> = Vec::new();
+    for app in &apps {
+        let categoria = app.subtitle.as_deref().unwrap_or("");
+        let coincide = categoria.eq_ignore_ascii_case(&fila.label)
+            || categoria.eq_ignore_ascii_case(fila.subtitle.as_deref().unwrap_or(""))
+            || app
+                .subtitle
+                .as_deref()
+                .map(|texto| texto.eq_ignore_ascii_case(&fila.key))
+                .unwrap_or(false);
+        if coincide && !claves.contains(&app.key.as_str()) {
+            claves.push(app.key.as_str());
+        }
+    }
+    if claves.is_empty() {
+        None
+    } else {
+        Some(claves.len() as u32)
+    }
+}
+
+/// Sparkline recortada al ancho disponible (mínimo 10 puntos).
+fn dibujar_sparkline(serie: &[u64], ancho: u16) -> String {
+    let ancho = usize::from(ancho.max(SPARK_ANCHO_MIN));
+    if serie.is_empty() {
+        return "─".repeat(ancho);
+    }
+    let inicio = serie.len().saturating_sub(ancho);
+    sparkline(&serie[inicio..])
+}
+
+/// Alto del panel «¿Quién lo usa?» según las filas.
+fn alto_panel_quien(app: &App) -> u16 {
+    let filas = app
+        .traffic
+        .who_uses
+        .as_ref()
+        .map(|panel| panel.rows.len())
+        .unwrap_or(0);
+    (filas.clamp(1, MAX_FILAS_QUIEN) as u16).saturating_add(2)
+}
+
+fn draw_quien_lo_usa(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(panel) = app.traffic.who_uses.as_ref() else {
+        return;
+    };
+    let titulo = format!(
+        "¿Quién lo usa? {} · {} · [Enter]detalle [Esc]cerrar",
+        panel.label,
+        panel.window.label()
+    );
+    let bloque = Block::bordered()
+        .border_style(app.theme.accent)
+        .title(Span::styled(titulo, app.theme.title));
+    let interior = bloque.inner(area);
+    frame.render_widget(bloque, area);
+
+    let mut lineas: Vec<Line> = Vec::new();
+    if panel.pending {
+        lineas.push(Line::from(Span::styled("Consultando…", app.theme.dim)));
+    } else if panel.rows.is_empty() {
+        lineas.push(Line::from(Span::styled(
+            "Sin equipos para esta clave en la ventana",
+            app.theme.dim,
+        )));
+    } else {
+        let ancho_nombre = usize::from(interior.width).saturating_sub(34).clamp(8, 40);
+        for (posicion, cuota) in panel.rows.iter().take(MAX_FILAS_QUIEN).enumerate() {
+            let es_host = cuota.device_id == crate::traffic::DEVICE_ID_HOST;
+            let (icono, estilo_icono) = match app.devices.iter().find(|d| d.id == cuota.device_id) {
+                Some(device) => {
+                    let (icono, estilo) = device_icon(device, &app.theme);
+                    (icono.to_string(), estilo)
+                }
+                None if es_host => (String::new(), app.theme.accent),
+                None => ("[?]".to_string(), app.theme.dim),
+            };
+            let nombre = if es_host {
+                "[host]".to_string()
+            } else {
+                cuota.label.clone()
+            };
+            let nombre = recortar(&nombre, ancho_nombre);
+            let tasa = formatear_bytes_por_segundo(
+                app.bytes_por_segundo_en_ventana(cuota.bytes, panel.window),
+            );
+            let linea = Line::from(vec![
+                Span::styled(
+                    format!(
+                        "  {} ",
+                        if posicion == panel.selected {
+                            "▸"
+                        } else {
+                            " "
+                        }
+                    ),
+                    app.theme.accent,
+                ),
+                Span::styled(format!("{icono} "), estilo_icono),
+                Span::styled(
+                    format!("{nombre:<ancho$} ", ancho = ancho_nombre),
+                    app.theme.normal,
+                ),
+                Span::styled(format!("{tasa:>10} "), app.theme.online),
+                Span::styled(format!("{:>4.0} %", cuota.pct), app.theme.accent),
+            ]);
+            let estilo = if posicion == panel.selected {
+                app.theme.selected
+            } else {
+                app.theme.normal
+            };
+            lineas.push(linea.style(estilo));
+        }
+    }
+    frame.render_widget(Paragraph::new(lineas), interior);
+}
+
+/// Recorta un texto y añade puntos suspensivos si no cabe.
+fn recortar(texto: &str, ancho: usize) -> String {
+    if texto.chars().count() <= ancho {
+        return texto.to_string();
+    }
+    let mut recortado: String = texto.chars().take(ancho.saturating_sub(1)).collect();
+    recortado.push('…');
+    recortado
+}
+
 fn draw_resumen(frame: &mut Frame, app: &App, area: Rect) {
     let (entrada, salida) = app.traffic.global_rates();
-    let conexiones = app.traffic.connections_total;
-    let mut texto = format!(
-        "Total observado: ↓ {}/s · ↑ {}/s · {conexiones} conexiones",
+    let sin_identificar = app.traffic.unidentified_pct(app.traffic_window);
+    let totales = format!(
+        "Total: ↓ {} · ↑ {} · sin identificar: {sin_identificar:.0} %",
         formatear_bytes_por_segundo(entrada),
         formatear_bytes_por_segundo(salida)
     );
+    let mut visibilidad = format!(
+        "{} · ventana: {} · orden: {}",
+        app.visibility_line(),
+        app.traffic_window.label(),
+        app.rank_sort.label()
+    );
+    // Se conserva la difusión de F3 cuando la hay.
     let difusion = app.traffic.broadcast_bytes();
     if difusion > 0 {
-        texto.push_str(&format!(" · difusión {}", formatear_bytes(difusion)));
+        visibilidad.push_str(&format!(" · difusión {}", formatear_bytes(difusion)));
     }
     if !app.traffic.capture.active {
         if let Some(fecha) = app.traffic.seed_label() {
-            texto.push_str(&format!(" · snapshot: {fecha}"));
+            visibilidad.push_str(&format!(" · snapshot: {fecha}"));
         }
     }
+    let filas = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
     frame.render_widget(
-        Paragraph::new(Span::styled(texto, app.theme.dim)).style(app.theme.normal),
-        area,
+        Paragraph::new(Span::styled(totales, app.theme.normal)).style(app.theme.normal),
+        filas[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(visibilidad, app.theme.dim)),
+        filas[1],
     );
 }
 
@@ -251,8 +646,12 @@ fn draw_sin_captura(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled(
+        "Sin tráfico en esta ventana: la captura está deshabilitada.",
+        app.theme.dim,
+    )));
 
-    let filas_ranking = app.traffic_rows();
+    let filas_ranking = app.traffic.ranked_devices();
     if !app.traffic.has_seed() || filas_ranking.is_empty() {
         lineas.push(Line::from(Span::styled(
             "Todavía no hay ningún snapshot de tráfico guardado.",
@@ -268,12 +667,7 @@ fn draw_sin_captura(frame: &mut Frame, app: &App, area: Rect) {
             .iter()
             .take(TOP_RANKING)
             .map(|estadisticas| {
-                let nombre = app
-                    .devices
-                    .iter()
-                    .find(|device| device.id == estadisticas.device_id)
-                    .map(|device| device.display_name().to_string())
-                    .unwrap_or_else(|| format!("equipo {}", estadisticas.device_id));
+                let nombre = nombre_equipo(app, Some(estadisticas.device_id), "equipo");
                 format!(
                     "{nombre} {}",
                     formatear_bytes(estadisticas.bytes_in.saturating_add(estadisticas.bytes_out))
@@ -295,40 +689,32 @@ fn draw_sin_captura(frame: &mut Frame, app: &App, area: Rect) {
         .style(app.theme.normal);
     let vertical = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(8),
+        Constraint::Length(10),
         Constraint::Fill(1),
     ])
     .split(area);
     frame.render_widget(parrafo, vertical[1]);
 }
 
-/// Suma las series de entrada y salida para una única sparkline.
-fn serie_total(estadisticas: &DeviceTraffic) -> Vec<u64> {
-    estadisticas
-        .series_60s_in
-        .iter()
-        .zip(estadisticas.series_60s_out.iter())
-        .map(|(entrada, salida)| entrada.saturating_add(*salida))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capabilities::Capabilities;
-    use crate::capture::aggregate::GlobalTraffic;
+    use crate::capture::aggregate::DeviceTraffic;
     use crate::config::Config;
+    use crate::rankings::{DeviceShare, Dimension, RankRow, Window};
     use crate::repo::devices::Device;
-    use crate::traffic::CaptureStatus;
+    use crate::traffic::{CaptureStatus, RankingView};
     use crate::tui::app::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
+    use std::time::Instant;
 
-    fn device(id: i64, ip: &str) -> Device {
+    fn dispositivo(id: i64, ip: &str) -> Device {
         Device {
             id,
-            mac: format!("aa:bb:cc:dd:ee:0{id}"),
+            mac: format!("00:1a:2b:3c:4d:{:02x}", id),
             ip: ip.to_string(),
             hostname: Some(format!("equipo-{id}")),
             vendor: Some("Apple".to_string()),
@@ -342,32 +728,56 @@ mod tests {
             os_family: None,
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 
     fn estadisticas(device_id: i64, bytes: u64) -> DeviceTraffic {
-        let mut serie = [0u64; 60];
-        for (posicion, valor) in serie.iter_mut().enumerate() {
-            *valor = (posicion as u64 + 1) * bytes / 60;
-        }
         DeviceTraffic {
             device_id,
             bytes_in: bytes,
             bytes_out: bytes / 2,
             packets_in: 10,
             packets_out: 5,
-            rate_in: 1200,
-            rate_out: 600,
+            rate_in: 120,
+            rate_out: 60,
             peak_bps: bytes,
-            series_60s_in: serie,
+            series_60s_in: [1; 60],
             series_60s_out: [0; 60],
-            series_5min_in: [0; 60],
+            series_5min_in: [1; 60],
             series_5min_out: [0; 60],
             top_ports: Vec::new(),
         }
     }
 
-    fn app_con_trafico(activa: bool) -> App {
+    fn fila(clave: &str, etiqueta: &str, bajada: u64, subida: u64) -> RankRow {
+        RankRow {
+            key: clave.to_string(),
+            label: etiqueta.to_string(),
+            subtitle: None,
+            device_id: None,
+            bytes_down: bajada,
+            bytes_up: subida,
+            devices: 2,
+            connections: 3,
+            series_60s: [1; 60],
+        }
+    }
+
+    fn vista(dimension: Dimension, window: Window, rows: Vec<RankRow>) -> RankingView {
+        RankingView {
+            dimension,
+            window,
+            rows,
+        }
+    }
+
+    fn app_prueba() -> App {
         let mut app = App::new(
             Config::default(),
             PathBuf::from("/tmp/config.toml"),
@@ -378,22 +788,15 @@ mod tests {
             },
             None,
         );
-        app.set_data(
-            vec![device(1, "10.0.0.2"), device(2, "10.0.0.3")],
-            Vec::new(),
-        );
-        app.traffic.devices = vec![estadisticas(1, 10_000_000), estadisticas(2, 5_000_000)];
-        app.traffic.global = GlobalTraffic {
-            bytes_in: 100,
-            bytes_out: 50,
-            broadcast_bytes: 0,
-            packets_total: 20,
-        };
-        app.traffic.connections_total = 3;
+        app.set_data(vec![dispositivo(1, "192.168.1.42")], Vec::new());
         app.traffic.capture = CaptureStatus {
-            active: activa,
+            active: true,
+            pps: 2400,
+            interfaces: vec!["eth0".to_string()],
             ..CaptureStatus::default()
         };
+        app.traffic.updated_at = Some(Instant::now());
+        app.traffic.unidentified = [3.0, 4.0, 5.0];
         app
     }
 
@@ -402,7 +805,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
         terminal
             .draw(|frame| draw(frame, app, frame.area()))
-            .expect("dibujado del ranking");
+            .expect("dibujado de Tráfico");
         terminal
             .backend()
             .buffer()
@@ -412,81 +815,228 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn ranking_muestra_columnas_y_top_10() {
-        let mut app = app_con_trafico(true);
-        app.traffic.devices = (1..=12)
-            .map(|id| estadisticas(id, 10_000 * id as u64))
-            .collect();
-        let contenido = dibujar(&mut app, 140, 30);
-        assert!(contenido.contains("Dispositivo"));
-        assert!(contenido.contains("sparkline 60 s"));
-        assert!(contenido.contains("ranking en vivo"));
-        // El ranking ordena por consumo: el 12 entra y el menos activo (2) queda fuera.
-        assert!(contenido.contains("equipo 12"));
-        assert!(!contenido.contains("equipo 2 "), "solo top-10");
+    fn app_con_agrupacion(dimension: Dimension, rows: Vec<RankRow>) -> App {
+        let mut app = app_prueba();
+        app.traffic_group = dimension;
+        app.traffic.rankings = vec![vista(dimension, Window::Sixty, rows)];
+        app
     }
 
     #[test]
-    fn ranking_cabe_en_ochenta_columnas() {
-        let mut app = app_con_trafico(true);
-        let contenido = dibujar(&mut app, 80, 24);
-        assert!(contenido.contains("Dispositivo"));
-        assert!(contenido.contains("Total"));
-        assert!(contenido.contains("equipo-1"));
+    fn cada_agrupacion_muestra_sus_columnas_del_informe() {
+        let casos: Vec<(Dimension, Vec<RankRow>, Vec<&str>)> = vec![
+            (
+                Dimension::Destination,
+                vec![fila("googlevideo.com", "googlevideo.com", 9_000, 100)],
+                vec![
+                    "Destino",
+                    "Organización · país",
+                    "↓ bajada",
+                    "↑ subida",
+                    "Equipos",
+                ],
+            ),
+            (
+                Dimension::App,
+                vec![fila("youtube", "YouTube", 9_000, 100)],
+                vec![
+                    "App",
+                    "Categoría",
+                    "↓ bajada",
+                    "↑ subida",
+                    "Equipos",
+                    "sparkline 60 s",
+                ],
+            ),
+            (
+                Dimension::Category,
+                vec![fila("video", "Vídeo", 9_000, 100)],
+                vec!["Categoría", "↓ bajada", "↑ subida", "Apps", "Equipos"],
+            ),
+            (
+                Dimension::Protocol,
+                vec![fila("tls", "tls", 9_000, 100)],
+                vec!["Protocolo", "↓ bajada", "↑ subida", "Conexiones"],
+            ),
+            (
+                Dimension::Process,
+                vec![fila("1234", "firefox (1234)", 9_000, 100)],
+                vec!["Proceso (pid)", "↓ bajada", "↑ subida", "Conexiones"],
+            ),
+        ];
+        for (dimension, rows, columnas) in casos {
+            let mut app = app_con_agrupacion(dimension, rows);
+            let texto = dibujar(&mut app, 120, 30);
+            for columna in columnas {
+                assert!(
+                    texto.contains(columna),
+                    "la agrupación {} no muestra la columna {columna}",
+                    dimension.label()
+                );
+            }
+        }
+
+        // La agrupación por equipo son las columnas de F3.
+        let mut app = app_prueba();
+        app.traffic.devices = vec![estadisticas(1, 1_000)];
+        let texto = dibujar(&mut app, 120, 30);
+        for columna in [
+            "Dispositivo",
+            "Tipo",
+            "↓ in",
+            "↑ out",
+            "Total",
+            "sparkline 60 s",
+        ] {
+            assert!(texto.contains(columna), "falta la columna {columna}");
+        }
     }
 
     #[test]
-    fn sin_captura_muestra_aviso_y_snapshot() {
-        let mut app = app_con_trafico(false);
-        app.traffic.devices.clear();
-        app.traffic.seed = vec![crate::repo::TrafficSnapshot {
-            device_id: 1,
-            bytes_in: 2_000_000,
-            bytes_out: 500_000,
-            packets_in: 100,
-            packets_out: 40,
-            peak_bps: 3_000_000,
-            window_s: 60,
-            updated_at: "2026-11-10T10:00:00Z".to_string(),
-        }];
-        app.traffic.capture.disabled_reason = Some("requiere CAP_NET_RAW".to_string());
-        app.traffic.capture.available = false;
-        let contenido = dibujar(&mut app, 110, 30);
-        assert!(contenido.contains("Captura deshabilitada"));
-        assert!(contenido.contains("CAP_NET_RAW"));
-        assert!(contenido.contains("Ayuda"));
-        assert!(contenido.contains("Snapshot del último ciclo"));
+    fn el_ranking_por_app_muestra_categoria_y_equipos() {
+        let mut fila = fila("youtube", "YouTube", 9_000, 100);
+        fila.subtitle = Some("Vídeo".to_string());
+        let mut app = app_con_agrupacion(Dimension::App, vec![fila]);
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("YouTube"));
+        assert!(texto.contains("Vídeo"));
     }
 
     #[test]
-    fn ranking_muestra_el_trafico_propio_como_host() {
-        let mut app = app_con_trafico(true);
-        app.traffic.devices.clear();
-        let mut host = estadisticas(1, 500);
-        host.device_id = crate::traffic::DEVICE_ID_HOST;
-        host.rate_in = 10;
-        host.rate_out = 5;
-        app.traffic.host = host;
-        app.traffic.updated_at = Some(std::time::Instant::now());
-        let contenido = dibujar(&mut app, 110, 30);
-        assert!(contenido.contains("[host]"));
-        assert!(contenido.contains("host"));
+    fn el_ranking_por_destino_muestra_organizacion_y_pais() {
+        let mut fila = fila("googlevideo.com", "googlevideo.com", 9_000, 100);
+        fila.subtitle = Some("Google LLC · US".to_string());
+        let mut app = app_con_agrupacion(Dimension::Destination, vec![fila]);
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("googlevideo.com"));
+        assert!(texto.contains("Google LLC · US"));
     }
 
     #[test]
-    fn seleccion_y_enter_en_ranking() {
-        let mut app = app_con_trafico(true);
-        assert_eq!(app.selected_traffic_device().map(|e| e.device_id), Some(1));
-        app.move_traffic_selection(1);
-        assert_eq!(app.selected_traffic_device().map(|e| e.device_id), Some(2));
+    fn el_ranking_por_categoria_cuenta_las_apps() {
+        let mut categoria = fila("video", "Vídeo", 9_000, 100);
+        categoria.subtitle = Some("video".to_string());
+        let mut app = app_con_agrupacion(Dimension::Category, vec![categoria]);
+        let mut youtube = fila("youtube", "YouTube", 5_000, 50);
+        youtube.subtitle = Some("Vídeo".to_string());
+        let mut netflix = fila("netflix", "Netflix", 4_000, 50);
+        netflix.subtitle = Some("Vídeo".to_string());
+        app.traffic
+            .rankings
+            .push(vista(Dimension::App, Window::Sixty, vec![youtube, netflix]));
+        let filas = app.ranking_rows();
+        assert_eq!(filas.len(), 1);
+        assert_eq!(
+            contar_apps_de_categoria(&app, &filas[0], Window::Sixty),
+            Some(2),
+            "cuenta las apps distintas de la categoría"
+        );
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("Apps"));
     }
 
     #[test]
-    fn resumen_muestra_totales_y_conexiones() {
-        let mut app = app_con_trafico(true);
-        let contenido = dibujar(&mut app, 110, 30);
-        assert!(contenido.contains("Total observado"));
-        assert!(contenido.contains("conexiones"));
+    fn el_pie_muestra_sin_identificar_y_la_visibilidad() {
+        let app_rows = vec![fila("youtube", "YouTube", 9_000, 100)];
+        let mut app = app_con_agrupacion(Dimension::App, app_rows);
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("sin identificar: 3 %"));
+        assert!(texto.contains("visibilidad: propia + broadcast"));
+    }
+
+    #[test]
+    fn el_pie_usa_el_porcentaje_de_la_ventana_activa() {
+        let mut app =
+            app_con_agrupacion(Dimension::App, vec![fila("youtube", "YouTube", 9_000, 100)]);
+        app.traffic_window = Window::FiveMin;
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("sin identificar: 4 %"));
+        assert!(texto.contains("ventana: 5 min"));
+    }
+
+    #[test]
+    fn sin_datos_en_la_ventana_muestra_un_mensaje_claro() {
+        let mut app = app_prueba();
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("Sin tráfico en esta ventana"));
+        assert!(
+            texto.contains("sin identificar: 3 %"),
+            "el pie siempre está"
+        );
+    }
+
+    #[test]
+    fn sin_captura_muestra_el_aviso_de_fase3() {
+        let mut app = app_prueba();
+        app.traffic.capture = CaptureStatus::default();
+        app.traffic.updated_at = None;
+        let texto = dibujar(&mut app, 100, 30);
+        assert!(texto.contains("Captura deshabilitada"));
+        assert!(texto.contains("Todavía no hay ningún snapshot"));
+    }
+
+    #[test]
+    fn el_panel_quien_lo_usa_lista_equipos_con_porcentaje() {
+        let mut app =
+            app_con_agrupacion(Dimension::App, vec![fila("youtube", "YouTube", 9_000, 100)]);
+        app.open_who_uses().expect("petición");
+        app.set_who_uses(vec![
+            DeviceShare {
+                device_id: 1,
+                label: "chromecast-sala".to_string(),
+                bytes: 6_900,
+                pct: 79.0,
+            },
+            DeviceShare {
+                device_id: 99,
+                label: "laptop-juan".to_string(),
+                bytes: 1_800,
+                pct: 21.0,
+            },
+        ]);
+        let texto = dibujar(&mut app, 120, 34);
+        assert!(texto.contains("¿Quién lo usa?"));
+        assert!(texto.contains("YouTube"));
+        assert!(texto.contains("chromecast-sala"));
+        assert!(texto.contains("laptop-juan"));
+        assert!(texto.contains("79 %"));
+    }
+
+    #[test]
+    fn el_panel_quien_lo_usa_muestra_consultando_sin_respuesta() {
+        let mut app =
+            app_con_agrupacion(Dimension::App, vec![fila("youtube", "YouTube", 9_000, 100)]);
+        app.open_who_uses().expect("petición");
+        let texto = dibujar(&mut app, 120, 34);
+        assert!(texto.contains("Consultando…"));
+    }
+
+    #[test]
+    fn el_ranking_cabe_en_ochenta_columnas() {
+        let mut app = app_con_agrupacion(
+            Dimension::App,
+            vec![
+                fila("youtube", "YouTube", 9_000, 100),
+                fila("netflix", "Netflix", 4_000, 50),
+            ],
+        );
+        let texto = dibujar(&mut app, 80, 24);
+        assert!(texto.contains("YouTube"));
+        assert!(texto.contains("Equipos"));
+        assert!(texto.contains("sin identificar:"));
+    }
+
+    #[test]
+    fn el_titulo_indica_agrupacion_y_ventana() {
+        let mut app = app_con_agrupacion(
+            Dimension::Destination,
+            vec![fila("googlevideo.com", "googlevideo.com", 9_000, 100)],
+        );
+        app.traffic_window = Window::FiveMin;
+        app.rank_sort = crate::rankings::SortKey::Down;
+        let texto = dibujar(&mut app, 140, 30);
+        assert!(texto.contains("ranking por destino"));
+        assert!(texto.contains("5 min"));
+        assert!(texto.contains("↓"));
     }
 }

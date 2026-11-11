@@ -1,10 +1,10 @@
-//! Pestaña Conexiones: tabla plana ordenable/filtrable y panel de cabeceras.
+//! Pestaña Conexiones: tabla plana ordenable, filtrable y buscable, con las
+//! columnas de F4 (Prot. · Equipo · Destino · App · ↑ · ↓ · Edad y Estado a
+//! partir de 100 columnas) y el panel de detalle de la tecla v.
 //!
-//! La tabla mezcla las conexiones del kernel (/proc/net/*, con estado y proceso)
-//! y las observadas por captura (bytes reales de terceros). Las etiquetas
-//! [host], [broadcast] y [?] se muestran en dim cuando el extremo no está
-//! atribuido a un equipo inventariado. La tecla v abre un panel inferior no
-//! modal con las cabeceras IP/TCP guardadas en memoria.
+//! Equipo es el lado cliente (o el de la LAN) y Destino el lado servidor,
+//! deducidos del rol de §7.1; sin rol la fila sale en orden canónico con «?»
+//! delante del destino. La tecla i alterna nombres ⇄ IPs (sin persistir).
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -12,54 +12,68 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::capture::Protocol;
-use crate::traffic::{formatear_bytes, ConnectionView};
+use crate::traffic::{formatear_bytes, ConnectionView, EndpointView};
 use crate::tui::app::App;
-use crate::tui::theme::device_icon;
+use crate::tui::theme::{device_icon, Theme};
+use crate::tui::traffic_state::{bytes_orientados, lados_conexion, ConnectionFilter};
 
-/// Alto del panel de cabeceras (tecla v).
-const ALTO_CABECERAS: u16 = 11;
+/// Alto del panel de detalle de conexión (tecla v).
+const ALTO_CABECERAS: u16 = 13;
+/// Ancho a partir del cual aparece la columna Estado.
+pub const ANCHO_CON_ESTADO: u16 = 100;
 
 /// Anchos de las columnas de la tabla de conexiones.
 #[derive(Debug, Clone, Copy)]
 struct Columnas {
     protocolo: u16,
-    origen: u16,
+    equipo: u16,
     destino: u16,
-    estado: u16,
-    enviado: u16,
-    recibido: u16,
+    app: u16,
+    subida: u16,
+    bajada: u16,
     edad: u16,
+    estado: Option<u16>,
 }
 
 impl Columnas {
     /// Reparte el ancho disponible para que quepa en 80 columnas.
     fn para(ancho: u16) -> Self {
-        let base: [u16; 7] = [5, 18, 17, 11, 8, 8, 5];
-        let fijo: u16 = base.iter().sum::<u16>() + 6;
+        let con_estado = ancho >= ANCHO_CON_ESTADO;
+        let mut base = vec![5u16, 17, 17, 15, 7, 7, 5];
+        if con_estado {
+            base.push(9);
+        }
+        let separaciones = base.len().saturating_sub(1) as u16;
+        let fijo: u16 = base.iter().sum::<u16>() + separaciones;
         let extra = ancho.saturating_sub(fijo);
-        let extra_origen = extra / 2;
-        let extra_destino = extra - extra_origen;
+        let extra_equipo = extra / 2;
+        let extra_destino = extra - extra_equipo;
         Self {
             protocolo: base[0],
-            origen: base[1] + extra_origen,
+            equipo: base[1] + extra_equipo,
             destino: base[2] + extra_destino,
-            estado: base[3],
-            enviado: base[4],
-            recibido: base[5],
+            app: base[3],
+            subida: base[4],
+            bajada: base[5],
             edad: base[6],
+            estado: con_estado.then(|| base[7]),
         }
     }
 
     fn constraints(self) -> Vec<Constraint> {
-        vec![
+        let mut columnas = vec![
             Constraint::Length(self.protocolo),
-            Constraint::Length(self.origen),
+            Constraint::Length(self.equipo),
             Constraint::Length(self.destino),
-            Constraint::Length(self.estado),
-            Constraint::Length(self.enviado),
-            Constraint::Length(self.recibido),
+            Constraint::Length(self.app),
+            Constraint::Length(self.subida),
+            Constraint::Length(self.bajada),
             Constraint::Length(self.edad),
-        ]
+        ];
+        if let Some(estado) = self.estado {
+            columnas.push(Constraint::Length(estado));
+        }
+        columnas
     }
 }
 
@@ -81,12 +95,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_tabla(frame: &mut Frame, app: &mut App, area: Rect) {
     let visibles = app.filtered_connections();
     let total = app.traffic.connections_total;
-    let titulo = format!(
-        "Conexiones activas ({} de {total}) · filtro: {} · orden: {}",
+    let vista = if app.show_names { "nombres" } else { "IPs" };
+    let mut titulo = format!(
+        "Conexiones activas ({} de {total}) · vista: {vista} · filtro: {} · orden: {}",
         visibles.len(),
         app.connection_filter_label(),
         app.conn_sort.label()
     );
+    let busqueda = app.effective_conn_search().trim().to_string();
+    if !busqueda.is_empty() {
+        titulo.push_str(&format!(" · búsqueda: \"{busqueda}\""));
+    }
     let bloque = Block::bordered()
         .border_style(app.theme.border)
         .title(Span::styled(titulo, app.theme.title));
@@ -94,7 +113,11 @@ fn draw_tabla(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(bloque, area);
 
     if visibles.is_empty() {
-        let mensaje = if app.traffic.connections_total == 0 {
+        let mensaje = if !busqueda.is_empty() {
+            "No hay conexiones que coincidan con la búsqueda"
+        } else if matches!(app.conn_filter, ConnectionFilter::Proceso { .. }) {
+            "No hay conexiones del proceso seleccionado"
+        } else if app.traffic.connections_total == 0 {
             if app.traffic.capture.active {
                 "Sin conexiones activas todavía (esperando al primer ciclo de captura)"
             } else {
@@ -117,10 +140,11 @@ fn draw_tabla(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Los índices se calculan sobre la lista filtrada y ordenada.
     let columnas = Columnas::para(interior.width);
-    let cabecera = Row::new(vec![
-        "Proto", "Origen", "Destino", "Estado", "↑", "↓", "Edad",
-    ])
-    .style(app.theme.accent);
+    let mut cabecera = vec!["Prot.", "Equipo", "Destino", "App", "↑", "↓", "Edad"];
+    if columnas.estado.is_some() {
+        cabecera.push("Estado");
+    }
+    let cabecera = Row::new(cabecera).style(app.theme.accent);
 
     // Se copian las celdas antes de pedir el estado mutable de la tabla.
     let dispositivos: Vec<(i64, String, String)> = app
@@ -137,7 +161,15 @@ fn draw_tabla(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let filas: Vec<Row> = visibles
         .iter()
-        .map(|conexion| fila_conexion(conexion, &dispositivos, &app.theme))
+        .map(|conexion| {
+            fila_conexion(
+                conexion,
+                &dispositivos,
+                &app.theme,
+                app.show_names,
+                columnas.estado.is_some(),
+            )
+        })
         .collect();
 
     let tabla = Table::new(filas, columnas.constraints())
@@ -153,51 +185,111 @@ fn draw_tabla(frame: &mut Frame, app: &mut App, area: Rect) {
 fn fila_conexion(
     conexion: &ConnectionView,
     dispositivos: &[(i64, String, String)],
-    theme: &crate::tui::theme::Theme,
+    theme: &Theme,
+    mostrar_nombres: bool,
+    con_estado: bool,
 ) -> Row<'static> {
-    let origen = celda_endpoint(&conexion.origin, dispositivos, theme);
-    let destino = celda_endpoint(&conexion.destination, dispositivos, theme);
-    let estado_estilo = match conexion.state.as_deref() {
-        Some("ESTABLISHED") => theme.online,
-        Some("TIME_WAIT") | Some("CLOSE_WAIT") | Some("SYN_SENT") => theme.warning,
-        Some("RESET") | Some("CLOSE") => theme.error,
-        _ => theme.dim,
+    let (rol, cliente, servidor) = lados_conexion(conexion);
+    let equipo = celda_equipo(conexion, &cliente, dispositivos, theme, mostrar_nombres);
+    let destino = celda_destino(conexion, &servidor, theme, mostrar_nombres, rol.sin_rol());
+    let (subida, bajada) = bytes_orientados(conexion);
+    let app = conexion.app_label();
+    let estilo_app = if app == "Sin identificar" {
+        theme.dim
+    } else {
+        theme.normal
     };
-    Row::new(vec![
-        Cell::from(Span::styled(conexion.protocol().as_str(), theme.normal)),
-        origen,
-        destino,
+    let mut celdas = vec![
         Cell::from(Span::styled(
+            conexion.app_protocol_label().to_string(),
+            theme.normal,
+        )),
+        equipo,
+        destino,
+        Cell::from(Span::styled(app, estilo_app)),
+        Cell::from(Span::styled(formatear_bytes(subida), theme.accent)),
+        Cell::from(Span::styled(formatear_bytes(bajada), theme.online)),
+        Cell::from(Span::styled(conexion.age_label(), theme.dim)),
+    ];
+    if con_estado {
+        let estado_estilo = match conexion.state.as_deref() {
+            Some("ESTABLISHED") => theme.online,
+            Some("TIME_WAIT") | Some("CLOSE_WAIT") | Some("SYN_SENT") => theme.warning,
+            Some("RESET") | Some("CLOSE") => theme.error,
+            _ => theme.dim,
+        };
+        celdas.push(Cell::from(Span::styled(
             conexion.state_label().to_string(),
             estado_estilo,
-        )),
-        Cell::from(Span::styled(
-            formatear_bytes(conexion.bytes_out),
-            theme.accent,
-        )),
-        Cell::from(Span::styled(
-            formatear_bytes(conexion.bytes_in),
-            theme.online,
-        )),
-        Cell::from(Span::styled(conexion.age_label(), theme.dim)),
-    ])
+        )));
+    }
+    Row::new(celdas)
 }
 
-/// Celda de un extremo: icono del dispositivo o etiqueta dim + ip:puerto.
-fn celda_endpoint(
-    extremo: &crate::traffic::EndpointView,
+/// Celda del lado cliente (o de la LAN): icono y nombre, o IP con «i».
+fn celda_equipo(
+    conexion: &ConnectionView,
+    cliente: &EndpointView,
     dispositivos: &[(i64, String, String)],
-    theme: &crate::tui::theme::Theme,
+    theme: &Theme,
+    mostrar_nombres: bool,
 ) -> Cell<'static> {
     let mut spans: Vec<Span> = Vec::new();
-    if let Some(id) = extremo.device_id {
+    if let Some(id) = cliente.device_id {
         if let Some((_, icono, _)) = dispositivos.iter().find(|(ident, _, _)| *ident == id) {
             spans.push(Span::styled(icono.clone(), theme.accent));
+            if mostrar_nombres {
+                if let Some((_, _, nombre)) = dispositivos.iter().find(|(ident, _, _)| *ident == id)
+                {
+                    spans.push(Span::styled(format!(" {nombre}"), theme.normal));
+                }
+            } else {
+                spans.push(Span::styled(format!(" {}", cliente.ip), theme.normal));
+            }
         }
-    } else if let Some(etiqueta) = extremo.tag {
-        spans.push(Span::styled(format!("[{etiqueta}]"), theme.dim));
+    } else if mostrar_nombres && cliente.tag == Some("host") {
+        spans.push(Span::styled("[host]", theme.dim));
+        if let Some(comm) = &conexion.comm {
+            spans.push(Span::styled(comm.clone(), theme.normal));
+        }
+    } else {
+        if let Some(etiqueta) = cliente.tag {
+            spans.push(Span::styled(format!("[{etiqueta}]"), theme.dim));
+        }
+        spans.push(Span::styled(cliente.ip.to_string(), theme.normal));
     }
-    spans.push(Span::styled(extremo.display(), theme.normal));
+    Cell::from(Line::from(spans))
+}
+
+/// Celda del lado servidor: nombre del servidor o IP con organización y país.
+fn celda_destino(
+    conexion: &ConnectionView,
+    servidor: &EndpointView,
+    theme: &Theme,
+    mostrar_nombres: bool,
+    sin_rol: bool,
+) -> Cell<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    if sin_rol {
+        spans.push(Span::styled("?", theme.warning));
+    }
+    let etiqueta = conexion.label.as_ref();
+    if mostrar_nombres {
+        match etiqueta.and_then(|valor| valor.server_name.clone()) {
+            Some(nombre) => spans.push(Span::styled(nombre, theme.normal)),
+            None => {
+                spans.push(Span::styled(servidor.ip.to_string(), theme.normal));
+                let subtitulo = etiqueta
+                    .map(|valor| valor.destination.subtitle())
+                    .unwrap_or_default();
+                if !subtitulo.is_empty() {
+                    spans.push(Span::styled(format!(" ({subtitulo})"), theme.dim));
+                }
+            }
+        }
+    } else {
+        spans.push(Span::styled(servidor.ip.to_string(), theme.normal));
+    }
     Cell::from(Line::from(spans))
 }
 
@@ -207,7 +299,7 @@ fn draw_cabeceras(frame: &mut Frame, app: &App, area: Rect) {
     };
     let conexion = &panel.connection;
     let titulo = format!(
-        "Cabeceras IP/TCP — {} {} → {} (Esc cierra)",
+        "Detalle de conexión — {} {} → {} (Esc cierra)",
         conexion.protocol().as_str(),
         conexion.origin.display(),
         conexion.destination.display()
@@ -219,6 +311,41 @@ fn draw_cabeceras(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bloque, area);
 
     let mut lineas: Vec<Line> = Vec::new();
+    lineas.push(Line::from(vec![
+        Span::styled("Rol: ", app.theme.accent),
+        Span::styled(rol_label(conexion), app.theme.normal),
+    ]));
+    lineas.push(Line::from(vec![
+        Span::styled("Servidor: ", app.theme.accent),
+        Span::styled(servidor_label(conexion), app.theme.normal),
+        Span::styled(
+            format!(" · fuente del nombre: {}", fuente_nombre(conexion)),
+            app.theme.dim,
+        ),
+    ]));
+    lineas.push(Line::from(vec![
+        Span::styled("App: ", app.theme.accent),
+        Span::styled(conexion.app_label(), app.theme.normal),
+        Span::styled(
+            format!(
+                " · categoría: {} · fuente: {}",
+                conexion.category_label(),
+                fuente_app(conexion)
+            ),
+            app.theme.dim,
+        ),
+    ]));
+    lineas.push(Line::from(vec![
+        Span::styled("JA4: ", app.theme.accent),
+        Span::styled(ja4_label(conexion), app.theme.normal),
+    ]));
+    if let Some(proceso) = conexion.process_label() {
+        lineas.push(Line::from(Span::styled(
+            format!("Proceso local: {proceso}"),
+            app.theme.accent,
+        )));
+    }
+
     match conexion.headers {
         Some(cabeceras) => {
             lineas.push(Line::from(Span::styled(
@@ -290,12 +417,6 @@ fn draw_cabeceras(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     }
-    if let Some(proceso) = conexion.process_label() {
-        lineas.push(Line::from(Span::styled(
-            format!("Proceso local: {proceso}"),
-            app.theme.accent,
-        )));
-    }
     lineas.push(Line::from(Span::styled(
         format!(
             "Bytes: ↑ {} · ↓ {} · edad {} · inactiva {}",
@@ -308,6 +429,59 @@ fn draw_cabeceras(frame: &mut Frame, app: &App, area: Rect) {
     )));
 
     frame.render_widget(Paragraph::new(lineas).style(app.theme.normal), interior);
+}
+
+/// Texto del rol cliente/servidor de la conexión.
+pub fn rol_label(conexion: &ConnectionView) -> String {
+    match conexion
+        .label
+        .as_ref()
+        .and_then(|etiqueta| etiqueta.client_is_src)
+    {
+        Some(true) => "cliente en el origen · servidor en el destino".to_string(),
+        Some(false) => "cliente en el destino · servidor en el origen".to_string(),
+        None => "desconocido (orden canónico origen → destino)".to_string(),
+    }
+}
+
+fn servidor_label(conexion: &ConnectionView) -> String {
+    match conexion
+        .label
+        .as_ref()
+        .and_then(|etiqueta| etiqueta.server_name.clone())
+    {
+        Some(nombre) => nombre,
+        None => conexion.server_label(),
+    }
+}
+
+fn fuente_nombre(conexion: &ConnectionView) -> String {
+    conexion
+        .label
+        .as_ref()
+        .and_then(|etiqueta| etiqueta.name_source)
+        .map(|fuente| fuente.label().to_string())
+        .unwrap_or_else(|| "sin nombre".to_string())
+}
+
+fn fuente_app(conexion: &ConnectionView) -> String {
+    conexion
+        .label
+        .as_ref()
+        .and_then(|etiqueta| etiqueta.app_source)
+        .map(|fuente| fuente.label().to_string())
+        .unwrap_or_else(|| "sin identificar".to_string())
+}
+
+fn ja4_label(conexion: &ConnectionView) -> String {
+    match conexion
+        .label
+        .as_ref()
+        .and_then(|etiqueta| etiqueta.ja4.clone())
+    {
+        Some(huella) => huella,
+        None => "—".to_string(),
+    }
 }
 
 /// Representación hexadecimal separada por espacios.
@@ -326,15 +500,16 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::capabilities::Capabilities;
-    use crate::capture::{ConnectionKey, Endpoint, HeaderSnapshot, Protocol};
+    use crate::capture::{ConnectionKey, Endpoint, Protocol as CaptureProtocol};
     use crate::config::Config;
+    use crate::inference::{AppSource, DestinationInfo, DestinationKind, FlowLabel, NameSource};
     use crate::repo::devices::Device;
     use crate::traffic::EndpointView;
     use crate::tui::app::App;
-    use crate::tui::traffic_state::HeadersView;
+    use crate::tui::traffic_state::ConnectionFilter;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -342,13 +517,13 @@ mod tests {
         texto.parse().expect("IP de prueba")
     }
 
-    fn dispositivo(id: i64, ip_texto: &str) -> Device {
+    fn dispositivo() -> Device {
         Device {
-            id,
-            mac: format!("aa:bb:cc:dd:ee:0{id}"),
-            ip: ip_texto.to_string(),
-            hostname: Some(format!("equipo-{id}")),
-            vendor: None,
+            id: 1,
+            mac: "00:1a:2b:3c:4d:01".to_string(),
+            ip: "192.168.1.42".to_string(),
+            hostname: Some("laptop-juan".to_string()),
+            vendor: Some("Apple".to_string()),
             interface_id: 1,
             device_type: "pc".to_string(),
             is_online: true,
@@ -359,59 +534,68 @@ mod tests {
             os_family: None,
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 
-    fn conexion(
-        origen: (&str, u16, Option<i64>, Option<&'static str>),
-        destino: (&str, u16, Option<i64>, Option<&'static str>),
-        estado: &str,
-    ) -> ConnectionView {
-        let cabeceras = HeaderSnapshot {
-            ip_version: 4,
-            ip_header_len: 20,
-            ip_total_len: 60,
-            ttl: 64,
-            tos: 0,
-            ip_protocol: 6,
-            ip_raw: [0x45; 40],
-            ip_raw_len: 20,
-            transport_raw: [0x01; 20],
-            transport_raw_len: 20,
-            tcp_seq: 123,
-            tcp_ack: 456,
-            tcp_window: 65535,
-            tcp_flags: 0x12,
+    fn etiqueta() -> FlowLabel {
+        let mut etiqueta = FlowLabel::empty(ip("1.1.1.1"));
+        etiqueta.client_is_src = Some(true);
+        etiqueta.app_protocol = Some(crate::inference::AppProtocol::Tls);
+        etiqueta.server_name = Some("github.com".to_string());
+        etiqueta.name_source = Some(NameSource::Sni);
+        etiqueta.app = Some("github".to_string());
+        etiqueta.category = Some("developer".to_string());
+        etiqueta.app_source = Some(AppSource::Domain);
+        etiqueta.ja4 = Some("t13d1516h2_8daaf6152771_02713d6af862".to_string());
+        etiqueta.destination = DestinationInfo {
+            key: "github.com".to_string(),
+            label: "github.com".to_string(),
+            org: Some("GitHub".to_string()),
+            country: Some("US".to_string()),
+            kind: DestinationKind::Domain,
         };
+        etiqueta
+    }
+
+    fn conexion() -> ConnectionView {
         ConnectionView {
             key: ConnectionKey::from_endpoints(
-                Protocol::Tcp,
-                Endpoint::new(ip(origen.0), Some(origen.1)),
-                Endpoint::new(ip(destino.0), Some(destino.1)),
+                CaptureProtocol::Tcp,
+                Endpoint::new(ip("192.168.1.42"), Some(40000)),
+                Endpoint::new(ip("1.1.1.1"), Some(443)),
             ),
-            state: Some(estado.to_string()),
-            bytes_in: 4096,
-            bytes_out: 2048,
-            age: Duration::from_secs(125),
-            idle: Duration::from_secs(5),
+            state: Some("ESTABLISHED".to_string()),
+            bytes_in: 900,
+            bytes_out: 100,
+            age: Duration::from_secs(120),
+            idle: Duration::from_secs(2),
             pid: Some(1234),
             comm: Some("firefox".to_string()),
-            device_id: origen.2.or(destino.2),
+            device_id: Some(1),
             origin: EndpointView {
-                ip: ip(origen.0),
-                port: Some(origen.1),
-                device_id: origen.2,
-                tag: origen.3,
+                ip: ip("192.168.1.42"),
+                port: Some(40000),
+                device_id: Some(1),
+                tag: None,
             },
             destination: EndpointView {
-                ip: ip(destino.0),
-                port: Some(destino.1),
-                device_id: destino.2,
-                tag: destino.3,
+                ip: ip("1.1.1.1"),
+                port: Some(443),
+                device_id: None,
+                tag: Some("?"),
             },
-            headers: Some(cabeceras),
+            headers: None,
             seen_capture: true,
             seen_kernel: true,
+            label: Some(etiqueta()),
+            app_name: Some("GitHub".to_string()),
+            category_name: Some("Desarrollo".to_string()),
         }
     }
 
@@ -426,13 +610,7 @@ mod tests {
             },
             None,
         );
-        app.set_data(
-            vec![
-                dispositivo(1, "192.168.1.42"),
-                dispositivo(2, "192.168.1.1"),
-            ],
-            Vec::new(),
-        );
+        app.set_data(vec![dispositivo()], Vec::new());
         app.traffic.connections = conexiones;
         app.traffic.connections_total = app.traffic.connections.len();
         app
@@ -443,7 +621,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
         terminal
             .draw(|frame| draw(frame, app, frame.area()))
-            .expect("dibujado de conexiones");
+            .expect("dibujado de Conexiones");
         terminal
             .backend()
             .buffer()
@@ -454,120 +632,155 @@ mod tests {
     }
 
     #[test]
-    fn tabla_muestra_columnas_y_etiquetas_dim() {
-        let mut app = app_con(vec![
-            conexion(
-                ("192.168.1.42", 54321, Some(1), None),
-                ("1.1.1.1", 443, None, Some("?")),
-                "ESTABLISHED",
-            ),
-            conexion(
-                ("192.168.1.10", 5353, None, Some("host")),
-                ("224.0.0.251", 5353, None, Some("broadcast")),
-                "—",
-            ),
-        ]);
-        let contenido = dibujar(&mut app, 110, 30);
-        assert!(contenido.contains("Proto"));
-        assert!(contenido.contains("Origen"));
-        assert!(contenido.contains("Destino"));
-        assert!(contenido.contains("Estado"));
-        assert!(contenido.contains("Edad"));
-        assert!(contenido.contains("ESTABLISHED"));
-        assert!(contenido.contains("[host]"));
-        assert!(contenido.contains("[broadcast]"));
-    }
-
-    #[test]
-    fn tabla_ordena_y_filtra() {
-        let mut app = app_con(vec![
-            conexion(
-                ("192.168.1.42", 1000, Some(1), None),
-                ("8.8.8.8", 53, None, Some("?")),
-                "ESTABLISHED",
-            ),
-            conexion(
-                ("192.168.1.42", 2000, Some(1), None),
-                ("1.1.1.1", 443, None, Some("?")),
-                "TIME_WAIT",
-            ),
-        ]);
-        assert_eq!(app.filtered_connections().len(), 2);
-        app.cycle_connection_filter();
-        assert_eq!(app.connection_filter_label(), "tcp");
-        assert_eq!(app.filtered_connections().len(), 2);
-        for _ in 0..3 {
-            app.cycle_connection_filter();
+    fn la_tabla_muestra_las_columnas_de_f4_a_ochenta_columnas() {
+        let mut app = app_con(vec![conexion()]);
+        let texto = dibujar(&mut app, 80, 24);
+        for columna in ["Prot.", "Equipo", "Destino", "App", "↑", "↓", "Edad"] {
+            assert!(texto.contains(columna), "falta la columna {columna}");
         }
-        assert_eq!(app.connection_filter_label(), "established");
-        assert_eq!(app.filtered_connections().len(), 1);
-        app.cycle_connection_sort();
-        assert!(app.conn_sort.label().contains('↑') || app.conn_sort.label().contains('↓'));
-    }
-
-    #[test]
-    fn tecla_v_abre_panel_de_cabeceras_y_esc_lo_cierra() {
-        let mut app = app_con(vec![conexion(
-            ("192.168.1.42", 54321, Some(1), None),
-            ("1.1.1.1", 443, None, Some("?")),
-            "ESTABLISHED",
-        )]);
-        app.tab = crate::tui::app::Tab::Conexiones;
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert!(app.headers_open());
-        let contenido = dibujar(&mut app, 110, 30);
-        assert!(contenido.contains("Cabeceras IP/TCP"));
-        assert!(contenido.contains("TCP puertos"));
-        assert!(contenido.contains("firefox"));
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert!(!app.headers_open());
-    }
-
-    #[test]
-    fn v_sin_conexion_avisa() {
-        let mut app = app_con(Vec::new());
-        app.tab = crate::tui::app::Tab::Conexiones;
-        assert!(!app.open_headers());
-        assert!(app
-            .notifier
-            .current()
-            .expect("notificación")
-            .message
-            .contains("conexión"));
-    }
-
-    #[test]
-    fn panel_sin_cabeceras_muestra_aviso() {
-        let mut conexion = conexion(
-            ("192.168.1.42", 54321, Some(1), None),
-            ("1.1.1.1", 443, None, Some("?")),
-            "ESTABLISHED",
+        assert!(
+            !texto.contains("Estado"),
+            "a 80 columnas no se muestra el Estado"
         );
-        conexion.headers = None;
-        let mut app = app_con(vec![conexion]);
-        app.headers = Some(HeadersView {
-            connection: app.traffic.connections[0].clone(),
-        });
-        let contenido = dibujar(&mut app, 110, 30);
-        assert!(contenido.contains("Sin cabeceras en memoria"));
+        assert!(texto.contains("tls"), "Prot. usa el protocolo de app");
+        assert!(texto.contains("GitHub"));
     }
 
     #[test]
-    fn tabla_cabe_en_ochenta_columnas() {
-        let mut app = app_con(vec![conexion(
-            ("192.168.1.42", 54321, Some(1), None),
-            ("1.1.1.1", 443, None, Some("?")),
-            "ESTABLISHED",
-        )]);
-        let contenido = dibujar(&mut app, 80, 24);
-        assert!(contenido.contains("Proto"));
-        assert!(contenido.contains("Edad"));
-        assert_eq!(Ipv4Addr::new(192, 168, 1, 42).to_string(), "192.168.1.42");
+    fn el_estado_aparece_a_partir_de_cien_columnas() {
+        let mut app = app_con(vec![conexion()]);
+        let texto = dibujar(&mut app, 120, 24);
+        assert!(texto.contains("Estado"));
+        assert!(
+            texto.contains("ESTABLISH"),
+            "el estado aparece aunque se recorte"
+        );
+    }
+
+    #[test]
+    fn el_destino_muestra_el_servidor_y_si_no_hay_ip_con_organizacion() {
+        let mut sin_nombre = conexion();
+        sin_nombre.label.as_mut().unwrap().server_name = None;
+        sin_nombre.app_name = Some("Sin identificar".to_string());
+        let mut app = app_con(vec![conexion(), sin_nombre]);
+        let texto = dibujar(&mut app, 160, 24);
+        assert!(texto.contains("github.com"));
+        assert!(
+            texto.contains("1.1.1.1 (GitHub · US)"),
+            "sin nombre se muestra la IP con organización y país"
+        );
+    }
+
+    #[test]
+    fn la_tecla_i_alterna_nombres_e_ips() {
+        let mut app = app_con(vec![conexion()]);
+        let texto = dibujar(&mut app, 140, 24);
+        assert!(texto.contains("laptop-juan"));
+        assert!(texto.contains("github.com"));
+
+        app.show_names = false;
+        let texto = dibujar(&mut app, 140, 24);
+        assert!(texto.contains("vista: IPs"));
+        assert!(texto.contains("192.168.1.42"));
+        assert!(texto.contains("1.1.1.1"));
+        assert!(
+            !texto.contains("laptop-juan"),
+            "en modo IPs no se pinta el nombre del equipo"
+        );
+        assert!(!texto.contains("github.com"));
+    }
+
+    #[test]
+    fn sin_rol_se_marca_el_destino_con_interrogacion() {
+        let mut conexion = conexion();
+        conexion.label.as_mut().unwrap().client_is_src = None;
+        let mut app = app_con(vec![conexion]);
+        let texto = dibujar(&mut app, 140, 24);
+        assert!(
+            texto.contains("?github.com"),
+            "sin rol la fila va en orden canónico con ? delante del destino"
+        );
+    }
+
+    #[test]
+    fn el_equipo_es_el_lado_cliente_aunque_el_cliente_sea_el_destino() {
+        let mut conexion = conexion();
+        conexion.label.as_mut().unwrap().client_is_src = Some(false);
+        conexion.origin.device_id = None;
+        conexion.origin.tag = Some("?");
+        conexion.destination.device_id = Some(1);
+        conexion.destination.tag = None;
+        let mut app = app_con(vec![conexion]);
+        let texto = dibujar(&mut app, 160, 24);
+        assert!(
+            texto.contains("laptop-juan"),
+            "el equipo se pinta como cliente"
+        );
+        // La subida es el sentido cliente → servidor: el cliente recibe 900.
+        assert!(texto.contains("900"));
+    }
+
+    #[test]
+    fn el_panel_v_muestra_rol_fuentes_ja4_y_proceso() {
+        let mut app = app_con(vec![conexion()]);
+        assert!(app.open_headers());
+        let texto = dibujar(&mut app, 160, 40);
+        assert!(texto.contains("Detalle de conexión"));
+        assert!(texto.contains("Rol: cliente en el origen"));
+        assert!(texto.contains("fuente del nombre: SNI"));
+        assert!(texto.contains("fuente: dominio"));
+        assert!(texto.contains("JA4: t13d"));
+        assert!(texto.contains("Proceso local: 1234 firefox"));
+        assert!(texto.contains("GitHub"));
+        assert!(texto.contains("Desarrollo"));
+    }
+
+    #[test]
+    fn el_panel_v_sin_cabeceras_avisa_sin_panico() {
+        let mut app = app_con(vec![conexion()]);
+        assert!(app.open_headers());
+        let texto = dibujar(&mut app, 120, 34);
+        assert!(texto.contains("Sin cabeceras en memoria"));
+    }
+
+    #[test]
+    fn la_app_sin_etiqueta_sale_sin_identificar() {
+        let mut conexion = conexion();
+        conexion.label = None;
+        conexion.app_name = None;
+        conexion.category_name = None;
+        let mut app = app_con(vec![conexion]);
+        let texto = dibujar(&mut app, 140, 24);
+        assert!(texto.contains("Sin identificar"));
+    }
+
+    #[test]
+    fn el_filtro_por_proceso_y_la_busqueda_se_ven_en_el_titulo() {
+        let mut app = app_con(vec![conexion()]);
+        app.conn_filter = ConnectionFilter::Proceso {
+            pid: Some(1234),
+            comm: "firefox".to_string(),
+        };
+        app.conn_search = "github".to_string();
+        let texto = dibujar(&mut app, 200, 24);
+        assert!(texto.contains("proceso firefox (1234)"));
+        assert!(texto.contains("búsqueda:"));
+        assert!(texto.contains("github"));
+    }
+
+    #[test]
+    fn sin_conexiones_muestra_mensajes_distintos_por_filtro() {
+        let mut app = app_con(vec![conexion()]);
+        app.conn_filter = ConnectionFilter::Proceso {
+            pid: Some(999),
+            comm: "curl".to_string(),
+        };
+        let texto = dibujar(&mut app, 120, 24);
+        assert!(texto.contains("No hay conexiones del proceso seleccionado"));
+
+        app.conn_filter = ConnectionFilter::Todas;
+        app.conn_search = "no-existe".to_string();
+        let texto = dibujar(&mut app, 120, 24);
+        assert!(texto.contains("No hay conexiones que coincidan con la búsqueda"));
     }
 }

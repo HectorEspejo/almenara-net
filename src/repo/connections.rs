@@ -107,6 +107,23 @@ pub struct Connection {
     pub first_seen: String,
     /// Última observación (RFC 3339 UTC).
     pub last_seen: String,
+    /// 1 si el extremo src canónico es el cliente, 0 si es el servidor y NULL si
+    /// el rol no se pudo deducir (§7.1).
+    pub client_is_src: Option<bool>,
+    /// Protocolo de aplicación identificado por firma o por puerto (§7.3).
+    pub app_protocol: Option<String>,
+    /// Nombre del servidor normalizado (minúsculas y sin punto final).
+    pub server_name: Option<String>,
+    /// Fuente del nombre del servidor: sni, http o cache.
+    pub name_source: Option<String>,
+    /// Clave de app del catálogo; None = sin identificar.
+    pub app: Option<String>,
+    /// Clave de categoría del catálogo (§7.9).
+    pub category: Option<String>,
+    /// Fuente de la app: domain, lan_service, asn o port.
+    pub app_source: Option<String>,
+    /// Huella JA4 del cliente (TLS o QUIC).
+    pub ja4: Option<String>,
 }
 
 /// Datos para hacer upsert de una conexión.
@@ -137,11 +154,29 @@ pub struct ConnectionUpdate {
     pub bytes_in: i64,
     /// Bytes enviados acumulados.
     pub bytes_out: i64,
+    /// Rol del extremo src (None = no deducido).
+    pub client_is_src: Option<bool>,
+    /// Protocolo de aplicación identificado (§7.3).
+    pub app_protocol: Option<String>,
+    /// Nombre del servidor en minúsculas y sin punto final (máximo 255).
+    pub server_name: Option<String>,
+    /// Fuente del nombre del servidor (sni, http o cache).
+    pub name_source: Option<String>,
+    /// Clave de app del catálogo; None = sin identificar.
+    pub app: Option<String>,
+    /// Clave de categoría del catálogo.
+    pub category: Option<String>,
+    /// Fuente de la app (domain, lan_service, asn o port).
+    pub app_source: Option<String>,
+    /// Huella JA4 del cliente (máximo 64 caracteres).
+    pub ja4: Option<String>,
 }
 
 /// Columnas de CONNECTIONS en el mismo orden que reconstruye fila_a_conexion.
 const SQL_SELECCION: &str = "SELECT id, device_id, protocol, src_ip, src_port, dst_ip, \
-     dst_port, state, bytes_in, bytes_out, first_seen, last_seen FROM CONNECTIONS";
+     dst_port, state, bytes_in, bytes_out, first_seen, last_seen, client_is_src, \
+     app_protocol, server_name, name_source, app, category, app_source, ja4 \
+     FROM CONNECTIONS";
 
 /// Sentencia SET común a los updates por id y por 5-tuple (first_seen se omite
 /// a propósito: nunca se pisa en un update).
@@ -155,8 +190,16 @@ const SQL_ACTUALIZAR: &str = "UPDATE CONNECTIONS SET
          state = ?7,
          bytes_in = ?8,
          bytes_out = ?9,
-         last_seen = ?10
-     WHERE id = ?11";
+         client_is_src = ?10,
+         app_protocol = ?11,
+         server_name = ?12,
+         name_source = ?13,
+         app = ?14,
+         category = ?15,
+         app_source = ?16,
+         ja4 = ?17,
+         last_seen = ?18
+     WHERE id = ?19";
 
 /// El filtro de list convierte el estado o el protocolo en su forma persistida:
 /// el resto de búsquedas (IP) es un LIKE a la representación textual.
@@ -188,8 +231,12 @@ pub(crate) fn upsert(conn: &SqliteConnection, conexion: &ConnectionUpdate) -> Re
     let id = conn.query_row(
         "INSERT INTO CONNECTIONS (
              device_id, protocol, src_ip, src_port, dst_ip, dst_port,
-             state, bytes_in, bytes_out, first_seen, last_seen
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+             state, bytes_in, bytes_out,
+             client_is_src, app_protocol, server_name, name_source,
+             app, category, app_source, ja4,
+             first_seen, last_seen
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                   ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
          RETURNING id",
         params![
             conexion.device_id,
@@ -201,6 +248,14 @@ pub(crate) fn upsert(conn: &SqliteConnection, conexion: &ConnectionUpdate) -> Re
             conexion.state,
             conexion.bytes_in,
             conexion.bytes_out,
+            conexion.client_is_src,
+            conexion.app_protocol,
+            conexion.server_name,
+            conexion.name_source,
+            conexion.app,
+            conexion.category,
+            conexion.app_source,
+            conexion.ja4,
             ahora
         ],
         |fila| fila.get(0),
@@ -295,6 +350,14 @@ fn actualizar(
             conexion.state,
             conexion.bytes_in,
             conexion.bytes_out,
+            conexion.client_is_src,
+            conexion.app_protocol,
+            conexion.server_name,
+            conexion.name_source,
+            conexion.app,
+            conexion.category,
+            conexion.app_source,
+            conexion.ja4,
             ahora,
             id
         ],
@@ -356,6 +419,14 @@ fn fila_a_conexion(fila: &Row<'_>) -> rusqlite::Result<Connection> {
         bytes_out: fila.get(9)?,
         first_seen: fila.get(10)?,
         last_seen: fila.get(11)?,
+        client_is_src: fila.get(12)?,
+        app_protocol: fila.get(13)?,
+        server_name: fila.get(14)?,
+        name_source: fila.get(15)?,
+        app: fila.get(16)?,
+        category: fila.get(17)?,
+        app_source: fila.get(18)?,
+        ja4: fila.get(19)?,
     })
 }
 
@@ -415,6 +486,14 @@ mod tests {
             state: Some("ESTABLISHED".to_string()),
             bytes_in,
             bytes_out,
+            client_is_src: None,
+            app_protocol: None,
+            server_name: None,
+            name_source: None,
+            app: None,
+            category: None,
+            app_source: None,
+            ja4: None,
         }
     }
 
@@ -492,6 +571,122 @@ mod tests {
         assert_eq!(conexiones[0].bytes_in, 9_000);
         assert_eq!(conexiones[0].bytes_out, 4_500);
         assert_eq!(conexiones[0].state.as_deref(), Some("CLOSE_WAIT"));
+    }
+
+    #[test]
+    fn upsert_persiste_el_rol_y_las_etiquetas() {
+        let (conn, _) = conexion_con_equipo();
+        let mut primera = actualizacion_tcp(1_000, 500);
+        primera.client_is_src = Some(true);
+        primera.app_protocol = Some("tls".to_string());
+        primera.server_name = Some("music.youtube.com".to_string());
+        primera.name_source = Some("sni".to_string());
+        primera.app = Some("youtube-music".to_string());
+        primera.category = Some("music".to_string());
+        primera.app_source = Some("domain".to_string());
+        primera.ja4 = Some("t13d1516h2_8daaf6152771_02713d6af862".to_string());
+        let id = upsert(&conn, &primera).expect("insertar con etiquetas");
+
+        let conexion = get(&conn, id).expect("buscar").expect("existe");
+        assert_eq!(conexion.client_is_src, Some(true));
+        assert_eq!(conexion.app_protocol.as_deref(), Some("tls"));
+        assert_eq!(conexion.server_name.as_deref(), Some("music.youtube.com"));
+        assert_eq!(conexion.name_source.as_deref(), Some("sni"));
+        assert_eq!(conexion.app.as_deref(), Some("youtube-music"));
+        assert_eq!(conexion.category.as_deref(), Some("music"));
+        assert_eq!(conexion.app_source.as_deref(), Some("domain"));
+        assert_eq!(
+            conexion.ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_02713d6af862")
+        );
+
+        // El ciclo siguiente reenvía la etiqueta resuelta: el update por
+        // 5-tuple la sobrescribe sin duplicar la conexión.
+        let mut segunda = actualizacion_tcp(2_000, 900);
+        segunda.client_is_src = Some(false);
+        segunda.app_protocol = Some("quic".to_string());
+        segunda.server_name = Some("rr1---sn-abc.googlevideo.com".to_string());
+        segunda.name_source = Some("cache".to_string());
+        segunda.app = Some("youtube".to_string());
+        segunda.category = Some("streaming".to_string());
+        segunda.app_source = Some("asn".to_string());
+        segunda.ja4 = Some("q13d0310h3_55b375c5d22e_c9c5e6cbb6d3".to_string());
+        let id_repetido = upsert(&conn, &segunda).expect("actualizar etiquetas");
+
+        assert_eq!(id_repetido, id);
+        let conexion = get(&conn, id).expect("buscar").expect("existe");
+        assert_eq!(conexion.client_is_src, Some(false));
+        assert_eq!(conexion.app_protocol.as_deref(), Some("quic"));
+        assert_eq!(conexion.name_source.as_deref(), Some("cache"));
+        assert_eq!(conexion.app.as_deref(), Some("youtube"));
+        assert_eq!(conexion.app_source.as_deref(), Some("asn"));
+        assert_eq!(
+            conexion.server_name.as_deref(),
+            Some("rr1---sn-abc.googlevideo.com")
+        );
+        assert_eq!(list(&conn, None).expect("listar").len(), 1);
+    }
+
+    #[test]
+    fn las_etiquetas_nuevas_nacen_a_null_y_el_rol_puede_quedar_sin_deducir() {
+        let (conn, _) = conexion_con_equipo();
+        let id = upsert(&conn, &actualizacion_tcp(10, 20)).expect("insertar");
+
+        let conexion = get(&conn, id).expect("buscar").expect("existe");
+        assert_eq!(conexion.client_is_src, None);
+        assert_eq!(conexion.app_protocol, None);
+        assert_eq!(conexion.server_name, None);
+        assert_eq!(conexion.name_source, None);
+        assert_eq!(conexion.app, None);
+        assert_eq!(conexion.category, None);
+        assert_eq!(conexion.app_source, None);
+        assert_eq!(conexion.ja4, None);
+
+        // Un update con None limpia la etiqueta anterior (es un snapshot, no un
+        // incremento), pero nunca pierde la fila ni su first_seen.
+        let mut con_etiqueta = actualizacion_tcp(10, 20);
+        con_etiqueta.app = Some("netflix".to_string());
+        con_etiqueta.client_is_src = Some(true);
+        upsert(&conn, &con_etiqueta).expect("etiquetar");
+        let conexion = get(&conn, id).expect("buscar").expect("existe");
+        assert_eq!(conexion.app.as_deref(), Some("netflix"));
+
+        upsert(&conn, &actualizacion_tcp(11, 21)).expect("limpiar etiqueta");
+        let conexion = get(&conn, id).expect("buscar").expect("existe");
+        assert_eq!(conexion.app, None);
+        assert_eq!(conexion.client_is_src, None);
+        assert_eq!(conexion.bytes_in, 11);
+    }
+
+    #[test]
+    fn list_tolera_etiquetas_desconocidas_escritas_por_otra_version() {
+        let (conn, _) = conexion_con_equipo();
+        // Una versión futura puede guardar valores que esta no conoce: la fila
+        // debe listarse igualmente y el resto de columnas conservarse.
+        conn.execute(
+            "INSERT INTO CONNECTIONS (
+                 protocol, src_ip, src_port, dst_ip, dst_port, state,
+                 bytes_in, bytes_out, first_seen, last_seen,
+                 client_is_src, app_protocol, server_name, name_source,
+                 app, category, app_source, ja4
+             ) VALUES ('tcp', '10.0.0.1', 1000, '10.0.0.2', 2000, 'ESTABLISHED',
+                       0, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       1, 'sctp-futuro', 'servidor.example', 'cache',
+                       'app-futura', 'cat-futura', 'heuristica', 't00_00_00')",
+            [],
+        )
+        .expect("insertar etiquetas futuras");
+
+        let conexiones = list(&conn, None).expect("listar sin romper");
+        assert_eq!(conexiones.len(), 1);
+        assert_eq!(conexiones[0].client_is_src, Some(true));
+        assert_eq!(
+            conexiones[0].app_protocol.as_deref(),
+            Some("sctp-futuro"),
+            "el DAO guarda el texto tal cual; la validación es de inferencia"
+        );
+        assert_eq!(conexiones[0].name_source.as_deref(), Some("cache"));
+        assert_eq!(conexiones[0].ja4.as_deref(), Some("t00_00_00"));
     }
 
     #[test]
