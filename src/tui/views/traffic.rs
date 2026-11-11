@@ -1056,6 +1056,7 @@ mod tests {
             dhcp_hostname: None,
             user_agent: None,
             os_source: None,
+            watched: false,
         }
     }
 

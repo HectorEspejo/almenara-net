@@ -13,7 +13,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::Result;
 use crate::history::build::aplicar_topes;
 use crate::history::localtime;
-use crate::history::{Counter, Dimension, PurgeStats, RollupBatch, RollupRow, SeenItem, Subject};
+use crate::history::{Counter, Dimension, PurgeStats, RollupBatch, RollupRow, Subject};
+use crate::repo::seen::SeenChange;
 
 /// Columnas de un rollup, en el orden de inserción.
 const SQL_INSERTAR_MINUTO: &str = "\
@@ -37,19 +38,16 @@ INSERT INTO TRAFFIC_ROLLUP_DAY
     (bucket, subject, device_id, dimension, key, bytes_down, bytes_up, connections)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
-/// Inserta o actualiza el inventario de un lote del minuto.
-const SQL_UPSERT_SEEN: &str = "\
-INSERT INTO DEVICE_SEEN (device_id, kind, key, first_seen, last_seen)
-VALUES (?1, ?2, ?3, ?4, ?4)
-ON CONFLICT (device_id, kind, key) DO UPDATE SET last_seen = excluded.last_seen";
-
 /// Escribe el lote del minuto y su inventario en una única transacción.
 ///
-/// Devuelve el número de filas de rollup escritas (sin contar el inventario).
-pub(crate) fn insert_minute_batch(conn: &mut Connection, batch: &RollupBatch) -> Result<usize> {
+/// Devuelve las entradas de inventario nuevas (equipos y propio equipo): son la
+/// señal de las reglas de lo nuevo (§7.11).
+pub(crate) fn insert_minute_batch(
+    conn: &mut Connection,
+    batch: &RollupBatch,
+) -> Result<SeenChange> {
     let marca = localtime::rfc3339(batch.minute);
     let transaccion = conn.transaction()?;
-    let mut escritas = 0usize;
     {
         let mut sentencia = transaccion.prepare(SQL_INSERTAR_MINUTO)?;
         for fila in &batch.rows {
@@ -63,30 +61,11 @@ pub(crate) fn insert_minute_batch(conn: &mut Connection, batch: &RollupBatch) ->
                 entero(fila.counter.up),
                 entero(fila.counter.connections),
             ])?;
-            escritas += 1;
         }
     }
-    upsert_seen_en(&transaccion, &batch.seen, &marca)?;
+    let cambio = crate::repo::seen::upsert_seen_en(&transaccion, &batch.seen, &marca)?;
     transaccion.commit()?;
-    Ok(escritas)
-}
-
-/// Inserta o actualiza las entradas de inventario en la conexión indicada.
-pub(crate) fn upsert_seen(conn: &mut Connection, items: &[SeenItem], at: &str) -> Result<usize> {
-    let transaccion = conn.transaction()?;
-    let total = upsert_seen_en(&transaccion, items, at)?;
-    transaccion.commit()?;
-    Ok(total)
-}
-
-fn upsert_seen_en(conn: &Connection, items: &[SeenItem], at: &str) -> Result<usize> {
-    let mut sentencia = conn.prepare_cached(SQL_UPSERT_SEEN)?;
-    let mut escritas = 0usize;
-    for item in items {
-        sentencia.execute(params![item.device_id, item.kind.as_str(), item.key, at])?;
-        escritas += 1;
-    }
-    Ok(escritas)
+    Ok(cambio)
 }
 
 /// Consolida una hora a partir de sus minutos (§7.3).
@@ -411,21 +390,12 @@ fn maximo(valor: i64) -> u64 {
 // escritor de la base de datos (ADR-35).
 #[allow(dead_code)]
 impl crate::repo::Repo {
-    /// Escribe el lote del minuto y su inventario en una transacción.
+    /// Escribe el lote del minuto y su inventario en una transacción (§7.11).
     pub fn insert_minute_batch(
         &mut self,
         batch: &crate::history::RollupBatch,
-    ) -> crate::error::Result<usize> {
+    ) -> crate::error::Result<SeenChange> {
         insert_minute_batch(&mut self.conn, batch)
-    }
-
-    /// Inserta o actualiza el inventario por equipo (§7.9).
-    pub fn upsert_seen(
-        &mut self,
-        items: &[crate::history::SeenItem],
-        at: std::time::SystemTime,
-    ) -> crate::error::Result<usize> {
-        upsert_seen(&mut self.conn, items, &crate::repo::instante_a_rfc3339(at))
     }
 
     /// Consolida una hora a partir de sus minutos (§7.3).
@@ -486,12 +456,26 @@ impl crate::repo::Repo {
         clear_destination_hours(&self.conn)
     }
 
-    /// Borra un equipo de la base de datos y sus rollups (sin clave ajena).
+    /// Borra un equipo, sus rollups y sus datos lógicos (§7.17).
+    ///
+    /// Las relaciones sin clave ajena se borran a mano: los rollups del equipo,
+    /// sus silencios y su aprendizaje. Las alertas sobreviven con
+    /// `device_id = NULL` (clave ajena con ON DELETE SET NULL) y conservan su
+    /// `subject_label`; el aprendizaje del propio equipo no se toca.
     pub fn delete_device(&mut self, device_id: i64) -> crate::error::Result<bool> {
-        delete_device_rollups(&self.conn, device_id)?;
-        let borrados = self
-            .conn
-            .execute("DELETE FROM DEVICES WHERE id = ?1", params![device_id])?;
+        let transaccion = self.conn.transaction()?;
+        delete_device_rollups(&transaccion, device_id)?;
+        transaccion.execute(
+            "DELETE FROM ALERT_MUTES WHERE subject = 'device' AND device_id = ?1",
+            params![device_id],
+        )?;
+        transaccion.execute(
+            "DELETE FROM ALERT_LEARNING WHERE subject = 'device' AND device_id = ?1",
+            params![device_id],
+        )?;
+        let borrados =
+            transaccion.execute("DELETE FROM DEVICES WHERE id = ?1", params![device_id])?;
+        transaccion.commit()?;
         Ok(borrados > 0)
     }
 }
@@ -507,7 +491,7 @@ fn contar(conn: &Connection, tabla: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{LocalDay, Retention, SeenKind};
+    use crate::history::{LocalDay, Retention, SeenItem, SeenKind};
     use tempfile::tempdir;
 
     fn conexion() -> Connection {
@@ -539,11 +523,10 @@ mod tests {
                 fila(Subject::Device(1), Dimension::Total, "", 100, 10),
                 fila(Subject::Device(1), Dimension::App, "youtube", 80, 5),
             ],
-            seen: vec![SeenItem {
-                device_id: 1,
-                kind: SeenKind::App,
-                key: "youtube".to_string(),
-            }],
+            seen: vec![
+                SeenItem::de_equipo(1, SeenKind::App, "youtube"),
+                SeenItem::del_host(SeenKind::App, "steam"),
+            ],
             overflow: 0,
         };
         // El inventario exige que el equipo exista (FK a DEVICES).
@@ -553,10 +536,17 @@ mod tests {
              VALUES ('aa:bb:cc:dd:ee:01', '192.168.1.50', 1, 'unknown', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
         )
         .expect("equipo de prueba");
-        let escritas = insert_minute_batch(&mut conn, &lote).expect("primer lote");
-        assert_eq!(escritas, 2);
-        insert_minute_batch(&mut conn, &lote).expect("segundo lote");
+        let cambio = insert_minute_batch(&mut conn, &lote).expect("primer lote");
+        assert_eq!(cambio.new_items.len(), 2, "la app del equipo y la del host");
+        let cambio = insert_minute_batch(&mut conn, &lote).expect("segundo lote");
+        assert!(cambio.is_empty(), "repetir el lote no descubre nada nuevo");
         assert_eq!(contar(&conn, "TRAFFIC_ROLLUP_MINUTE"), 2);
+        assert_eq!(
+            contar(&conn, "HOST_SEEN"),
+            1,
+            "el inventario del host se escribe"
+        );
+        assert_eq!(contar(&conn, "DEVICE_SEEN"), 1);
         let (down, up): (i64, i64) = conn
             .query_row(
                 "SELECT bytes_down, bytes_up FROM TRAFFIC_ROLLUP_MINUTE
@@ -835,8 +825,9 @@ mod tests {
             seen: Vec::new(),
             overflow: 0,
         };
+        let escritas = lote.rows.len();
         let inicio = std::time::Instant::now();
-        let escritas = repo.insert_minute_batch(&lote).expect("lote");
+        repo.insert_minute_batch(&lote).expect("lote");
         let transcurrido = inicio.elapsed();
         println!(
             "lote del minuto: {escritas} filas en {transcurrido:?} ({:.2} ms)",
@@ -912,13 +903,11 @@ mod tests {
              VALUES ('aa:bb:cc:dd:ee:01', '192.168.1.50', 1, 'unknown', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
         )
         .expect("equipo");
-        let items = vec![SeenItem {
-            device_id: 1,
-            kind: SeenKind::Org,
-            key: "Google LLC".to_string(),
-        }];
-        upsert_seen(&mut conn, &items, "2026-01-01T10:00:00Z").expect("primera vez");
-        upsert_seen(&mut conn, &items, "2026-01-01T11:00:00Z").expect("segunda vez");
+        let items = vec![SeenItem::de_equipo(1, SeenKind::Org, "Google LLC")];
+        crate::repo::seen::upsert_seen(&mut conn, &items, "2026-01-01T10:00:00Z")
+            .expect("primera vez");
+        crate::repo::seen::upsert_seen(&mut conn, &items, "2026-01-01T11:00:00Z")
+            .expect("segunda vez");
         let (primera, ultima): (String, String) = conn
             .query_row(
                 "SELECT first_seen, last_seen FROM DEVICE_SEEN",
@@ -970,7 +959,52 @@ mod tests {
         };
         repo.insert_minute_batch(&lote).expect("lote");
         assert_eq!(contar(repo.connection(), "TRAFFIC_ROLLUP_MINUTE"), 1);
+        // Silencios, aprendizaje y una alerta del equipo antes de borrarlo.
+        repo.connection()
+            .execute(
+                "INSERT INTO ALERT_MUTES (rule, subject, device_id, until, created_at)
+                 VALUES ('new_app', 'device', ?1, NULL, '2026-01-01T00:00:00Z')",
+                params![device_id],
+            )
+            .expect("silencio del equipo");
+        repo.connection()
+            .execute(
+                "INSERT INTO ALERT_LEARNING
+                     (subject, device_id, learning_from, data_days, learned_at, updated_day)
+                 VALUES ('device', ?1, '2026-01-01T00:00:00Z', 0, NULL, 0)",
+                params![device_id],
+            )
+            .expect("aprendizaje del equipo");
+        repo.connection()
+            .execute(
+                "INSERT INTO ALERTS
+                     (rule, level, subject, device_id, key, title, subject_label, details,
+                      created_at, last_at)
+                 VALUES ('device_new', 'important', 'device', ?1, '', 'Equipo nuevo', 'nas',
+                         '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                params![device_id],
+            )
+            .expect("alerta del equipo");
+
         repo.delete_device(device_id).expect("borrar equipo");
         assert_eq!(contar(repo.connection(), "TRAFFIC_ROLLUP_MINUTE"), 0);
+        assert_eq!(
+            contar(repo.connection(), "ALERT_MUTES"),
+            0,
+            "sus silencios se borran con él"
+        );
+        assert_eq!(
+            contar(repo.connection(), "ALERT_LEARNING"),
+            1,
+            "su aprendizaje se borra; el del propio equipo se queda"
+        );
+        let (device_id_alerta, etiqueta): (Option<i64>, String) = repo
+            .connection()
+            .query_row("SELECT device_id, subject_label FROM ALERTS", [], |fila| {
+                Ok((fila.get(0)?, fila.get(1)?))
+            })
+            .expect("alerta superviviente");
+        assert_eq!(device_id_alerta, None, "la alerta sobrevive sin device_id");
+        assert_eq!(etiqueta, "nas");
     }
 }

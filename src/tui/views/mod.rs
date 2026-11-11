@@ -4,6 +4,7 @@
 //! barra de estado (2 líneas en terminales estrechas, 3 en anchos) y pie con los
 //! atajos. Si el terminal es menor de 80x24 se muestra un mensaje claro.
 
+pub mod alerts;
 pub mod charts;
 pub mod config_view;
 pub mod connections;
@@ -11,7 +12,6 @@ pub mod device_detail;
 pub mod devices;
 pub mod help;
 pub mod history;
-pub mod placeholder;
 pub mod traffic;
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -80,10 +80,9 @@ fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Trafico => traffic::draw(frame, app, area),
         Tab::Conexiones => connections::draw(frame, app, area),
         Tab::Historico => history::draw(frame, app, area),
+        Tab::Alertas => alerts::draw(frame, app, area),
         Tab::Config => config_view::draw(frame, app, area),
         Tab::Ayuda => help::draw(frame, app, area),
-        otro if otro.is_placeholder() => placeholder::draw(frame, app, area),
-        _ => {}
     }
 }
 
@@ -127,6 +126,13 @@ fn draw_input_line(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_notification(frame: &mut Frame, app: &App, area: Rect) {
+    // El aviso de una línea de una alerta importante tiene prioridad durante 10 s
+    // (§6): no lo puede tapar la siguiente notificación del búfer.
+    if let Some((mensaje, _)) = &app.alert_notice {
+        let linea = Line::from(Span::styled(mensaje.clone(), app.theme.warning));
+        frame.render_widget(Paragraph::new(linea).alignment(Alignment::Right), area);
+        return;
+    }
     let Some(notification) = app.notifier.current() else {
         return;
     };
@@ -168,10 +174,15 @@ fn draw_status_summary(frame: &mut Frame, app: &App, area: Rect) {
     let columnas =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(ancho_modo)]).split(area);
 
-    frame.render_widget(
-        Paragraph::new(app.status_summary()).style(app.theme.dim),
-        columnas[0],
-    );
+    // F6: contador «Alertas N» (no vistas importantes y avisos, §6).
+    let mut resumen = vec![Span::styled(app.status_summary(), app.theme.dim)];
+    if app.config.alerts.enabled && !app.alerts.counts.is_empty() {
+        resumen.push(Span::styled(
+            format!(" · {}", alerts::contador_barra(app.alerts.counts)),
+            app.theme.accent,
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(resumen)), columnas[0]);
     frame.render_widget(
         Paragraph::new(modo)
             .alignment(Alignment::Right)
@@ -289,6 +300,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         app.tab,
         app.detail_open(),
         app.who_uses_open() || app.history.history_who_uses_open(),
+        app.alerts.view,
     );
     let lineas: Vec<Line> = atajos
         .iter()
@@ -385,6 +397,7 @@ mod tests {
             dhcp_hostname: None,
             user_agent: None,
             os_source: None,
+            watched: false,
         }
     }
 
@@ -478,13 +491,13 @@ mod tests {
     }
 
     #[test]
-    fn pestana_placeholder_muestra_no_disponible() {
-        // Tras F5 solo Alertas (F6) sigue siendo un placeholder.
+    fn la_pestana_alertas_deja_de_ser_placeholder() {
+        // F6: Alertas ya tiene vista propia; sin alertas, su mensaje vacío.
         let mut app = app_vacia();
         app.tab = Tab::Alertas;
         let texto = dibujar(&mut app, 100, 30);
-        assert!(texto.contains("no disponible"));
         assert!(texto.contains("Alertas"));
+        assert!(texto.contains("Sin alertas en este filtro"));
     }
 
     #[test]
@@ -687,5 +700,160 @@ mod tests {
         assert!(texto.contains("Conexiones activas"));
         assert!(texto.contains("Sin conexiones"));
         assert!(texto.contains("filtro:"));
+    }
+
+    #[test]
+    #[ignore]
+    fn medir_render_alertas() {
+        // §8: render con Alertas abierta ≤ 16 ms en 80x24 y ≤ 33 ms en 120x40.
+        use crate::alerts::{AlertRule, Level, RuleId, Subject};
+        use crate::history::AlertRow;
+        use std::time::{Duration, Instant};
+
+        let mut app = app_vacia();
+        app.tab = Tab::Alertas;
+        let ahora = crate::history::localtime::now_unix();
+        app.alerts.rows = (0..60)
+            .map(|indice| AlertRow {
+                id: i64::from(indice) + 1,
+                rule: AlertRule::Rule(if indice % 5 == 0 {
+                    RuleId::DeviceNew
+                } else if indice % 5 == 1 {
+                    RuleId::PortNew
+                } else if indice % 5 == 2 {
+                    RuleId::NewApp
+                } else if indice % 5 == 3 {
+                    RuleId::TrafficHigh
+                } else {
+                    RuleId::MacChanged
+                }),
+                level: match indice % 3 {
+                    0 => Level::Important,
+                    1 => Level::Warning,
+                    _ => Level::Info,
+                },
+                subject: if indice % 7 == 0 {
+                    Subject::Host
+                } else {
+                    Subject::Device(1)
+                },
+                device_id: Some(1),
+                title: format!("Alerta de prueba número {indice}"),
+                subject_label: "equipo-de-prueba".to_string(),
+                created_at: ahora - i64::from(indice) * 60,
+                last_at: ahora - i64::from(indice) * 30,
+                count: i64::from(indice % 4) + 1,
+                seen: indice % 3 != 0,
+                resolved: indice % 11 == 0,
+                notified: indice % 2 == 0,
+                summary_id: None,
+            })
+            .collect();
+        app.alerts.selected = 3;
+        app.alerts.detail_open = true;
+        app.alerts.detail = Some(crate::history::AlertDetail {
+            row: app.alerts.rows[3].clone(),
+            details: serde_json::json!({"porque": "Primera vez en la red hace 3 días"}),
+            grouped: Vec::new(),
+            learned_at: None,
+            mutes: Vec::new(),
+        });
+
+        for (ancho, alto, limite_ms) in [(80u16, 24u16, 16u128), (120, 40, 33)] {
+            // Calentamiento para no medir la inicialización de ratatui.
+            let _ = dibujar(&mut app, ancho, alto);
+            let repeticiones = 100u32;
+            let inicio = Instant::now();
+            for _ in 0..repeticiones {
+                let _ = dibujar(&mut app, ancho, alto);
+            }
+            let media = inicio.elapsed() / repeticiones;
+            println!(
+                "render alertas {ancho}x{alto}: {:.3} ms de media ({repeticiones} repeticiones)",
+                media.as_secs_f64() * 1000.0
+            );
+            assert!(
+                media <= Duration::from_millis(limite_ms as u64),
+                "render con Alertas abierta en {ancho}x{alto}: {media:?} > {limite_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn medir_render_equipos() {
+        // F1-64/F2 §8: render con 256 equipos ≤ 16 ms en 80x24 y ≤ 33 ms en 120x40.
+        use crate::repo::Device;
+        use std::time::{Duration, Instant};
+
+        let mut app = app_vacia();
+        app.list_view = crate::config::ListView::Flat;
+        app.devices = (0..256)
+            .map(|indice| {
+                let n = i64::from(indice);
+                Device {
+                    id: n + 1,
+                    mac: format!(
+                        "aa:bb:cc:dd:{:02x}:{:02x}",
+                        (indice / 256) % 256,
+                        indice % 256
+                    ),
+                    ip: format!("192.168.1.{}", (indice % 254) + 1),
+                    hostname: Some(format!("equipo-{indice:03}")),
+                    vendor: Some("Fabricante de prueba".to_string()),
+                    interface_id: 1,
+                    device_type: if indice % 5 == 0 { "gateway" } else { "pc" }.to_string(),
+                    is_online: indice % 3 != 0,
+                    first_seen: "2026-01-01T00:00:00Z".to_string(),
+                    last_seen: "2026-01-01T00:00:00Z".to_string(),
+                    alias: None,
+                    notes: None,
+                    os_family: Some("linux".to_string()),
+                    device_type_manual: None,
+                    last_fingerprint: None,
+                    model: None,
+                    dhcp_fingerprint: None,
+                    dhcp_vendor: None,
+                    dhcp_hostname: None,
+                    user_agent: None,
+                    os_source: None,
+                    watched: indice % 10 == 0,
+                }
+            })
+            .collect();
+        app.clamp_selection();
+
+        for (ancho, alto, limite_ms) in [(80u16, 24u16, 16u64), (120, 40, 33)] {
+            let _ = dibujar(&mut app, ancho, alto);
+            let repeticiones = 50u32;
+            let inicio = Instant::now();
+            for indice in 0..repeticiones {
+                app.selected = (indice as usize) % app.devices.len();
+                let _ = dibujar(&mut app, ancho, alto);
+            }
+            let media = inicio.elapsed() / repeticiones;
+            println!(
+                "render equipos (256 dispositivos) {ancho}x{alto}: {:.3} ms de media",
+                media.as_secs_f64() * 1000.0
+            );
+            assert!(
+                media <= Duration::from_millis(limite_ms),
+                "render con 256 equipos en {ancho}x{alto}: {media:?} > {limite_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn el_aviso_de_alerta_tapa_a_las_notificaciones_normales() {
+        let mut app = app_vacia();
+        app.push_alert_notice("▲ Alerta importante: Puerto nuevo · [5] para verla");
+        app.notifier
+            .push(crate::notifier::Level::Info, "mensaje normal");
+        let texto = dibujar(&mut app, 120, 30);
+        assert!(texto.contains("▲ Alerta importante: Puerto nuevo"));
+        assert!(
+            !texto.contains("mensaje normal"),
+            "el aviso de alerta tiene prioridad durante 10 s"
+        );
     }
 }

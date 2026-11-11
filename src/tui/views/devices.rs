@@ -7,7 +7,7 @@
 //! agrupada la traduce a la fila correspondiente de la tabla.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
@@ -88,6 +88,51 @@ impl Columnas {
     }
 }
 
+/// Marcas de F6 tras el icono de un equipo (§6, mockup 5): `*` si está
+/// vigilado (§7.7) y `!` si tiene alertas importantes o avisos sin ver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marcas {
+    /// El equipo está vigilado (`DEVICES.watched`).
+    vigilado: bool,
+    /// Tiene alertas importantes o de aviso sin ver.
+    alertas: bool,
+}
+
+impl Marcas {
+    /// Marcas del equipo con el estado que publica [App].
+    fn de(app: &App, device: &Device) -> Self {
+        Self {
+            vigilado: device.watched,
+            alertas: app.alerts.has_unseen(device.id),
+        }
+    }
+}
+
+/// Spans de la celda del icono: icono, marcas de F6 y relleno hasta el ancho.
+///
+/// Las marcas van tras el icono y no dependen solo del color (§6).
+fn spans_icono(
+    icono: &'static str,
+    estilo: Style,
+    marcas: Marcas,
+    ancho: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(icono, estilo)];
+    if marcas.vigilado {
+        spans.push(Span::styled("*", theme.accent));
+    }
+    if marcas.alertas {
+        spans.push(Span::styled("!", theme.warning));
+    }
+    let ocupado =
+        icono.chars().count() + usize::from(marcas.vigilado) + usize::from(marcas.alertas);
+    if ancho > ocupado {
+        spans.push(Span::styled(" ".repeat(ancho - ocupado), theme.normal));
+    }
+    spans
+}
+
 /// Dibuja la pestaña Equipos, con el panel master-detail si está abierto.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.detail_open() {
@@ -142,16 +187,25 @@ fn draw_lista(frame: &mut Frame, app: &mut App, area: Rect) {
     let interior = bloque.inner(area);
     frame.render_widget(bloque, area);
 
-    // Línea «Último evento» al pie del contenido (encima de la barra de estado);
-    // se oculta si no hay evento o si el texto no cabe (§6, mockup 5).
-    let evento = linea_ultimo_evento(app, interior.width);
-    let (area_lista, area_evento) = match &evento {
-        Some(_) if interior.height > 3 => {
-            let filas =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(interior);
-            (filas[0], Some(filas[1]))
+    // Pie del contenido: la leyenda de las marcas de F6 (bajo la lista) y la
+    // línea «Último evento» de F5. Se ocultan si no caben o si el texto no cabe
+    // en el ancho disponible (§6, mockup 5).
+    let mut pies: Vec<Line<'static>> = Vec::new();
+    if !indices.is_empty() {
+        if let Some(leyenda) = linea_leyenda(app, interior.width) {
+            pies.push(leyenda);
         }
-        _ => (interior, None),
+    }
+    if let Some(evento) = linea_ultimo_evento(app, interior.width) {
+        pies.push(evento);
+    }
+    let alto_pie = u16::try_from(pies.len()).unwrap_or(u16::MAX);
+    let (area_lista, area_pie) = if alto_pie > 0 && interior.height > alto_pie + 2 {
+        let filas =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(alto_pie)]).split(interior);
+        (filas[0], Some(filas[1]))
+    } else {
+        (interior, None)
     };
 
     if indices.is_empty() {
@@ -177,8 +231,8 @@ fn draw_lista(frame: &mut Frame, app: &mut App, area: Rect) {
             ListView::Grouped => draw_grouped(frame, app, &indices, area_lista),
         }
     }
-    if let (Some(linea), Some(area)) = (evento, area_evento) {
-        frame.render_widget(Paragraph::new(linea), area);
+    if let Some(area) = area_pie {
+        frame.render_widget(Paragraph::new(pies), area);
     }
 }
 
@@ -213,6 +267,32 @@ fn linea_ultimo_evento(app: &App, ancho: u16) -> Option<Line<'static>> {
     ]))
 }
 
+/// Leyenda de las marcas de la lista de equipos (§6, mockup 5).
+///
+/// El mockup pide «* vigilado · ! alertas sin ver»; si el pie de teclas ya
+/// anuncia `[p]vigilar` (keys.rs) no se repite aquí. Se oculta si no cabe.
+fn linea_leyenda(app: &App, ancho: u16) -> Option<Line<'static>> {
+    const BASE: &str = "* vigilado · ! alertas sin ver";
+    const EXTRA: &str = " · [p]vigilar";
+    let disponible = usize::from(ancho);
+    if BASE.chars().count() > disponible {
+        return None;
+    }
+    let mut spans = vec![
+        Span::styled("*", app.theme.accent),
+        Span::styled(" vigilado · ", app.theme.dim),
+        Span::styled("!", app.theme.warning),
+        Span::styled(" alertas sin ver", app.theme.dim),
+    ];
+    let pie_lo_dice = crate::tui::keys::FOOTER_EQUIPOS
+        .iter()
+        .any(|linea| linea.contains("[p]"));
+    if !pie_lo_dice && BASE.chars().count() + EXTRA.chars().count() <= disponible {
+        spans.push(Span::styled(EXTRA, app.theme.dim));
+    }
+    Some(Line::from(spans))
+}
+
 /// Texto de «hace cuánto» de un evento («2 min», «3 h», «2 d»).
 fn hace_cuanto(segundos: i64) -> String {
     let segundos = segundos.max(0);
@@ -242,7 +322,7 @@ fn draw_flat(frame: &mut Frame, app: &mut App, indices: &[usize], area: Rect) {
 
     let filas: Vec<Row> = indices
         .iter()
-        .map(|indice| fila(&app.devices[*indice], &app.theme))
+        .map(|indice| fila(app, &app.devices[*indice], columnas.icono))
         .collect();
 
     let tabla = Table::new(filas, columnas.constraints())
@@ -273,7 +353,7 @@ fn draw_grouped(frame: &mut Frame, app: &mut App, indices: &[usize], area: Rect)
         if posicion == app.selected {
             fila_seleccionada = Some(filas.len());
         }
-        filas.push(fila_agrupada(device, columnas, &app.theme));
+        filas.push(fila_agrupada(app, device, columnas));
     }
 
     // Una única columna con la línea completa ya formateada: así las cabeceras
@@ -287,9 +367,12 @@ fn draw_grouped(frame: &mut Frame, app: &mut App, indices: &[usize], area: Rect)
     frame.render_stateful_widget(tabla, area, &mut app.table_state);
 }
 
-/// Fila de la lista plana.
-fn fila(device: &Device, theme: &Theme) -> Row<'static> {
+/// Fila de la lista plana, con las marcas de F6 tras el icono.
+fn fila(app: &App, device: &Device, ancho_icono: u16) -> Row<'static> {
+    let theme = &app.theme;
     let (icono, estilo_icono) = device_icon(device, theme);
+    let marcas = Marcas::de(app, device);
+    let celda_icono = spans_icono(icono, estilo_icono, marcas, usize::from(ancho_icono), theme);
     let fabricante = texto_fabricante(device);
     let hostname = device.display_name().to_string();
     let estilo_hostname = if device.alias.is_some() {
@@ -304,7 +387,7 @@ fn fila(device: &Device, theme: &Theme) -> Row<'static> {
     };
 
     Row::new(vec![
-        Cell::from(Span::styled(icono, estilo_icono)),
+        Cell::from(Line::from(celda_icono)),
         Cell::from(Span::raw(device.ip.clone())),
         Cell::from(Span::styled(hostname, estilo_hostname)),
         Cell::from(Span::styled(fabricante, theme.dim)),
@@ -314,8 +397,13 @@ fn fila(device: &Device, theme: &Theme) -> Row<'static> {
 }
 
 /// Fila de un equipo en la vista agrupada (línea formateada a mano).
-fn fila_agrupada(device: &Device, columnas: Columnas, theme: &Theme) -> Row<'static> {
+///
+/// La columna del icono reserva sitio para las dos marcas de F6 (`*` y `!`),
+/// de modo que todos los equipos quedan alineados (§6, mockup 5).
+fn fila_agrupada(app: &App, device: &Device, columnas: Columnas) -> Row<'static> {
+    let theme = &app.theme;
     let (icono, estilo_icono) = device_icon(device, theme);
+    let marcas = Marcas::de(app, device);
     let fabricante = texto_fabricante(device);
     let hostname = device.display_name().to_string();
     let estilo_hostname = if device.alias.is_some() {
@@ -328,15 +416,20 @@ fn fila_agrupada(device: &Device, columnas: Columnas, theme: &Theme) -> Row<'sta
     } else {
         theme.offline
     };
-    let ancho_icono = usize::from(columnas.icono).saturating_sub(2);
     let texto_estado = if device.is_online {
         "online"
     } else {
         "offline"
     };
 
-    let linea = Line::from(vec![
-        Span::styled(format!("  {}", ajustar(icono, ancho_icono)), estilo_icono),
+    let mut spans = spans_icono(
+        icono,
+        estilo_icono,
+        marcas,
+        usize::from(columnas.icono),
+        theme,
+    );
+    spans.extend([
         Span::styled(" ", theme.normal),
         Span::styled(ajustar(&device.ip, usize::from(columnas.ip)), theme.normal),
         Span::styled(" ", theme.normal),
@@ -358,7 +451,7 @@ fn fila_agrupada(device: &Device, columnas: Columnas, theme: &Theme) -> Row<'sta
         ),
     ]);
 
-    Row::new(vec![Cell::from(linea)])
+    Row::new(vec![Cell::from(Line::from(spans))])
 }
 
 /// Texto de la columna Fabricante: MAC y OUI, o «MAC privada» si el bit U/L
@@ -393,7 +486,7 @@ fn ajustar(texto: &str, ancho: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::hace_cuanto;
+    use super::{hace_cuanto, linea_leyenda};
     use crate::capabilities::Capabilities;
     use crate::config::{Config, ListView};
     use crate::repo::devices::Device;
@@ -446,6 +539,7 @@ mod tests {
             dhcp_hostname: None,
             user_agent: None,
             os_source: None,
+            watched: false,
         }
     }
 
@@ -709,5 +803,93 @@ mod tests {
         assert_eq!(hace_cuanto(120), "2 min");
         assert_eq!(hace_cuanto(3 * 3600), "3 h");
         assert_eq!(hace_cuanto(2 * 86_400), "2 d");
+    }
+
+    /// Equipo de tipo NAS (icono «[▣]») y vigilado.
+    fn dispositivo_vigilado(id: i64, ip: &str) -> Device {
+        let mut device = dispositivo_de_tipo(id, ip, "nas");
+        device.watched = true;
+        device
+    }
+
+    #[test]
+    fn las_marcas_de_f6_van_tras_el_icono_en_la_vista_plana() {
+        let mut app = app_con(vec![
+            dispositivo_vigilado(1, "10.0.0.1"),
+            dispositivo_de_tipo(2, "10.0.0.2", "pc"),
+        ]);
+        app.alerts.set_device_unseen(vec![2]);
+        let contenido = dibujar(&mut app, 100, 24);
+        assert!(
+            contenido.contains("[▣]*"),
+            "el equipo vigilado lleva * tras el icono"
+        );
+        assert!(
+            contenido.contains("[▣]!"),
+            "el equipo con alertas sin ver lleva ! tras el icono"
+        );
+        assert!(contenido.contains("* vigilado · ! alertas sin ver"));
+
+        // Las mismas marcas y la leyenda en pantalla grande.
+        let contenido = dibujar(&mut app, 120, 40);
+        assert!(contenido.contains("[▣]*"));
+        assert!(contenido.contains("[▣]!"));
+        assert!(contenido.contains("* vigilado · ! alertas sin ver"));
+    }
+
+    #[test]
+    fn sin_vigilado_ni_alertas_no_hay_marcas() {
+        let mut app = app_con(vec![dispositivo(1, "10.0.0.1", true, false)]);
+        let contenido = dibujar(&mut app, 120, 40);
+        assert!(!contenido.contains("[?]*"));
+        assert!(!contenido.contains("[?]!"));
+        assert!(contenido.contains("[?]"), "el icono se sigue viendo");
+    }
+
+    #[test]
+    fn las_marcas_y_la_leyenda_caben_en_ochenta_por_veinticuatro() {
+        let mut app = app_con(vec![
+            dispositivo_vigilado(1, "10.0.0.1"),
+            dispositivo_de_tipo(2, "10.0.0.2", "pc"),
+        ]);
+        app.alerts.set_device_unseen(vec![2]);
+        let contenido = dibujar(&mut app, 80, 24);
+        assert!(contenido.contains("[▣]*"));
+        assert!(contenido.contains("! alertas sin ver"));
+        assert!(!contenido.contains("demasiado pequeño"));
+    }
+
+    #[test]
+    fn la_vista_agrupada_tambien_muestra_las_marcas() {
+        let mut app = app_agrupada(vec![dispositivo_vigilado(1, "10.0.0.1")]);
+        app.alerts.set_device_unseen(vec![1]);
+        let contenido = dibujar(&mut app, 80, 24);
+        assert!(contenido.contains("[▣]*!"));
+        assert!(contenido.contains("* vigilado · ! alertas sin ver"));
+    }
+
+    #[test]
+    fn la_leyenda_anade_p_vigilar_solo_si_el_pie_no_lo_trae() {
+        let app = app_con(vec![dispositivo(1, "10.0.0.1", true, false)]);
+        let linea = linea_leyenda(&app, 80).expect("la leyenda cabe a 80 columnas");
+        let texto: String = linea
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(texto.starts_with("* vigilado · ! alertas sin ver"));
+        let pie_lo_dice = crate::tui::keys::FOOTER_EQUIPOS
+            .iter()
+            .any(|linea| linea.contains("[p]"));
+        assert_eq!(texto.contains("[p]vigilar"), !pie_lo_dice);
+        // A un ancho mínimo que solo deja la leyenda base, no se añade nada.
+        let estrecha = linea_leyenda(&app, 30).expect("la leyenda base cabe en 30");
+        let texto_estrecho: String = estrecha
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert_eq!(texto_estrecho, "* vigilado · ! alertas sin ver");
+        assert!(linea_leyenda(&app, 10).is_none());
     }
 }

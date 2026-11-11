@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::alerts::RuleId;
 use crate::config::Config;
 use crate::tui::app::App;
 
@@ -38,6 +39,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
     ];
+
+    // Alertas (F6): [alerts], notificador, horario silencioso y propio equipo.
+    lineas.extend(bloque_alertas(app));
+    lineas.push(Line::from(""));
 
     // Inferencia, catálogo y bases IP (Fase 4).
     lineas.push(Line::from(Span::styled(
@@ -125,6 +130,214 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         interior,
     );
+}
+
+/// Sección [alerts] de F6 y estado de las notificaciones (§6, mockup 5).
+///
+/// Pinta la configuración activa, el notificador (servidor o próximo intento),
+/// el horario silencioso, las notificaciones descartadas y el aprendizaje y el
+/// inventario del propio equipo.
+fn bloque_alertas(app: &App) -> Vec<Line<'static>> {
+    let alerts = &app.config.alerts;
+    let mut lineas: Vec<Line> = Vec::new();
+    lineas.push(Line::from(Span::styled("Alertas (F6)", app.theme.accent)));
+    lineas.push(Line::from(vec![
+        Span::styled("  [alerts] ", app.theme.accent),
+        Span::styled(
+            format!(
+                "enabled = {}   retention_days = {}   learning_days = {}",
+                alerts.enabled, alerts.retention_days, alerts.learning_days
+            ),
+            app.theme.normal,
+        ),
+    ]));
+    lineas.push(Line::from(Span::styled(
+        format!(
+            "    catch_up_minutes = {}   dedup_hours = {}   quiet_hours = {}",
+            alerts.catch_up_minutes,
+            alerts.dedup_hours,
+            if alerts.quiet_hours.trim().is_empty() {
+                "«ninguno»".to_string()
+            } else {
+                format!("\"{}\"", alerts.quiet_hours.trim())
+            }
+        ),
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        format!(
+            "    desktop_notifications = {}   max_notifications_per_minute = {}",
+            alerts.desktop_notifications, alerts.max_notifications_per_minute
+        ),
+        app.theme.normal,
+    )));
+    let traffic = alerts.traffic_high;
+    lineas.push(Line::from(Span::styled(
+        format!(
+            "    traffic_high: ×{} la mediana · {} días · mínimo {} · ↓ {} MB · ↑ {} MB/h",
+            traffic.factor,
+            traffic.baseline_days,
+            traffic.min_days,
+            traffic.min_mb_down,
+            traffic.min_mb_up
+        ),
+        app.theme.normal,
+    )));
+    let reglas_activas = RuleId::ALL
+        .iter()
+        .filter(|regla| alerts.rule(**regla).enabled)
+        .count();
+    lineas.push(Line::from(Span::styled(
+        format!(
+            "    capture_drops: > {} % durante {} min · reglas: {reglas_activas} de {} activas",
+            alerts.capture_drops.percent,
+            alerts.capture_drops.minutes,
+            RuleId::ALL.len()
+        ),
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(""));
+
+    lineas.push(linea_notificador(app));
+    lineas.push(linea_horario_silencioso(app));
+    if let Some(notificador) = app.alert_notifier.as_ref() {
+        let descartadas = notificador.drops();
+        if descartadas > 0 {
+            lineas.push(Line::from(vec![
+                Span::styled("  Notificaciones descartadas: ", app.theme.accent),
+                Span::styled(
+                    format!("{descartadas} (el canal del notificador estaba lleno)"),
+                    app.theme.warning,
+                ),
+            ]));
+        }
+    }
+    lineas.push(linea_propio_equipo(app));
+    lineas
+}
+
+/// Estado del notificador de escritorio, con el servidor o el próximo intento.
+fn linea_notificador(app: &App) -> Line<'static> {
+    let (texto, estilo) = match app.alert_notifier.as_ref() {
+        Some(notificador) => {
+            let estado = notificador.status();
+            let estilo = match estado {
+                crate::notify::NotifierStatus::Disponible { .. } => app.theme.online,
+                crate::notify::NotifierStatus::Apagado => app.theme.dim,
+                crate::notify::NotifierStatus::NoDisponible { .. } => app.theme.warning,
+            };
+            let mut texto = estado.summary();
+            let enviadas = notificador.enviadas();
+            if enviadas > 0 {
+                texto.push_str(&format!(" · {enviadas} enviadas"));
+            }
+            (texto, estilo)
+        }
+        None => (
+            "sin notificador en esta sesión (solo pruebas)".to_string(),
+            app.theme.dim,
+        ),
+    };
+    Line::from(vec![
+        Span::styled("  Notificaciones de escritorio: ", app.theme.accent),
+        Span::styled(texto, estilo),
+    ])
+}
+
+/// Horario silencioso de las notificaciones: activo o no y cuándo empieza (§7.14).
+fn linea_horario_silencioso(app: &App) -> Line<'static> {
+    match crate::alerts::QuietHours::parse(&app.config.alerts.quiet_hours) {
+        Ok(None) => Line::from(vec![
+            Span::styled("  Horario silencioso: ", app.theme.accent),
+            Span::styled("sin horario configurado", app.theme.dim),
+        ]),
+        Ok(Some(horario)) => {
+            let activo = horario.contains_at(std::time::SystemTime::now());
+            let texto = if activo {
+                format!(
+                    "ahora sí (hasta las {:02}:{:02})",
+                    horario.end_min / 60,
+                    horario.end_min % 60
+                )
+            } else {
+                format!(
+                    "ahora no (empieza a las {:02}:{:02})",
+                    horario.start_min / 60,
+                    horario.start_min % 60
+                )
+            };
+            Line::from(vec![
+                Span::styled("  Horario silencioso: ", app.theme.accent),
+                Span::styled(
+                    texto,
+                    if activo {
+                        app.theme.warning
+                    } else {
+                        app.theme.normal
+                    },
+                ),
+                Span::styled(format!(" · {}", horario.as_string()), app.theme.dim),
+            ])
+        }
+        Err(_) => Line::from(vec![
+            Span::styled("  Horario silencioso: ", app.theme.accent),
+            Span::styled(
+                format!("«{}» no es válido", app.config.alerts.quiet_hours),
+                app.theme.warning,
+            ),
+        ]),
+    }
+}
+
+/// Aprendizaje e inventario del propio equipo (§7.3 y §7.11).
+fn linea_propio_equipo(app: &App) -> Line<'static> {
+    let dias = app.config.alerts.learning_days;
+    let mut spans = vec![Span::styled("  Propio equipo: ", app.theme.accent)];
+    match app.alerts.host_summary.as_ref() {
+        None => spans.push(Span::styled("cargando…", app.theme.dim)),
+        Some(resumen) => {
+            spans.push(Span::styled(
+                texto_aprendizaje(resumen.learning.as_ref(), dias),
+                app.theme.normal,
+            ));
+            if let Some(inventario) = resumen.inventory.as_ref() {
+                spans.push(Span::styled(
+                    format!(
+                        " · inventario: {} apps, {} categorías, {} organizaciones, {} países, {} huellas JA4",
+                        inventario.count(crate::history::SeenKind::App),
+                        inventario.count(crate::history::SeenKind::Category),
+                        inventario.count(crate::history::SeenKind::Org),
+                        inventario.count(crate::history::SeenKind::Country),
+                        inventario.count(crate::history::SeenKind::Ja4)
+                    ),
+                    app.theme.dim,
+                ));
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+/// Texto del aprendizaje de lo nuevo para un sujeto (§7.3).
+fn texto_aprendizaje(learning: Option<&crate::alerts::LearningState>, dias: u32) -> String {
+    match learning {
+        None => "sin datos de aprendizaje todavía".to_string(),
+        Some(estado) => match estado.learned_at {
+            Some(instante) => {
+                let unix = instante
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duracion| duracion.as_secs() as i64)
+                    .unwrap_or(0);
+                let fecha = crate::history::LocalDay::from_unix(unix).label_corto();
+                format!("aprendido el {fecha} ({} días con datos)", estado.data_days)
+            }
+            None if dias == 0 => "sin aprendizaje ([alerts].learning_days = 0)".to_string(),
+            None => format!(
+                "aprendiendo ({} de {dias} días con datos)",
+                estado.data_days
+            ),
+        },
+    }
 }
 
 /// Sección [history] de la configuración y estado de la base de datos (F5).
@@ -305,6 +518,7 @@ mod tests {
             dhcp_hostname: None,
             user_agent: None,
             os_source: None,
+            watched: false,
         }
     }
 
@@ -328,7 +542,7 @@ mod tests {
         // La pestaña Config es larga (TOML completo): el backend de pruebas
         // necesita altura suficiente para que [ui] entre en el viewport.
         let app = app_prueba(Vec::new());
-        let contenido = texto(&app, 110, 80);
+        let contenido = texto(&app, 110, 140);
         assert!(contenido.contains("/tmp/config.toml"));
         assert!(contenido.contains("[scan]"));
         assert!(contenido.contains("[storage]"));
@@ -539,5 +753,186 @@ mod tests_f5 {
         let contenido = texto(&app, 160, 100);
         assert!(contenido.contains("sin estadísticas todavía"));
         assert!(contenido.contains("Última purga: todavía no ha corrido"));
+    }
+}
+
+#[cfg(test)]
+mod tests_f6 {
+    use crate::alerts::{AlertCounts, LearningState, Subject};
+    use crate::capabilities::Capabilities;
+    use crate::config::Config;
+    use crate::history::{AlertSummary, Inventory, SeenRow, SubjectSel};
+    use crate::tui::app::App;
+    use chrono::Timelike;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    fn app_prueba() -> App {
+        App::new(
+            Config::default(),
+            PathBuf::from("/tmp/config.toml"),
+            PathBuf::from("/tmp/data.db"),
+            Capabilities {
+                raw_sockets: true,
+                detail: "CAP_NET_RAW detectada".to_string(),
+            },
+            None,
+        )
+    }
+
+    fn texto(app: &App, ancho: u16, alto: u16) -> String {
+        let backend = TestBackend::new(ancho, alto);
+        let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
+        terminal
+            .draw(|frame| super::draw(frame, app, frame.area()))
+            .expect("dibujado de Config");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect()
+    }
+
+    fn filas(cantidad: usize, prefijo: &str) -> Vec<SeenRow> {
+        (0..cantidad)
+            .map(|indice| SeenRow {
+                key: format!("{prefijo}{indice}"),
+                label: format!("{prefijo}{indice}"),
+                first_seen: "2026-10-12T00:00:00Z".to_string(),
+                last_seen: "2026-10-12T00:00:00Z".to_string(),
+            })
+            .collect()
+    }
+
+    fn inventario_host() -> Inventory {
+        Inventory {
+            device_id: 0,
+            since: Some("2026-10-12T00:00:00Z".to_string()),
+            apps: filas(41, "app"),
+            categories: filas(12, "cat"),
+            orgs: filas(230, "org"),
+            countries: filas(19, "pais"),
+            ja4: filas(27, "ja4"),
+            ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_muestra_la_seccion_alerts() {
+        let app = app_prueba();
+        let contenido = texto(&app, 160, 120);
+        assert!(contenido.contains("Alertas (F6)"));
+        assert!(contenido.contains("[alerts]"));
+        assert!(contenido.contains("enabled = true"));
+        assert!(contenido.contains("retention_days = 90"));
+        assert!(contenido.contains("learning_days = 7"));
+        assert!(contenido.contains("catch_up_minutes = 10"));
+        assert!(contenido.contains("dedup_hours = 24"));
+        assert!(contenido.contains("quiet_hours = «ninguno»"));
+        assert!(contenido.contains("desktop_notifications = true"));
+        assert!(contenido.contains("max_notifications_per_minute = 3"));
+        assert!(contenido
+            .contains("traffic_high: ×3 la mediana · 14 días · mínimo 5 · ↓ 200 MB · ↑ 50 MB/h"));
+        assert!(contenido.contains("capture_drops: > 1 % durante 5 min · reglas: 16 de 16 activas"));
+        assert!(contenido.contains("Notificaciones de escritorio:"));
+        assert!(contenido.contains("Horario silencioso: sin horario configurado"));
+    }
+
+    #[test]
+    fn config_muestra_el_notificador_apagado() {
+        let mut app = app_prueba();
+        app.alert_notifier = Some(crate::notify::spawn(crate::notify::NotifyConfig {
+            enabled: false,
+        }));
+        let contenido = texto(&app, 160, 120);
+        assert!(contenido.contains("Notificaciones de escritorio: APAGADO"));
+        assert!(contenido.contains("desktop_notifications = false"));
+        assert!(!contenido.contains("Notificaciones descartadas"));
+    }
+
+    #[test]
+    fn config_muestra_si_el_horario_silencioso_esta_activo() {
+        let mut app = app_prueba();
+        let hora = chrono::Local::now().hour();
+        // Ventana de tres horas alrededor de la hora local: siempre activa.
+        app.config.alerts.quiet_hours =
+            format!("{:02}:00-{:02}:00", (hora + 23) % 24, (hora + 2) % 24);
+        let contenido = texto(&app, 160, 120);
+        assert!(
+            contenido.contains("Horario silencioso: ahora sí"),
+            "la ventana contiene la hora actual"
+        );
+        // Ventana al otro lado del día: ahora no.
+        app.config.alerts.quiet_hours =
+            format!("{:02}:00-{:02}:00", (hora + 3) % 24, (hora + 5) % 24);
+        let contenido = texto(&app, 160, 120);
+        assert!(contenido.contains("Horario silencioso: ahora no"));
+    }
+
+    #[test]
+    fn config_muestra_el_aprendizaje_y_el_inventario_del_propio_equipo() {
+        let mut app = app_prueba();
+        app.alerts.host_summary = Some(AlertSummary {
+            subject: SubjectSel::Host,
+            recent: Vec::new(),
+            unseen: AlertCounts::default(),
+            mutes: Vec::new(),
+            learning: Some(LearningState {
+                subject: Subject::Host,
+                learning_from: SystemTime::now() - Duration::from_secs(7 * 86_400),
+                data_days: 4,
+                learned_at: None,
+            }),
+            inventory: Some(inventario_host()),
+        });
+        let contenido = texto(&app, 200, 120);
+        assert!(contenido.contains("Propio equipo: aprendiendo (4 de 7 días con datos)"));
+        assert!(contenido.contains(
+            "inventario: 41 apps, 12 categorías, 230 organizaciones, 19 países, 27 huellas JA4"
+        ));
+    }
+
+    #[test]
+    fn config_muestra_el_aprendizaje_terminado() {
+        let mut app = app_prueba();
+        app.alerts.host_summary = Some(AlertSummary {
+            subject: SubjectSel::Host,
+            recent: Vec::new(),
+            unseen: AlertCounts::default(),
+            mutes: Vec::new(),
+            learning: Some(LearningState {
+                subject: Subject::Host,
+                learning_from: SystemTime::now() - Duration::from_secs(7 * 86_400),
+                data_days: 7,
+                learned_at: Some(SystemTime::now() - Duration::from_secs(86_400)),
+            }),
+            inventory: None,
+        });
+        let contenido = texto(&app, 200, 120);
+        assert!(contenido.contains("aprendido el"));
+        assert!(contenido.contains("(7 días con datos)"));
+        assert!(!contenido.contains("inventario:"));
+    }
+
+    #[test]
+    fn la_seccion_de_alertas_cabe_en_ochenta_por_veinticuatro() {
+        let app = app_prueba();
+        let contenido = texto(&app, 80, 24);
+        assert!(contenido.contains("Alertas (F6)"));
+        assert!(contenido.contains("Notificaciones de escritorio:"));
+        assert!(contenido.contains("Horario silencioso:"));
+    }
+
+    #[test]
+    fn la_seccion_de_alertas_cabe_en_ciento_veinte_por_cuarenta() {
+        let app = app_prueba();
+        let contenido = texto(&app, 120, 40);
+        assert!(contenido.contains("Alertas (F6)"));
+        assert!(contenido.contains("[alerts]"));
+        assert!(contenido.contains("Propio equipo:"));
     }
 }

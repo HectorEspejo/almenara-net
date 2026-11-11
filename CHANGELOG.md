@@ -3,6 +3,76 @@
 Todas las versiones relevantes del proyecto. El formato sigue
 [Versionado Semántico](https://semver.org/lang/es/).
 
+## [0.6.0] - 2026-11-11
+
+**Fase 6 — Alertas (locales + escritorio).** Almenara deja de solo observar y
+avisa de lo que cambia: un motor puro con 16 reglas, tres niveles, aprendizaje
+de 7 días con datos, deduplicación de 24 h, silencios y notificaciones de
+escritorio por D-Bus. Llegan la pestaña **Alertas** (lista con detalle, Reglas y
+Silencios), el contador «Alertas N» en la barra, las marcas `*`/`!` en Equipos,
+el bloque de alertas y el aprendizaje en el detalle, `[alerts]` en Config y los
+huecos de suspensión y captura parada en todo el histórico.
+
+### Añadido
+
+- **Pestaña Alertas** con lista por última repetición, nivel (importante / aviso
+  / info), marca de no vista, «×N» de repeticiones y «· resuelta»; detalle con el
+  porqué, las repeticiones, si se notificó y lo que agrupa un resumen. Filtros
+  de nivel, solo sin ver y por equipo.
+- **Catálogo fijo de 16 reglas**: equipo nuevo, puerto nuevo, cambio de MAC, de
+  nombre, de SO y de tipo; app, categoría, país, organización y huella JA4
+  nuevas; más tráfico de lo habitual; vigilado ausente o de vuelta; captura
+  parada; pérdidas de captura y base de datos grande. Las reglas se activan,
+  apagan y cambian de nivel desde la TUI, guardando en `config.toml`.
+- **Aprendizaje de 7 días con datos** por sujeto (equipos y propio equipo), con
+  relleno inicial desde el histórico de F5, línea base en una BD vacía y sin
+  vuelta atrás.
+- **Deduplicación de 24 h** con repeticiones y alertas de condición que se
+  resuelven y reactivan; apagar una regla resuelve sus condiciones.
+- **Silencios** por regla, sujeto y equipo (1 día, 7 días o siempre) con vista
+  propia y purga de los caducados.
+- **Notificaciones de escritorio** por D-Bus de sesión (`notify-rust` 4.17,
+  Rust puro) en un hilo propio: solo las importantes, puesta al día de 10
+  minutos con resumen, horario silencioso, tope de 3 por minuto y estado del
+  notificador en Config.
+- **Equipos vigilados** (`DEVICES.watched`): `p` los marca en Equipos y en el
+  detalle; solo ellos avisan de presencia, con `while_closed` si se fueron con
+  Almenara cerrada.
+- **Inventario del propio equipo** (`HOST_SEEN`) con apps, categorías,
+  organizaciones, países y JA4, y su aprendizaje en Config.
+- **Huecos dentro de la sesión** (`COVERAGE_GAPS`): suspensión del equipo por
+  `CLOCK_BOOTTIME` frente a `CLOCK_MONOTONIC` y captura parada; toda cobertura
+  los resta y la línea de tiempo de Histórico los muestra.
+- **Puertos cerrados con fecha** (`DEVICE_SERVICES.closed_at`) y detección de
+  `reopened`; el detalle dice «cerrado el …» y `last_seen` vuelve a ser la
+  última vez que se vio abierto.
+- **Migración v6 aditiva**: ALERTS, ALERT_MUTES, ALERT_LEARNING, HOST_SEEN y
+  COVERAGE_GAPS, columnas `DEVICES.watched` y `DEVICE_SERVICES.closed_at`, con
+  rellenos de cierre y aprendizaje y test de compatibilidad v5 → v6.
+- **Mediciones**: `medir_alertas_motor`, `medir_alertas_hora`,
+  `medir_alertas_aprendizaje`, `medir_alertas_consulta`, `medir_migracion_v6` y
+  `medir_render_alertas`, con el sintético ampliado con alertas, silencios,
+  aprendizaje, `HOST_SEEN` y huecos.
+
+### Cambiado
+
+- Un puerto CERRADO se representa con `DEVICE_SERVICES.closed_at`;
+  `Repo::mark_service_closed` ya no mueve `last_seen` (hasta la v6 lo hacía).
+- `Repo::close_open_sessions` cierra también los huecos abiertos de una sesión
+  interrumpida.
+- Configuración nueva `[alerts]`, `[alerts.traffic_high]`,
+  `[alerts.capture_drops]` y `[alerts.rules]`, con validación tolerante.
+- Dependencia nueva `notify-rust` 4.17 (sin features por defecto, con `z`);
+  `uuid` queda fijada a una versión compatible con la MSRV 1.88.
+
+### Corregido
+
+- El cierre de un puerto ya no falsea `last_seen` y el estado CERRADO es
+  determinista con un escaneo posterior.
+- La cobertura del histórico, la presencia y el aprendizaje descuentan la
+  suspensión del equipo y la captura parada, que antes contaban como horas sin
+  tráfico.
+
 ## [0.5.0] - 2026-11-11
 
 **Fase 5 — Histórico, rollups y eventos.** Almenara deja de olvidar: cierra cada

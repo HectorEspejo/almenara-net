@@ -2,13 +2,14 @@
 
 ## Contexto
 
-Almenara es un monitor de red en TUI para Linux que descubre los equipos de la red local y muestra su tráfico, conexiones e histórico. Cliente: uso personal del desarrollador.
+Almenara es un monitor de red en TUI para Linux que descubre los equipos de la red local y muestra su tráfico, conexiones e histórico, y avisa de lo que cambia (F6). Cliente: uso personal del desarrollador.
 Stack: Rust (edition 2021, MSRV 1.88), tokio, ratatui + crossterm, clap, serde + toml,
-rusqlite (bundled), pnet (datalink), libc + nix (raw sockets, AF_PACKET, TPACKET_V3),
+rusqlite (bundled, hooks), pnet (datalink), libc + nix (raw sockets, AF_PACKET, TPACKET_V3),
 macaddr-ouidb (renombrada ouidb), hickory-proto (mDNS y respuestas DNS), reqwest (rustls, solo XML UPnP),
 tracing. Parser SSDP propio. Captura de tráfico con AF_PACKET + TPACKET_V3 (sin libpcap).
 Desde F4: RustCrypto (`aes-gcm`, `aes`, `hkdf`, `sha2`) para QUIC Initial y JA4, `psl` (dominio
-registrable) y `maxminddb` con DB-IP Lite embebida (organización y país). F5 no añade dependencias.
+registrable) y `maxminddb` con DB-IP Lite embebida (organización y país). F5 no añade dependencias: solo activa la feature `hooks` de `rusqlite` (para `progress_handler`).
+F6 añade `notify-rust` 4.17 (notificaciones de escritorio por D-Bus, Rust puro con `zbus` 5; desde la 4.18 pide Rust 1.89).
 
 ## Documentación del proyecto
 
@@ -25,11 +26,14 @@ La documentación funcional vive en `docs/`, con una carpeta por fase (`docs/fas
 - `docs/fase3/almenara-fase3-checklist.md` — alcance verificable de Fase 3 (102 casillas)
 - `docs/fase3/almenara-fase3-implementacion.md` — informe de implementación de Fase 3
 - `docs/fase4/almenara-fase4-informe.md` — especificación funcional de Fase 4 (v1.1)
-- `docs/fase4/almenara-fase4-checklist.md` — alcance verificable de Fase 4 (176 casillas; 9 pendientes de la pasada con `CAP_NET_RAW`)
+- `docs/fase4/almenara-fase4-checklist.md` — alcance verificable de Fase 4 (176 casillas; 9 pendientes de la pasada con `CAP_NET_RAW`, que cierra el sprint 6.0 de F6)
 - `docs/fase4/almenara-fase4-implementacion.md` — informe de implementación de Fase 4
-- `docs/fase5/almenara-fase5-informe.md` — especificación funcional de Fase 5 (v1.0)
+- `docs/fase5/almenara-fase5-informe.md` — especificación funcional de Fase 5 (v1.1)
 - `docs/fase5/almenara-fase5-checklist.md` — alcance verificable de Fase 5 (141 casillas)
-- `docs/fase5/almenara-fase5-implementacion.md` — informe de implementación de Fase 5 (lo escribes tú)
+- `docs/fase5/almenara-fase5-implementacion.md` — informe de implementación de Fase 5
+- `docs/fase6/almenara-fase6-informe.md` — especificación funcional de Fase 6 (v1.0)
+- `docs/fase6/almenara-fase6-checklist.md` — alcance verificable de Fase 6 (174 casillas)
+- `docs/fase6/almenara-fase6-implementacion.md` — informe de implementación de Fase 6 (lo escribes tú)
 
 El informe de fase manda sobre tu criterio: si algo te parece incorrecto o incompleto, no lo cambies por tu cuenta — impleméntalo como está o párate y coméntalo con el desarrollador.
 
@@ -39,6 +43,7 @@ El informe de fase manda sobre tu criterio: si algo te parece incorrecto o incom
 - No añadas funcionalidades que no estén en el checklist de la fase. Si detectas algo necesario que falta, propónlo antes de implementarlo y déjalo anotado como desviación.
 - Nomenclatura: tablas SQL en `MAYUSCULAS_SNAKE_CASE`, campos en `minusculas_snake_case`. Como Almenara es TUI (sin API HTTP), los "servicios internos" siguen el patrón `Módulo::función_snake_case`.
 - Gestor de dependencias: `cargo`; requiere Rust 1.88 o superior (MSRV). Comando de arranque: `cargo run`. Tests: `cargo test`. Formato: `cargo fmt`. Lints: `cargo clippy --all-targets -- -D warnings`.
+- El crate es solo binario (sin `lib.rs`): las pruebas que necesitan módulos internos van como tests unitarios en `src/` (`#[cfg(test)]`); `tests/` es solo para la CLI. Mediciones de rendimiento (pruebas ignoradas `medir_*`, con histórico sintético): `cargo test --release --bin almenara medir_ -- --ignored --nocapture --test-threads=1`.
 - Arranque con `CAP_NET_RAW`: `scripts/ejecutar-con-permisos.sh`. El `setcap` necesita el `sudo` del desarrollador, que tú no tienes: pídeselo y no recompiles después, porque recompilar quita la capacidad.
 - Datos embebidos en `data/` (catálogo de apps y DB-IP Lite) con origen, fecha y licencia en `data/FUENTES.md`. Las bases IP solo se actualizan con `scripts/actualizar-bases-ip.sh` (desarrollo); la app nunca descarga nada. Atribución a DB-IP (CC BY 4.0) en Ayuda, README y `data/FUENTES.md`.
 - SQLite con migraciones versionadas en `src/repo/migrations.rs`. Cada migración es idempotente y se aplica en orden.
@@ -46,12 +51,12 @@ El informe de fase manda sobre tu criterio: si algo te parece incorrecto o incom
 - Modo degradado obligatorio: la app debe arrancar sin `CAP_NET_RAW` mostrando aviso visible en la barra de estado. Nunca asumas privilegios.
 - Paleta 256 colores con respeto a `NO_COLOR=1`. Contraste mínimo 4.5:1.
 - OUI: el crate `ouidb` no existe en crates.io; en Cargo.toml se declara `ouidb = { package = "macaddr-ouidb", version = "0.3" }` y en el código se mantiene el nombre `ouidb`.
-- SQLite: fechas como TEXT RFC 3339 en UTC; modo WAL con claves foráneas activas y una única conexión de escritura en el hilo de la TUI. El histórico (F5) se lee por la conexión de solo lectura del lector, en su propio hilo; ningún otro hilo escribe. Excepción a las fechas TEXT: los cubos de `TRAFFIC_ROLLUP_*` son enteros (segundos Unix UTC; día local AAAAMMDD). Horas en UTC y días por fecha local, nunca mezclados.
+- SQLite: fechas como TEXT RFC 3339 en UTC; modo WAL con claves foráneas activas y una única conexión de escritura en el hilo de la TUI. El histórico (F5) se lee por la conexión de solo lectura del lector, en su propio hilo; ningún otro hilo escribe. Excepción a las fechas TEXT: los cubos de `TRAFFIC_ROLLUP_*` son enteros (segundos Unix UTC; día local AAAAMMDD). Horas en UTC y días por fecha local, nunca mezclados. Todo dato que viene de la red viaja como parámetro SQL; solo se interpolan nombres de tabla constantes del código.
 - Todo output al usuario en castellano, incluidos los textos de la TUI.
 - Migraciones **aditivas**: nunca borrar ni renombrar columnas de una fase anterior sin ADR y sin test de compatibilidad con la BD de la fase previa. Cada fase que añada columnas debe incluir un test que abra una BD de la fase anterior y verifique que los datos se conservan.
 - `[scan].passive_only = true` deshabilita todo el tráfico activo (ARP scan, ICMP sweep, mDNS browse, M-SEARCH, port scan, banner grabbing, fingerprint y, desde F4, consultas NetBIOS y DNS inverso). Ningún módulo puede emitir tráfico activo si `passive_only` está activo. El DNS inverso de IPs de Internet no se hace nunca, en ningún modo.
 - Port scan y banner grabbing **nunca** se ejecutan en cada ciclo periódico: solo al descubrir un equipo nuevo, cambio de IP/MAC o `r` manual del usuario.
-- `DEVICE_SERVICES` y `DISCOVERY_SOURCES` son las fuentes de verdad para servicios y procedencia de descubrimientos. No se duplica esa información en columnas de `DEVICES`.
+- `DEVICE_SERVICES` y `DISCOVERY_SOURCES` son las fuentes de verdad para servicios y procedencia de descubrimientos. No se duplica esa información en columnas de `DEVICES`. Desde la migración v6 (F6), un puerto CERRADO se marca con `DEVICE_SERVICES.closed_at` y `last_seen` es siempre la última vez que se vio abierto: `Repo::mark_service_closed` no lo toca. Hasta la v6 lo movía, así que en los puertos cerrados antes de la v6 `last_seen` no es fiable.
 - La clasificación de `device_type` es automática con `device_type_manual` como override del usuario (si no es NULL, gana siempre). Fingerprint de SO: si la confianza no supera el umbral (>= 4), `os_family = NULL`.
 - `g` alterna la vista plana/agrupada (preferencia persistida en `[ui].list_view`); `t` cicla el tipo manual del equipo seleccionado.
 - Captura de tráfico con AF_PACKET + TPACKET_V3 (sin libpcap). `libpcap`/`pcap` solo como
@@ -86,7 +91,10 @@ El informe de fase manda sobre tu criterio: si algo te parece incorrecto o incom
 - `v` sobre conexión → panel inferior con cabeceras IP/TCP ya en memoria (no modal).
 - `g` en Tráfico cicla la agrupación (persistida en `[ui].traffic_group`) y `w` la ventana
   (60 s → 5 min → 1 h → 24 h → sesión). En Histórico (F5): `e` sujeto, `w` rango, `<` `>` cursor
-  de la gráfica y `f` filtro de eventos.
+  de la gráfica y `f` filtro de eventos. En Alertas (F6): `Tab` Alertas → Reglas → Silencios; `Enter`
+  detalle (la marca vista), `espacio` vista, `T` todas vistas, `f` nivel, `u` sin ver, `/` equipo,
+  `m` silenciar y `e` ir al equipo; en Reglas, `espacio` activar/apagar y `n` nivel; en Silencios,
+  `x` quitar. `p` vigila un equipo en Equipos y en su detalle (en el detalle, `v` sigue siendo conexión).
 - Configuración tolerante: una clave obsoleta se avisa una sola vez y se descarta sin reescribir el
   fichero; un valor inválido usa el valor por defecto con aviso; la configuración nunca aborta el
   arranque.
@@ -94,7 +102,23 @@ El informe de fase manda sobre tu criterio: si algo te parece incorrecto o incom
   una BD temporal.
 - Histórico (F5): solo agregados (rollups por minuto 48 h, hora 90 días y día 2 años), sin registro
   de conexiones. Los destinos solo viven 2 h por minuto y 30 días por hora; nunca en días ni en el
-  inventario `DEVICE_SEEN`. Los huecos (sin sesión o sin captura) se marcan; nunca se interpolan.
+  inventario `DEVICE_SEEN`. Los huecos (sin sesión o sin captura) se marcan; nunca se interpolan. Las sesiones (`APP_SESSIONS`) se
+  registran siempre, también con `[history].enabled = false`.
+- Alertas (F6): el motor de `src/alerts/` es puro (señales → acciones, sin BD ni TUI) y solo el hilo de
+  la TUI escribe `ALERTS`, `ALERT_MUTES`, `ALERT_LEARNING`, `HOST_SEEN` y `COVERAGE_GAPS`. Las alertas
+  nacen de señales en vivo, nunca llevan dominios ni contenido y el texto que viene de la red se sanea
+  (sin caracteres de control ni secuencias ANSI); en las notificaciones se escapan además `&`, `<` y `>`.
+- Notificaciones de escritorio solo por `NotifierHandle` (hilo propio, canal acotado): la TUI nunca
+  espera a D-Bus. Sin servidor de notificaciones, la app sigue y las alertas quedan en la TUI.
+- Huecos dentro de la sesión (F6): la suspensión del equipo (`CLOCK_BOOTTIME` frente a `CLOCK_MONOTONIC`)
+  y la captura parada se guardan en `COVERAGE_GAPS`; toda cobertura (histórico, presencia, aprendizaje
+  y «más tráfico de lo habitual») los resta.
+- Presencia: solo hay alertas de presencia para los equipos vigilados (`DEVICES.watched`); ninguno lo
+  está por defecto.
+- `[alerts.rules]`: activar, apagar o cambiar el nivel de una regla desde la TUI reescribe `config.toml`
+  como `[ui]` (F2).
+- MSRV 1.88: `notify-rust` se queda en 4.17. Si una dependencia pide un Rust mayor, fíjala a una versión
+  compatible y anótalo como desviación; no subas la MSRV sin hablarlo con el desarrollador.
 
 ## Al terminar una fase (o al pausar la sesión)
 

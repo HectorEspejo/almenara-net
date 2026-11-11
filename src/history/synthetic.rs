@@ -22,6 +22,7 @@
 
 use rusqlite::{params, Connection, Statement};
 
+use crate::alerts::{AlertRule, Level, RuleId, Subject as AlertSubject};
 use crate::error::Result;
 use crate::history::localtime::{self, LocalDay};
 use crate::repo::migrations;
@@ -43,6 +44,24 @@ const ACTIVOS_MEDIA: f64 = 15.0;
 const EQUIPOS_REFERENCIA: usize = 30;
 /// Fracción de tiempo sin sesión de Almenara (10 %).
 const FRACCION_SIN_SESION: f64 = 0.10;
+/// Alertas del perfil de referencia: 20 000 en 90 días (§7.16).
+const ALERTAS_REFERENCIA: usize = 20_000;
+/// Días de alertas del perfil de referencia.
+const ALERTAS_DIAS_REFERENCIA: i64 = 90;
+/// Silencios del perfil de referencia (§7.16).
+const SILENCIOS_REFERENCIA: usize = 20;
+/// Entradas de inventario del propio equipo del perfil de referencia (§7.16).
+const HOST_SEEN_REFERENCIA: usize = 300;
+/// Una suspensión nocturna: de 02:00 a 04:30 locales.
+const SUSPENSION_HORA_LOCAL: i64 = 2;
+/// Duración de la suspensión nocturna en segundos (2,5 h).
+const SUSPENSION_DURACION: i64 = 2 * 3_600 + 30 * 60;
+/// Huellas JA4 estables del generador.
+const JA4_SINTETICAS: [&str; 3] = [
+    "t13d1516h2_8daaf6152771_02713d6af862",
+    "t13d1715h2_5b57614c22b0_3d5424432f57",
+    "t13d1517h2_8daaf6152771_b1ff8a24a2c4",
+];
 
 /// App del catálogo de F4 usada por el generador (claves estables inventadas).
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +223,14 @@ pub struct SyntheticProfile {
     pub destination_days: i64,
     /// Tope de claves por sujeto, dimensión y cubo (20).
     pub top_keys: usize,
+    /// Alertas generadas (20 000 en el perfil de referencia).
+    pub alerts: usize,
+    /// Días sobre los que se reparten las alertas (90).
+    pub alert_days: i64,
+    /// Silencios generados (20).
+    pub mutes: usize,
+    /// Entradas de HOST_SEEN generadas (300).
+    pub host_seen: usize,
     /// Instante final del histórico, en segundos Unix UTC.
     pub end: i64,
 }
@@ -219,6 +246,10 @@ impl Default for SyntheticProfile {
             minute_hours: 48,
             destination_days: 30,
             top_keys: 20,
+            alerts: ALERTAS_REFERENCIA,
+            alert_days: ALERTAS_DIAS_REFERENCIA,
+            mutes: SILENCIOS_REFERENCIA,
+            host_seen: HOST_SEEN_REFERENCIA,
             end: ahora - ahora.rem_euclid(3600),
         }
     }
@@ -235,6 +266,10 @@ impl SyntheticProfile {
             minute_hours: 1,
             destination_days: 1,
             top_keys: 5,
+            alerts: 60,
+            alert_days: 5,
+            mutes: 3,
+            host_seen: 6,
             end: 1_800_000_000 - 1_800_000_000_i64.rem_euclid(3600),
         }
     }
@@ -249,6 +284,10 @@ impl SyntheticProfile {
             minute_hours: self.minute_hours.clamp(1, 168),
             destination_days: self.destination_days.clamp(0, self.hour_days),
             top_keys: self.top_keys.clamp(1, 100),
+            alerts: self.alerts.clamp(0, 200_000),
+            alert_days: self.alert_days.clamp(1, 730),
+            mutes: self.mutes.clamp(0, 1_000),
+            host_seen: self.host_seen.clamp(0, 100_000),
             end: self.end,
         }
     }
@@ -273,6 +312,16 @@ pub struct SyntheticStats {
     pub sessions: u64,
     /// Bytes totales generados en las tres resoluciones.
     pub bytes: u64,
+    /// Filas de ALERTS (incluidos los resúmenes de la puesta al día).
+    pub alerts: u64,
+    /// Filas de ALERT_MUTES.
+    pub mutes: u64,
+    /// Filas de ALERT_LEARNING (equipos y propio equipo).
+    pub learning: u64,
+    /// Filas de HOST_SEEN.
+    pub host_seen: u64,
+    /// Filas de COVERAGE_GAPS.
+    pub gaps: u64,
 }
 
 impl SyntheticStats {
@@ -284,6 +333,11 @@ impl SyntheticStats {
             .saturating_add(self.seen)
             .saturating_add(self.events)
             .saturating_add(self.sessions)
+            .saturating_add(self.alerts)
+            .saturating_add(self.mutes)
+            .saturating_add(self.learning)
+            .saturating_add(self.host_seen)
+            .saturating_add(self.gaps)
     }
 }
 
@@ -291,7 +345,8 @@ impl SyntheticStats {
 pub struct Synthetic;
 
 impl Synthetic {
-    /// Genera el perfil completo en una base de datos ya migrada (o vacía).
+    /// Genera el perfil completo (histórico de F5 y datos de la F6) en una base
+    /// de datos ya migrada (o vacía).
     ///
     /// Escribe directamente en las tablas del histórico; está pensado para una
     /// base de datos temporal de pruebas, no para una base de datos real.
@@ -299,14 +354,12 @@ impl Synthetic {
         let perfil = profile.saneado();
         migrations::apply_all(conn)?;
         let mut rng = Rng::nuevo(perfil.seed);
-        let interfaz = crear_interfaz(conn, perfil.end)?;
-        let dispositivos = crear_dispositivos(conn, &perfil, interfaz, &mut rng)?;
-        crear_sesiones(conn, &perfil, &mut rng)?;
-        crear_minutos(conn, &perfil, &dispositivos, &mut rng)?;
-        crear_horas(conn, &perfil, &dispositivos, &mut rng)?;
-        crear_dias(conn, &perfil, &dispositivos, &mut rng)?;
-        crear_inventario(conn, &perfil, &dispositivos, &mut rng)?;
-        crear_eventos(conn, &perfil, &dispositivos, &mut rng)?;
+        let dispositivos = generar_historico(conn, &perfil, &mut rng)?;
+        crear_huecos(conn, &perfil, &mut rng)?;
+        crear_alertas(conn, &perfil, &dispositivos, &mut rng)?;
+        crear_silencios(conn, &perfil, &dispositivos, &mut rng)?;
+        crear_aprendizaje(conn, &perfil, &dispositivos, &mut rng)?;
+        crear_host_seen(conn, &perfil, &mut rng)?;
         let stats = SyntheticStats {
             devices: dispositivos.len() as u64,
             minutes: contar(conn, "TRAFFIC_ROLLUP_MINUTE")?,
@@ -316,9 +369,55 @@ impl Synthetic {
             events: contar(conn, "DEVICE_EVENTS")?,
             sessions: contar(conn, "APP_SESSIONS")?,
             bytes: bytes_generados(conn)?,
+            alerts: contar(conn, "ALERTS")?,
+            mutes: contar(conn, "ALERT_MUTES")?,
+            learning: contar(conn, "ALERT_LEARNING")?,
+            host_seen: contar(conn, "HOST_SEEN")?,
+            gaps: contar(conn, "COVERAGE_GAPS")?,
         };
         Ok(stats)
     }
+
+    /// Genera solo el histórico de F5 (sin datos de la F6) sobre una base ya en
+    /// la versión v5. Lo usa la medición de la migración v6 con sus rellenos.
+    pub fn generate_historico_v5(
+        conn: &mut Connection,
+        profile: &SyntheticProfile,
+    ) -> Result<SyntheticStats> {
+        let perfil = profile.saneado();
+        let mut rng = Rng::nuevo(perfil.seed);
+        let dispositivos = generar_historico(conn, &perfil, &mut rng)?;
+        Ok(SyntheticStats {
+            devices: dispositivos.len() as u64,
+            minutes: contar(conn, "TRAFFIC_ROLLUP_MINUTE")?,
+            hours: contar(conn, "TRAFFIC_ROLLUP_HOUR")?,
+            days: contar(conn, "TRAFFIC_ROLLUP_DAY")?,
+            seen: contar(conn, "DEVICE_SEEN")?,
+            events: contar(conn, "DEVICE_EVENTS")?,
+            sessions: contar(conn, "APP_SESSIONS")?,
+            bytes: bytes_generados(conn)?,
+            ..SyntheticStats::default()
+        })
+    }
+}
+
+/// Genera el histórico de F5 (tres resoluciones, inventario, eventos y
+/// sesiones) y devuelve los ids de los equipos creados.
+fn generar_historico(
+    conn: &mut Connection,
+    perfil: &SyntheticProfile,
+    rng: &mut Rng,
+) -> Result<Vec<i64>> {
+    let interfaz = crear_interfaz(conn, perfil.end)?;
+    let dispositivos = crear_dispositivos(conn, perfil, interfaz, rng)?;
+    crear_sesiones(conn, perfil, rng)?;
+    crear_minutos(conn, perfil, &dispositivos, rng)?;
+    crear_horas(conn, perfil, &dispositivos, rng)?;
+    crear_dias(conn, perfil, &dispositivos, rng)?;
+    crear_inventario(conn, perfil, &dispositivos, rng)?;
+    crear_servicios(conn, perfil, &dispositivos, rng)?;
+    crear_eventos(conn, perfil, &dispositivos, rng)?;
+    Ok(dispositivos)
 }
 
 /// Número de filas de una tabla.
@@ -983,6 +1082,49 @@ fn crear_inventario(
     Ok(())
 }
 
+/// Servicios de F2 de los equipos sintéticos, para que el relleno de
+/// DEVICE_SERVICES.closed_at de la migración v6 tenga datos que rellenar.
+fn crear_servicios(
+    conn: &mut Connection,
+    perfil: &SyntheticProfile,
+    dispositivos: &[i64],
+    rng: &mut Rng,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut sentencia = tx.prepare(
+            "INSERT OR IGNORE INTO DEVICE_SERVICES
+                 (device_id, port, protocol, service, banner, first_seen, last_seen)
+             VALUES (?1, ?2, 'tcp', ?3, NULL, ?4, ?5)",
+        )?;
+        for (indice, device_id) in dispositivos.iter().enumerate() {
+            let puertos: [(i64, &str); 2] = if indice % 2 == 0 {
+                [(445, "microsoft-ds"), (22, "ssh")]
+            } else {
+                [(22, "ssh"), (80, "http")]
+            };
+            for (puerto, servicio) in puertos {
+                let primera = perfil.end - rng.entre(30, 365) * 86_400;
+                let ultima = perfil.end - rng.entre(0, 30) * 86_400;
+                let (primera, ultima) = if primera <= ultima {
+                    (primera, ultima)
+                } else {
+                    (ultima, primera)
+                };
+                sentencia.execute(params![
+                    device_id,
+                    puerto,
+                    servicio,
+                    localtime::rfc3339(primera),
+                    localtime::rfc3339(ultima)
+                ])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Eventos: alta, presencia (new/disappeared/reappeared), servicios e identidad.
 fn crear_eventos(
     conn: &mut Connection,
@@ -1085,6 +1227,544 @@ fn crear_eventos(
 }
 
 // ---------------------------------------------------------------------------
+// Datos de la Fase 6: huecos, alertas, silencios, aprendizaje e inventario host
+// ---------------------------------------------------------------------------
+
+/// Huecos de cobertura: una suspensión nocturna diaria (§7.16).
+fn crear_huecos(conn: &mut Connection, perfil: &SyntheticProfile, rng: &mut Rng) -> Result<()> {
+    let sesiones = sesiones_para_huecos(conn)?;
+    let hoy = LocalDay::from_unix(perfil.end);
+    let tx = conn.transaction()?;
+    {
+        let mut sentencia = tx.prepare(
+            "INSERT INTO COVERAGE_GAPS (session_id, kind, started_at, ended_at)
+             VALUES (?1, 'suspend', ?2, ?3)",
+        )?;
+        for indice in 0..perfil.days {
+            let dia = hoy.sumar_dias(-(perfil.days - 1 - indice));
+            let inicio = dia.limits().0 + SUSPENSION_HORA_LOCAL * 3_600 + rng.entre(0, 30 * 60);
+            let fin = inicio + SUSPENSION_DURACION;
+            let Some(sesion_id) = sesion_que_cubre(&sesiones, inicio, fin) else {
+                continue;
+            };
+            sentencia.execute(params![
+                sesion_id,
+                localtime::rfc3339(inicio),
+                localtime::rfc3339(fin)
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Sesiones de Almenara como (id, inicio, fin) en segundos Unix UTC.
+fn sesiones_para_huecos(conn: &Connection) -> Result<Vec<(i64, i64, i64)>> {
+    let mut sentencia =
+        conn.prepare("SELECT id, started_at, ended_at FROM APP_SESSIONS ORDER BY started_at")?;
+    let filas = sentencia.query_map([], |fila| {
+        let id: i64 = fila.get(0)?;
+        let inicio: String = fila.get(1)?;
+        let fin: Option<String> = fila.get(2)?;
+        Ok((id, inicio, fin))
+    })?;
+    let mut sesiones = Vec::new();
+    for fila in filas {
+        let (id, inicio, fin) = fila?;
+        let Some(inicio) = localtime::unix_de_rfc3339(&inicio) else {
+            continue;
+        };
+        let Some(fin) = fin.as_deref().and_then(localtime::unix_de_rfc3339) else {
+            continue;
+        };
+        sesiones.push((id, inicio, fin));
+    }
+    Ok(sesiones)
+}
+
+/// Sesión que contiene por completo [inicio, fin), si la hay.
+fn sesion_que_cubre(sesiones: &[(i64, i64, i64)], inicio: i64, fin: i64) -> Option<i64> {
+    sesiones
+        .iter()
+        .find(|(_, desde, hasta)| *desde <= inicio && fin <= *hasta)
+        .map(|(id, _, _)| *id)
+}
+
+/// Alertas del perfil de referencia: 20 000 en 90 días con un 90 % de info.
+fn crear_alertas(
+    conn: &mut Connection,
+    perfil: &SyntheticProfile,
+    dispositivos: &[i64],
+    rng: &mut Rng,
+) -> Result<()> {
+    if perfil.alerts == 0 || dispositivos.is_empty() {
+        return Ok(());
+    }
+    let dias = perfil.alert_days.max(1);
+    let inicio = perfil.end - dias * 86_400;
+    let ventana = dias * 86_400;
+    let tx = conn.transaction()?;
+    {
+        let mut sentencia = tx.prepare(
+            "INSERT INTO ALERTS
+                 (rule, level, subject, device_id, key, title, subject_label, details,
+                  created_at, last_at, count, seen_at, resolved_at, notified, summary_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)",
+        )?;
+        let mut ultimas: Vec<i64> = Vec::new();
+        for indice in 0..perfil.alerts {
+            let regla = regla_sintetica(rng);
+            let nivel = nivel_sintetico(indice, rng);
+            let (subject, device_id, equipo) = sujeto_sintetico(regla, dispositivos, rng);
+            let (clave, titulo) = clave_y_titulo(regla, rng);
+            let etiqueta = etiqueta_de_sujeto(&subject, equipo, dispositivos);
+            let details = detalles_sinteticos(regla, &clave, rng);
+            let creada = inicio + rng.entre(0, ventana - 1);
+            let last = (creada + rng.entre(0, 3_600)).min(perfil.end);
+            let count = 1 + rng.entre(0, 4);
+            let vista =
+                (rng.unidad() < 0.65).then(|| (last + rng.entre(0, 86_400)).min(perfil.end));
+            let resuelta = (es_condicion(regla) && rng.unidad() < 0.4)
+                .then(|| (last + rng.entre(60, 86_400)).min(perfil.end));
+            let notificada = nivel == Level::Important && rng.unidad() < 0.7;
+            sentencia.execute(params![
+                AlertRule::Rule(regla).as_str(),
+                nivel.as_str(),
+                subject.as_str(),
+                device_id,
+                clave,
+                titulo,
+                etiqueta,
+                details,
+                localtime::rfc3339(creada),
+                localtime::rfc3339(last),
+                count,
+                vista.map(localtime::rfc3339),
+                resuelta.map(localtime::rfc3339),
+                notificada,
+            ])?;
+            let id = tx.last_insert_rowid();
+            ultimas.push(id);
+            if ultimas.len() > 4 {
+                ultimas.remove(0);
+            }
+            // De vez en cuando, un resumen de la puesta al día que agrupa las
+            // últimas alertas (para el detalle y la vista de la TUI).
+            if indice > 0 && indice % 200 == 0 {
+                insertar_resumen(&tx, perfil, &ultimas, rng)?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Regla del catálogo con la distribución del generador.
+fn regla_sintetica(rng: &mut Rng) -> RuleId {
+    match rng.rango(100) {
+        0..=9 => RuleId::NewApp,
+        10..=17 => RuleId::NewCategory,
+        18..=24 => RuleId::NewOrg,
+        25..=30 => RuleId::NewCountry,
+        31..=36 => RuleId::NewJa4,
+        37..=47 => RuleId::TrafficHigh,
+        48..=57 => RuleId::DeviceNew,
+        58..=64 => RuleId::PortNew,
+        65..=70 => RuleId::MacChanged,
+        71..=74 => RuleId::NameChanged,
+        75..=77 => RuleId::OsChanged,
+        78..=80 => RuleId::TypeChanged,
+        81..=83 => RuleId::WatchedPresence,
+        84..=86 => RuleId::CaptureStopped,
+        87..=89 => RuleId::CaptureDrops,
+        90..=92 => RuleId::DbSize,
+        93..=95 => RuleId::NewApp,
+        _ => RuleId::TrafficHigh,
+    }
+}
+
+/// Nivel con el 90 % exacto de info del perfil de referencia (§7.16).
+///
+/// Uno de cada diez es importante o aviso; así la proporción no depende de la
+/// suerte del RNG y cuadra con lo que pide el informe.
+fn nivel_sintetico(indice: usize, rng: &mut Rng) -> Level {
+    if !indice.is_multiple_of(10) {
+        Level::Info
+    } else if rng.rango(2) == 0 {
+        Level::Important
+    } else {
+        Level::Warning
+    }
+}
+
+/// Sujeto, device_id e índice del equipo de una alerta sintética.
+fn sujeto_sintetico(
+    regla: RuleId,
+    dispositivos: &[i64],
+    rng: &mut Rng,
+) -> (AlertSubject, Option<i64>, Option<usize>) {
+    let indice = rng.rango(dispositivos.len());
+    let de_equipo = |indice: usize| {
+        (
+            AlertSubject::Device(dispositivos[indice]),
+            Some(dispositivos[indice]),
+            Some(indice),
+        )
+    };
+    match regla {
+        RuleId::NewApp
+        | RuleId::NewCategory
+        | RuleId::NewOrg
+        | RuleId::NewCountry
+        | RuleId::NewJa4 => {
+            if rng.unidad() < 0.5 {
+                (AlertSubject::Host, None, None)
+            } else {
+                de_equipo(indice)
+            }
+        }
+        RuleId::TrafficHigh => match rng.rango(10) {
+            0 => (AlertSubject::Host, None, None),
+            1 => (AlertSubject::Network, None, None),
+            _ => de_equipo(indice),
+        },
+        RuleId::WatchedPresence
+        | RuleId::DeviceNew
+        | RuleId::PortNew
+        | RuleId::MacChanged
+        | RuleId::NameChanged
+        | RuleId::OsChanged
+        | RuleId::TypeChanged => de_equipo(indice),
+        RuleId::CaptureStopped | RuleId::CaptureDrops | RuleId::DbSize => {
+            (AlertSubject::Almenara, None, None)
+        }
+    }
+}
+
+/// Clave y título de una alerta sintética.
+fn clave_y_titulo(regla: RuleId, rng: &mut Rng) -> (String, String) {
+    match regla {
+        RuleId::NewApp => {
+            let app = &APPS[rng.rango(APPS.len())];
+            (app.clave.to_string(), format!("App nueva: {}", app.clave))
+        }
+        RuleId::NewCategory => {
+            let app = &APPS[rng.rango(APPS.len())];
+            (
+                app.categoria.to_string(),
+                format!("Categoría nueva: {}", app.categoria),
+            )
+        }
+        RuleId::NewOrg => {
+            let app = &APPS[rng.rango(APPS.len())];
+            (
+                app.org.to_string(),
+                format!("Organización nueva: {}", app.org),
+            )
+        }
+        RuleId::NewCountry => {
+            let app = &APPS[rng.rango(APPS.len())];
+            (app.pais.to_string(), format!("País nuevo: {}", app.pais))
+        }
+        RuleId::NewJa4 => {
+            let huella = JA4_SINTETICAS[rng.rango(JA4_SINTETICAS.len())];
+            (huella.to_string(), "Huella TLS nueva (JA4)".to_string())
+        }
+        RuleId::TrafficHigh => {
+            let sentido = if rng.rango(2) == 0 { "down" } else { "up" };
+            (
+                sentido.to_string(),
+                "Más tráfico de lo habitual".to_string(),
+            )
+        }
+        RuleId::DeviceNew => (String::new(), "Equipo nuevo".to_string()),
+        RuleId::PortNew => {
+            let puerto = if rng.rango(2) == 0 {
+                "22/tcp"
+            } else {
+                "445/tcp"
+            };
+            (puerto.to_string(), format!("Puerto nuevo: {puerto}"))
+        }
+        RuleId::MacChanged => (String::new(), "Cambio de MAC".to_string()),
+        RuleId::NameChanged => (String::new(), "Cambio de nombre".to_string()),
+        RuleId::OsChanged => (String::new(), "Cambio de SO".to_string()),
+        RuleId::TypeChanged => (String::new(), "Cambio de tipo".to_string()),
+        RuleId::WatchedPresence => {
+            if rng.rango(2) == 0 {
+                ("gone".to_string(), "Vigilado ausente".to_string())
+            } else {
+                ("back".to_string(), "Vigilado de vuelta".to_string())
+            }
+        }
+        RuleId::CaptureStopped => ("capture".to_string(), "Captura parada".to_string()),
+        RuleId::CaptureDrops => ("drops".to_string(), "Pérdidas de captura".to_string()),
+        RuleId::DbSize => ("db".to_string(), "Base de datos grande".to_string()),
+    }
+}
+
+/// El porqué (JSON) de una alerta sintética.
+fn detalles_sinteticos(regla: RuleId, clave: &str, rng: &mut Rng) -> String {
+    match regla {
+        RuleId::TrafficHigh => {
+            let valor = 400_000_000 + rng.entre(0, 3_000_000_000);
+            let factor = valor / 400_000_000;
+            format!(
+                r#"{{"direction":"{clave}","value":{valor},"median":400000000,"factor":{factor},"samples":14}}"#
+            )
+        }
+        RuleId::NewApp
+        | RuleId::NewCategory
+        | RuleId::NewOrg
+        | RuleId::NewCountry
+        | RuleId::NewJa4 => {
+            let tipo = tipo_de_clave(regla);
+            format!(r#"{{"kind":"{tipo}","key":"{clave}"}}"#)
+        }
+        _ => "{}".to_string(),
+    }
+}
+
+/// Tipo de clave de inventario de una regla de lo nuevo.
+fn tipo_de_clave(regla: RuleId) -> &'static str {
+    match regla {
+        RuleId::NewApp => "app",
+        RuleId::NewCategory => "category",
+        RuleId::NewOrg => "org",
+        RuleId::NewCountry => "country",
+        _ => "ja4",
+    }
+}
+
+/// Indica si la regla es de condición (puede quedar resuelta).
+fn es_condicion(regla: RuleId) -> bool {
+    matches!(
+        regla,
+        RuleId::WatchedPresence | RuleId::CaptureStopped | RuleId::CaptureDrops | RuleId::DbSize
+    )
+}
+
+/// Etiqueta visible de un sujeto de alerta sintética.
+fn etiqueta_de_sujeto(
+    subject: &AlertSubject,
+    equipo: Option<usize>,
+    dispositivos: &[i64],
+) -> String {
+    match subject {
+        AlertSubject::Device(id) => {
+            let indice = equipo.unwrap_or_else(|| {
+                dispositivos
+                    .iter()
+                    .position(|candidato| candidato == id)
+                    .unwrap_or(0)
+            });
+            etiqueta_de_equipo_sintetico(indice)
+        }
+        otro => otro.label().to_string(),
+    }
+}
+
+/// Nombre visible de un equipo del generador (el mismo con el que se crea).
+fn etiqueta_de_equipo_sintetico(indice: usize) -> String {
+    if indice.is_multiple_of(5) {
+        format!("alias-{:02}", indice + 1)
+    } else {
+        format!("equipo-{:02}", indice + 1)
+    }
+}
+
+/// Resumen de la puesta al día que agrupa las últimas alertas.
+fn insertar_resumen(
+    tx: &Connection,
+    perfil: &SyntheticProfile,
+    agrupadas: &[i64],
+    rng: &mut Rng,
+) -> Result<()> {
+    if agrupadas.is_empty() {
+        return Ok(());
+    }
+    let creada = perfil.end - rng.entre(0, perfil.alert_days.max(1) * 86_400);
+    let titulo = format!("Resumen al arrancar ({} alertas)", agrupadas.len());
+    tx.execute(
+        "INSERT INTO ALERTS
+             (rule, level, subject, device_id, key, title, subject_label, details,
+              created_at, last_at, count, seen_at, resolved_at, notified, summary_id)
+         VALUES (?1, 'important', 'almenara', NULL, '', ?2, 'Almenara', ?3, ?4, ?4, 1,
+                 NULL, NULL, 0, NULL)",
+        params![
+            AlertRule::CatchUp.as_str(),
+            titulo,
+            format!(r#"{{"grouped":{}}}"#, agrupadas.len()),
+            localtime::rfc3339(creada)
+        ],
+    )?;
+    let resumen = tx.last_insert_rowid();
+    for agrupada in agrupadas {
+        tx.execute(
+            "UPDATE ALERTS SET summary_id = ?1 WHERE id = ?2",
+            params![resumen, agrupada],
+        )?;
+    }
+    Ok(())
+}
+
+/// Silencios del perfil de referencia (20).
+fn crear_silencios(
+    conn: &mut Connection,
+    perfil: &SyntheticProfile,
+    dispositivos: &[i64],
+    rng: &mut Rng,
+) -> Result<()> {
+    if perfil.mutes == 0 || dispositivos.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut sentencia = tx.prepare(
+            "INSERT OR IGNORE INTO ALERT_MUTES (rule, subject, device_id, until, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        // El UNIQUE (rule, subject, device_id) puede descartar un sorteo repetido:
+        // se reintenta (con el mismo RNG determinista) hasta llegar al número pedido.
+        let mut insertados = 0usize;
+        let mut intentos = 0usize;
+        while insertados < perfil.mutes && intentos < perfil.mutes * 20 {
+            intentos += 1;
+            let regla = regla_sintetica(rng);
+            let indice = rng.rango(dispositivos.len());
+            let (subject, device_id) = if rng.rango(4) == 0 {
+                (AlertSubject::Host, 0)
+            } else {
+                (
+                    AlertSubject::Device(dispositivos[indice]),
+                    dispositivos[indice],
+                )
+            };
+            let until = match rng.rango(3) {
+                0 => None,
+                1 => Some(perfil.end + 86_400),
+                _ => Some(perfil.end + 7 * 86_400),
+            };
+            let creado = perfil.end - rng.entre(0, 30 * 86_400);
+            insertados += sentencia.execute(params![
+                AlertRule::Rule(regla).as_str(),
+                subject.as_str(),
+                device_id,
+                until.map(localtime::rfc3339),
+                localtime::rfc3339(creado)
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Aprendizaje de los equipos y del propio equipo (§7.3 y §7.16).
+fn crear_aprendizaje(
+    conn: &mut Connection,
+    perfil: &SyntheticProfile,
+    dispositivos: &[i64],
+    rng: &mut Rng,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut sentencia = tx.prepare(
+            "INSERT OR REPLACE INTO ALERT_LEARNING
+                 (subject, device_id, learning_from, data_days, learned_at, updated_day)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let ayer = LocalDay::from_unix(perfil.end).sumar_dias(-1).aaaammdd();
+        for device_id in dispositivos {
+            let dias = rng.rango(9) as i64;
+            let desde = perfil.end - rng.entre(30, 365) * 86_400;
+            let aprendido = (dias >= 7).then(|| perfil.end - rng.entre(0, 7) * 86_400);
+            sentencia.execute(params![
+                "device",
+                device_id,
+                localtime::rfc3339(desde),
+                dias,
+                aprendido.map(localtime::rfc3339),
+                ayer
+            ])?;
+        }
+        // El propio equipo empieza de cero en la v6 (§7.3).
+        let dias = rng.rango(9) as i64;
+        let desde = perfil.end - 10 * 86_400;
+        let aprendido = (dias >= 7).then(|| perfil.end - 86_400);
+        sentencia.execute(params![
+            "host",
+            0i64,
+            localtime::rfc3339(desde),
+            dias,
+            aprendido.map(localtime::rfc3339),
+            ayer
+        ])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Inventario del propio equipo (HOST_SEEN): 300 entradas en el perfil de
+/// referencia (§7.16), sin claves especiales ni destinos.
+fn crear_host_seen(conn: &mut Connection, perfil: &SyntheticProfile, rng: &mut Rng) -> Result<()> {
+    if perfil.host_seen == 0 {
+        return Ok(());
+    }
+    // Reparto por tipo que garantiza exactamente perfil.host_seen claves (los
+    // países solo se repiten hasta su catálogo; el resto se reparte entre apps,
+    // categorías, organizaciones y huellas JA4).
+    let paises = ["US", "IE", "NL", "DE", "ES", "SE", "SG", "GB", "FR", "JP"];
+    let total = perfil.host_seen;
+    let paises_n = (total / 10).max(1).min(paises.len()).min(total);
+    let resto = total - paises_n;
+    let apps_n = resto * 30 / 100;
+    let cats_n = resto * 15 / 100;
+    let orgs_n = resto * 25 / 100;
+    let ja4_n = resto - apps_n - cats_n - orgs_n;
+    let mut claves: Vec<(&'static str, String)> = Vec::with_capacity(total);
+    for indice in 0..paises_n {
+        claves.push(("country", paises[indice % paises.len()].to_string()));
+    }
+    for indice in 0..apps_n {
+        claves.push(("app", format!("app-sintetica-{indice:03}")));
+    }
+    for indice in 0..cats_n {
+        claves.push(("category", format!("categoria-{indice}")));
+    }
+    for indice in 0..orgs_n {
+        claves.push(("org", format!("org-sintetica-{indice:03}")));
+    }
+    for indice in 0..ja4_n {
+        claves.push(("ja4", format!("t13d1516h2_{indice:012x}")));
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut sentencia = tx.prepare(
+            "INSERT INTO HOST_SEEN (kind, key, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (kind, key) DO UPDATE SET last_seen = excluded.last_seen",
+        )?;
+        for (kind, key) in claves {
+            let primero = perfil.end - rng.entre(0, 365 * 86_400);
+            let ultimo = perfil.end - rng.entre(0, 30 * 86_400);
+            let (primero, ultimo) = if primero <= ultimo {
+                (primero, ultimo)
+            } else {
+                (ultimo, primero)
+            };
+            sentencia.execute(params![
+                kind,
+                key,
+                localtime::rfc3339(primero),
+                localtime::rfc3339(ultimo)
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Pruebas y mediciones
 // ---------------------------------------------------------------------------
 
@@ -1092,12 +1772,18 @@ fn crear_eventos(
 mod tests {
     use super::*;
     use rusqlite::params_from_iter;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use crate::history::Retention;
+    use crate::alerts::{LearningParams, Level};
+    use crate::history::queries::Queries;
+    use crate::history::{AlertFilter, Page, Retention, SubjectSel};
+    use crate::repo::Repo;
 
     fn conexion_en_memoria() -> Connection {
-        Connection::open_in_memory().expect("SQLite en memoria")
+        let mut conn = Connection::open_in_memory().expect("SQLite en memoria");
+        migrations::apply_all(&mut conn).expect("aplicar migraciones");
+        crate::history::esquema_v6_de_pruebas(&conn).expect("esquema v6 de pruebas");
+        conn
     }
 
     fn contar_tabla(conn: &Connection, tabla: &str) -> i64 {
@@ -1135,6 +1821,12 @@ mod tests {
             "DEVICE_SEEN",
             "DEVICE_EVENTS",
             "APP_SESSIONS",
+            "ALERTS",
+            "ALERT_MUTES",
+            "ALERT_LEARNING",
+            "HOST_SEEN",
+            "COVERAGE_GAPS",
+            "DEVICE_SERVICES",
         ] {
             assert_eq!(
                 contar_tabla(&primera, tabla),
@@ -1218,6 +1910,65 @@ mod tests {
             )
             .expect("captura");
         assert!(sin_captura >= 0);
+        // Datos de la F6 (§7.16).
+        assert_eq!(
+            contar_tabla(&conn, "ALERTS") as u64,
+            stats.alerts,
+            "las alertas generadas cuadran"
+        );
+        assert!(
+            stats.alerts >= perfil.alerts as u64,
+            "al menos las alertas pedidas (más los resúmenes)"
+        );
+        assert_eq!(
+            stats.mutes, perfil.mutes as u64,
+            "los silencios pedidos se generan todos (el UNIQUE reintenta)"
+        );
+        assert_eq!(
+            stats.learning,
+            perfil.devices as u64 + 1,
+            "aprendizaje de los equipos y del propio equipo"
+        );
+        assert_eq!(stats.host_seen, perfil.host_seen as u64);
+        assert!(stats.gaps > 0, "hay suspensiones nocturnas");
+        let info: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ALERTS WHERE level = 'info'",
+                [],
+                |fila| fila.get(0),
+            )
+            .expect("alertas info");
+        let porcentaje_info = info as f64 / stats.alerts as f64;
+        assert!(
+            porcentaje_info > 0.85,
+            "el perfil de referencia es ~90 % info (medido {porcentaje_info:.2})"
+        );
+        let aprendizaje_host: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ALERT_LEARNING
+                  WHERE subject = 'host' AND device_id = 0",
+                [],
+                |fila| fila.get(0),
+            )
+            .expect("aprendizaje del host");
+        assert_eq!(aprendizaje_host, 1);
+        let suspensiones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM COVERAGE_GAPS WHERE kind = 'suspend'",
+                [],
+                |fila| fila.get(0),
+            )
+            .expect("suspensiones");
+        assert_eq!(suspensiones as u64, stats.gaps);
+        // El inventario del propio equipo no guarda claves especiales.
+        let especiales: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM HOST_SEEN WHERE key LIKE '~%'",
+                [],
+                |fila| fila.get(0),
+            )
+            .expect("claves especiales");
+        assert_eq!(especiales, 0);
     }
 
     #[test]
@@ -1226,6 +1977,8 @@ mod tests {
         let directorio = tempfile::tempdir().expect("directorio temporal");
         let ruta = directorio.path().join("historico-sintetico.db");
         let mut conn = Connection::open(&ruta).expect("abrir BD");
+        migrations::apply_all(&mut conn).expect("aplicar migraciones");
+        crate::history::esquema_v6_de_pruebas(&conn).expect("esquema v6 de pruebas");
         let perfil = SyntheticProfile::default();
         println!("== medir_historial: perfil de referencia (§7.14) ==");
         println!(
@@ -1266,6 +2019,14 @@ mod tests {
             contar_tabla(&conn, "DEVICE_SEEN"),
             contar_tabla(&conn, "DEVICE_EVENTS"),
             contar_tabla(&conn, "APP_SESSIONS"),
+        );
+        println!(
+            "filas F6: alertas={} silencios={} aprendizaje={} host_seen={} huecos={}",
+            contar_tabla(&conn, "ALERTS"),
+            contar_tabla(&conn, "ALERT_MUTES"),
+            contar_tabla(&conn, "ALERT_LEARNING"),
+            contar_tabla(&conn, "HOST_SEEN"),
+            contar_tabla(&conn, "COVERAGE_GAPS"),
         );
 
         // Construcción de una hora: agregación de sus minutos (como build_hour).
@@ -1488,5 +2249,286 @@ mod tests {
         }
         assert!(filas_hora > 0 && filas_dia > 0);
         assert!(filas_top > 0);
+    }
+
+    /// Aplica solo las migraciones hasta la versión indicada (para medir la v6
+    /// sobre una base en la v5 sin el VACUUM inicial de F5).
+    fn aplicar_hasta(conn: &mut Connection, version_max: u32) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS SCHEMA_MIGRATIONS (
+                 version INTEGER PRIMARY KEY,
+                 applied_at TEXT NOT NULL
+             );",
+        )?;
+        for migracion in migrations::MIGRATIONS
+            .iter()
+            .filter(|migracion| migracion.version <= version_max)
+        {
+            let transaccion = conn.transaction()?;
+            let ya_presente = match migracion.already_applied {
+                Some(comprobar) => comprobar(&transaccion)?,
+                None => false,
+            };
+            if !ya_presente {
+                transaccion.execute_batch(migracion.sql)?;
+            }
+            transaccion.execute(
+                "INSERT OR IGNORE INTO SCHEMA_MIGRATIONS (version, applied_at) VALUES (?1, ?2)",
+                params![migracion.version, "2026-01-01T00:00:00Z"],
+            )?;
+            transaccion.commit()?;
+        }
+        let modo: i64 = conn.query_row("PRAGMA auto_vacuum", [], |fila| fila.get(0))?;
+        if modo != 2 {
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn medir_alertas_consulta() {
+        let mut conn = conexion_en_memoria();
+        let perfil = SyntheticProfile::default();
+        println!("== medir_alertas_consulta: 20 000 alertas en 90 días (§8) ==");
+        let stats = Synthetic::generate(&mut conn, &perfil).expect("generar");
+        println!(
+            "alertas={} · silencios={} · aprendizaje={} · host_seen={} · huecos={}",
+            stats.alerts, stats.mutes, stats.learning, stats.host_seen, stats.gaps
+        );
+        let consultas: [(&str, AlertFilter, Page); 5] = [
+            (
+                "todas",
+                AlertFilter::default(),
+                Page {
+                    limit: 50,
+                    offset: 0,
+                },
+            ),
+            (
+                "sin ver",
+                AlertFilter {
+                    unseen_only: true,
+                    ..AlertFilter::default()
+                },
+                Page {
+                    limit: 50,
+                    offset: 0,
+                },
+            ),
+            (
+                "importantes",
+                AlertFilter {
+                    level: Some(Level::Important),
+                    ..AlertFilter::default()
+                },
+                Page {
+                    limit: 50,
+                    offset: 0,
+                },
+            ),
+            (
+                "página honda",
+                AlertFilter::default(),
+                Page {
+                    limit: 50,
+                    offset: 15_000,
+                },
+            ),
+            (
+                "búsqueda",
+                AlertFilter {
+                    search: Some("equipo-03".to_string()),
+                    ..AlertFilter::default()
+                },
+                Page {
+                    limit: 50,
+                    offset: 0,
+                },
+            ),
+        ];
+        let mut peor = Duration::ZERO;
+        for (nombre, filtro, pagina) in consultas {
+            let inicio = Instant::now();
+            let filas = Queries::alerts(&conn, &filtro, pagina).expect("consulta de alertas");
+            let tiempo = inicio.elapsed();
+            peor = peor.max(tiempo);
+            println!(
+                "{nombre}: {:.2} ms ({} filas)",
+                tiempo.as_secs_f64() * 1_000.0,
+                filas.len()
+            );
+        }
+        let inicio = Instant::now();
+        let detalle = Queries::alert_detail(&conn, 1).expect("detalle de la alerta 1");
+        let tiempo_detalle = inicio.elapsed();
+        println!(
+            "detalle: {:.2} ms ({} alertas agrupadas)",
+            tiempo_detalle.as_secs_f64() * 1_000.0,
+            detalle.grouped.len()
+        );
+        assert!(
+            peor.as_millis() <= 100,
+            "Queries::alerts ≤ 100 ms con 20 000 alertas (peor {peor:?})"
+        );
+        assert!(
+            tiempo_detalle.as_millis() <= 100,
+            "alert_detail ≤ 100 ms con 20 000 alertas"
+        );
+        assert_eq!(detalle.row.id, 1);
+
+        // Resúmenes de equipo (detalle), del host (Config), reglas y silencios:
+        // son consultas del lector y van con el mismo límite de 100 ms.
+        let dispositivos: Vec<i64> = {
+            let mut sentencia = conn
+                .prepare("SELECT id FROM DEVICES ORDER BY id")
+                .expect("equipos");
+            let filas = sentencia
+                .query_map([], |fila| fila.get(0))
+                .expect("ids de los equipos");
+            filas.map(|fila| fila.expect("id")).collect()
+        };
+        let inicio = Instant::now();
+        let mut recientes = 0;
+        for device_id in &dispositivos {
+            let resumen = Queries::alert_summary(&conn, SubjectSel::Device(*device_id), perfil.end)
+                .expect("resumen del equipo");
+            recientes += resumen.recent.len();
+        }
+        let host = Queries::alert_summary(&conn, SubjectSel::Host, perfil.end)
+            .expect("resumen del propio equipo");
+        assert!(
+            host.inventory.is_some(),
+            "el resumen del host trae su inventario"
+        );
+        let reglas = Queries::rule_stats(&conn, perfil.end - 7 * 86_400).expect("reglas");
+        let silencios = Queries::mutes(&conn, perfil.end).expect("silencios");
+        let tiempo_resumenes = inicio.elapsed();
+        println!(
+            "resúmenes de {} equipos + host, reglas y silencios: {:.2} ms ({} alertas recientes, {} reglas, {} silencios)",
+            dispositivos.len(),
+            tiempo_resumenes.as_secs_f64() * 1_000.0,
+            recientes,
+            reglas.len(),
+            silencios.len()
+        );
+        assert!(
+            tiempo_resumenes.as_millis() <= 100,
+            "las consultas de resumen deben cumplir ≤ 100 ms (medido {tiempo_resumenes:?})"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn medir_alertas_aprendizaje() {
+        // §8: aprendizaje de un día ≤ 50 ms con 50 equipos (Repo::update_learning).
+        let directorio = tempfile::tempdir().expect("directorio temporal");
+        let ruta = directorio.path().join("aprendizaje.db");
+        let mut repo = Repo::init(&ruta).expect("repositorio de prueba");
+        let perfil = SyntheticProfile {
+            devices: 50,
+            ..SyntheticProfile::default()
+        };
+        println!("== medir_alertas_aprendizaje: día con datos de 50 equipos (§8) ==");
+        let stats = Synthetic::generate(repo.connection_mut(), &perfil).expect("generar");
+        println!(
+            "perfil: {} equipos · {} filas de aprendizaje · {} sesiones · {} huecos",
+            stats.devices, stats.learning, stats.sessions, stats.gaps
+        );
+        // El generador deja el día de ayer ya contado; se reinicia el aprendizaje
+        // para medir la consolidación completa de ese día.
+        repo.connection_mut()
+            .execute(
+                "UPDATE ALERT_LEARNING
+                    SET updated_day = 0, data_days = 0, learned_at = NULL",
+                [],
+            )
+            .expect("reiniciar aprendizaje");
+        let ayer = LocalDay::from_unix(perfil.end).sumar_dias(-1);
+        let parametros = LearningParams::default();
+        let inicio = Instant::now();
+        let cambios = repo
+            .update_learning(ayer, &parametros)
+            .expect("aprendizaje del día");
+        let tiempo = inicio.elapsed();
+        println!(
+            "Repo::update_learning de {} equipos + host: {:.2} ms ({} sujetos llegan a aprendidos)",
+            stats.devices,
+            tiempo.as_secs_f64() * 1_000.0,
+            cambios.len()
+        );
+        assert!(
+            tiempo.as_millis() <= 50,
+            "el aprendizaje de un día debe cumplir ≤ 50 ms (medido {tiempo:?})"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn medir_migracion_v6() {
+        let directorio = tempfile::tempdir().expect("directorio temporal");
+        let ruta = directorio.path().join("migracion-v6.db");
+        let mut conn = Connection::open(&ruta).expect("abrir BD");
+        aplicar_hasta(&mut conn, 5).expect("esquema v5");
+        let perfil = SyntheticProfile::default();
+        println!("== medir_migracion_v6: histórico sintético de 2 años (§8) ==");
+        let stats = Synthetic::generate_historico_v5(&mut conn, &perfil)
+            .expect("histórico sintético de la v5");
+        println!(
+            "BD v5: {} equipos · minutos={} horas={} días={} inventario={} eventos={} sesiones={} ({:.0} MB)",
+            stats.devices,
+            stats.minutes,
+            stats.hours,
+            stats.days,
+            stats.seen,
+            stats.events,
+            stats.sessions,
+            (conn
+                .query_row("PRAGMA page_count", [], |fila| fila.get::<_, i64>(0))
+                .unwrap_or(0) as f64
+                * conn
+                    .query_row("PRAGMA page_size", [], |fila| fila.get::<_, i64>(0))
+                    .unwrap_or(0) as f64)
+                / 1_000_000.0
+        );
+        let inicio = Instant::now();
+        let version = migrations::apply_all(&mut conn).expect("migrar a la v6");
+        let tiempo = inicio.elapsed();
+        println!(
+            "migración v5→v6 con sus rellenos: {:.2} ms (versión {version})",
+            tiempo.as_secs_f64() * 1_000.0
+        );
+        if version >= 6 {
+            let aprendidos: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ALERT_LEARNING WHERE learned_at IS NOT NULL",
+                    [],
+                    |fila| fila.get(0),
+                )
+                .expect("equipos aprendidos");
+            let cerrados: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM DEVICE_SERVICES WHERE closed_at IS NOT NULL",
+                    [],
+                    |fila| fila.get(0),
+                )
+                .expect("puertos cerrados");
+            println!(
+                "rellenos: {aprendidos} equipos aprendidos · {cerrados} puertos cerrados · {} entradas de aprendizaje",
+                conn.query_row("SELECT COUNT(*) FROM ALERT_LEARNING", [], |fila| fila
+                    .get::<_, i64>(0))
+                .unwrap_or(0)
+            );
+            assert!(
+                cerrados > 0,
+                "el histórico sintético tiene puertos cerrados que rellenar"
+            );
+            assert!(
+                tiempo.as_millis() <= 2_000,
+                "la migración v6 con rellenos debe cumplir ≤ 2 s (medida {tiempo:?})"
+            );
+        } else {
+            println!("la migración v6 todavía no existe: medición pendiente del equipo de datos");
+        }
     }
 }

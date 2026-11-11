@@ -1,21 +1,22 @@
 # Almenara
 
 Monitor de red en TUI para Linux: descubre los equipos conectados a la red local, qué servicios
-ofrecen, **qué tráfico generan en vivo**, **quién está detrás de cada conexión** y **qué ha pasado
-los últimos dos años**. **Fase 5: histórico, rollups y eventos** — cierra cada minuto los
-contadores de la Fase 4 y los guarda como agregados por minuto (48 h), hora (90 días) y día local
-(2 años), con retención, purga y compactación; añade la pestaña **Histórico**, las ventanas de
-**1 h y 24 h** de Tráfico y el histórico del detalle de equipo, completa los eventos (vuelta a
-estar en línea, servicios, SO y tipo), calcula la **presencia** y guarda el **inventario por
-equipo**. Todo sobre la base de las fases 1 a 4 (descubrimiento ARP/ICMP/DNS/OUI, mDNS, SSDP,
-DHCP, NetBIOS, port scan, fingerprint, clasificación, captura AF_PACKET + TPACKET_V3, tráfico en
-vivo, protocolos, apps y top talkers).
+ofrecen, **qué tráfico generan en vivo**, **quién está detrás de cada conexión**, **qué ha pasado
+los últimos dos años** y **avisa de lo que cambia**. **Fase 6: alertas** — un motor puro con 16
+reglas (equipos y puertos nuevos, cambios de identidad, apps, categorías, países, organizaciones y
+JA4 nuevas, más tráfico de lo habitual, equipos vigilados y salud de Almenara), tres niveles,
+aprendizaje de 7 días con datos, deduplicación de 24 h, silencios, horario silencioso y
+notificaciones de escritorio por D-Bus. La pestaña **Alertas** deja de ser un placeholder y la TUI
+gana contador en la barra, marcas en Equipos y bloque de alertas en el detalle. Todo sobre las
+fases 1 a 5 (descubrimiento ARP/ICMP/DNS/OUI, mDNS, SSDP, DHCP, NetBIOS, port scan, fingerprint,
+clasificación, captura AF_PACKET + TPACKET_V3, tráfico en vivo, protocolos, apps, top talkers,
+histórico y presencia).
 
 ## Estado del proyecto
 
-**Fases 1 a 5 implementadas** (pendiente de entrega del informe de implementación de la Fase 5 al
-analista funcional; las 9 casillas de F4 de la pasada con `CAP_NET_RAW` siguen pendientes por
-decisión del desarrollador). Documentación:
+**Fases 1 a 6 implementadas y verificadas**, incluida la pasada final con `CAP_NET_RAW` de F4
+(175/175) y la prueba con tráfico real de F5 y F6; queda entregar los informes de
+implementación de F5 y F6 al analista funcional. Documentación:
 
 - Fase 1: [informe de fase](docs/fase1/almenara-fase1-informe.md),
   [checklist](docs/fase1/almenara-fase1-checklist.md) e
@@ -32,6 +33,49 @@ decisión del desarrollador). Documentación:
 - Fase 5: [informe de fase](docs/fase5/almenara-fase5-informe.md),
   [checklist](docs/fase5/almenara-fase5-checklist.md) e
   [informe de implementación](docs/fase5/almenara-fase5-implementacion.md).
+- Fase 6: [informe de fase](docs/fase6/almenara-fase6-informe.md),
+  [checklist](docs/fase6/almenara-fase6-checklist.md) e
+  [informe de implementación](docs/fase6/almenara-fase6-implementacion.md).
+
+## Novedades de la Fase 6
+
+- **Pestaña Alertas** (tecla 5) con lista por última repetición (cuándo, nivel !! IMP / ! AVI /
+  INF, qué y equipo), marca ● de no vista y «×N» de repeticiones; detalle inferior con el porqué,
+  las repeticiones, si se notificó y lo que agrupa un resumen. Enter abre el detalle y marca vista;
+  espacio marca vista; T marca todas las del filtro (con confirmación si son más de 20); f filtra
+  por nivel; u deja solo las no vistas; / filtra por equipo; m silencia la regla para ese sujeto
+  (1 día, 7 días o siempre) y e abre el equipo.
+- **Tres vistas con Tab**: Alertas → **Reglas** (estado, nivel, alertas de 7 días y silencios de
+  cada una; espacio activa o apaga y n cambia el nivel, guardado al momento en config.toml) →
+  **Silencios** (regla, equipo, hasta y desde; x lo quita).
+- **Catálogo fijo de 16 reglas** (ADR-67): equipo nuevo (importante, aviso si la MAC es privada),
+  puerto nuevo, cambio de MAC, de nombre, de SO y de tipo, app / categoría / país / organización /
+  huella JA4 nuevas, más tráfico de lo habitual (mediana de la misma hora local de 14 días), equipo
+  vigilado ausente o de vuelta, captura parada, pérdidas de captura y base de datos grande.
+- **No avisar de más**: aprendizaje de **7 días con datos** (un día cuenta si hubo al menos 1 h de
+  cobertura y tráfico del sujeto), línea base cuando la BD está vacía, deduplicación de 24 h con
+  repeticiones y condiciones que se resuelven y reactivan, silencios por regla y sujeto, puesta al
+  día de 10 minutos con resumen, horario silencioso, tope de 3 notificaciones por minuto y
+  retención de 90 días.
+- **Notificaciones de escritorio** por D-Bus de sesión con notify-rust 4.17 (Rust puro) en un hilo
+  propio: solo las alertas importantes notifican; sin servidor de notificaciones la app sigue y las
+  alertas quedan en la pestaña. Texto saneado (sin ANSI ni caracteres de control) y escapado.
+- **Equipos vigilados**: p marca o desmarca un equipo como vigilado en Equipos y en su detalle;
+  solo ellos generan alertas de presencia (por defecto ninguno). Marcas * (vigilado) y !
+  (alertas importantes o avisos sin ver) con leyenda.
+- **La barra dice «Alertas N»** (no vistas importantes y avisos) y aparece un aviso de una línea
+  durante 10 s cuando llega una alerta importante fuera de la pestaña.
+- **Huecos honestos dentro de la sesión**: la suspensión del equipo (comparando CLOCK_BOOTTIME con
+  CLOCK_MONOTONIC) y la captura parada se guardan en COVERAGE_GAPS; todas las coberturas
+  (histórico, presencia, aprendizaje y «más tráfico de lo habitual») los restan.
+- **Inventario del propio equipo** (HOST_SEEN): apps, categorías, organizaciones, países y JA4 que
+  Almenara ve en el propio equipo, con aprendizaje independiente; se muestra en Config.
+- **Puertos cerrados con fecha**: DEVICE_SERVICES.closed_at permite decir «cerrado el …» y
+  distinguir un puerto reabierto; la reconciliación ya no mueve last_seen al cerrar.
+- **Privacidad**: las alertas guardan regla, sujeto, clave y porqué (nunca dominios ni contenido);
+  el detalle de lo nuevo usa el inventario de F5, que no guarda destinos.
+- **Mediciones**: pruebas ignoradas medir_alertas_*, medir_migracion_v6 y medir_render_alertas
+  sobre el histórico sintético ampliado con alertas, silencios, aprendizaje y huecos.
 
 ## Novedades de la Fase 5
 
@@ -113,6 +157,8 @@ decisión del desarrollador). Documentación:
 - Terminal de al menos 80x24.
 - Para capturar paquetes: `CAP_NET_RAW` (ver más abajo). El resto de la aplicación funciona sin
   privilegios.
+- Opcional: un servidor de notificaciones de escritorio (mako, dunst, GNOME Shell, KDE Plasma…) en
+  la sesión para las alertas importantes; sin él la aplicación sigue y las alertas quedan en la TUI.
 
 ## Compilación y arranque
 
@@ -172,7 +218,7 @@ aplicación nunca eleva privilegios por sí misma.
 ## Configuración
 
 Si el fichero de configuración no existe, se crea una plantilla con los valores por defecto al
-arrancar (y se usan esos valores aunque la creación no sea posible). Ejemplo actualizado a Fase 4:
+arrancar (y se usan esos valores aunque la creación no sea posible). Ejemplo actualizado a Fase 6:
 
 ```toml
 [scan]
@@ -207,6 +253,45 @@ destination_days = 30            # destinos por hora (0 = no guardarlos)
 top_keys = 20                    # claves por sujeto, dimensión y cubo; el resto, «otros»
 max_db_mb = 1024                 # aviso cuando la base de datos lo supera
 
+[alerts]                         # alertas (Fase 6)
+enabled = true                   # apagado: no se crean alertas; las guardadas se siguen viendo
+retention_days = 90              # retención de las alertas
+learning_days = 7                # días con datos antes de avisar de lo nuevo (0 = nace aprendido)
+catch_up_minutes = 10            # puesta al día al arrancar (0 = sin ella)
+dedup_hours = 24                 # la misma alerta no se repite en este plazo
+desktop_notifications = true     # notificaciones de escritorio (solo importantes)
+quiet_hours = ""                 # p. ej. "23:00-08:00" en hora local; vacío = sin horario
+max_notifications_per_minute = 3
+
+[alerts.traffic_high]
+factor = 3.0                     # veces la mediana
+baseline_days = 14               # días de muestras de la misma hora local
+min_days = 5                     # muestras mínimas para avisar
+min_mb_down = 200                # MB de bajada por hora (MB de 1 000 000 bytes)
+min_mb_up = 50                   # MB de subida por hora
+
+[alerts.capture_drops]
+percent = 1.0                    # % perdido en un minuto
+minutes = 5                      # minutos seguidos por encima del umbral
+
+[alerts.rules]
+device_new       = { enabled = true, level = "important", level_private_mac = "warning" }
+port_new         = { enabled = true, level = "important" }
+mac_changed      = { enabled = true, level = "warning" }
+name_changed     = { enabled = true, level = "info" }
+os_changed       = { enabled = true, level = "info" }
+type_changed     = { enabled = true, level = "info" }
+new_app          = { enabled = true, level = "info" }
+new_category     = { enabled = true, level = "info" }
+new_country      = { enabled = true, level = "info" }
+new_org          = { enabled = true, level = "info" }
+new_ja4          = { enabled = true, level = "info" }
+traffic_high     = { enabled = true, level = "warning" }
+watched_presence = { enabled = true, level = "warning" }
+capture_stopped  = { enabled = true, level = "important" }
+capture_drops    = { enabled = true, level = "warning" }
+db_size          = { enabled = true, level = "warning" }
+
 [ui]
 theme = "default"
 no_color = false
@@ -227,6 +312,13 @@ traffic_group = "device"         # device | destination | app | category | proto
 - Las claves de la fase 3 `inspect_payload`, `dns_attribution` y `sni_attribution` ya no se
   usan: si aparecen en el fichero se avisa una sola vez y se sigue el valor de
   `[inference].enabled`.
+- `[alerts.rules]`: activar, apagar o cambiar el nivel de una regla desde la pestaña Alertas
+  reescribe `config.toml` al momento (como `[ui]`); una regla desconocida se avisa una vez y se
+  ignora, y las que falten usan sus valores por defecto. `level_private_mac` solo existe para
+  `device_new`.
+- `[alerts].quiet_hours` es vacío o «HH:MM-HH:MM» en hora local (puede cruzar la medianoche).
+- `[history].enabled = false` también desactiva las reglas que dependen del histórico (lo nuevo y
+  «más tráfico de lo habitual»); la vista Reglas lo indica en su fila.
 - Los valores inválidos se avisan y se sustituyen por los valores por defecto (la aplicación nunca
   deja de arrancar por un error de configuración).
 
@@ -280,11 +372,11 @@ terminales de 100 columnas o más, añade las líneas de captura y visibilidad
 
 ## Uso de la TUI
 
-Pestañas: **Equipos · Tráfico · Conexiones · Histórico · Alertas · Config · Ayuda**. En Fase 5
-están operativas Equipos (plana o agrupada, con detalle master-detail y línea «Último evento»),
-Tráfico (rankings por dimensión y «¿Quién lo usa?»), Conexiones (tabla con protocolo, equipo,
-destino, app y panel de detalle), Histórico, Config y Ayuda. Solo Alertas (F6) sigue mostrando su
-placeholder.
+Pestañas: **Equipos · Tráfico · Conexiones · Histórico · Alertas · Config · Ayuda**. Desde la Fase 6
+están operativas todas: Equipos (plana o agrupada, con detalle master-detail, línea «Último evento»
+y marcas `*`/`!`), Tráfico (rankings por dimensión y «¿Quién lo usa?»), Conexiones (tabla con
+protocolo, equipo, destino, app y panel de detalle), Histórico, **Alertas** (lista con detalle,
+Reglas y Silencios), Config y Ayuda.
 
 En la pestaña Tráfico, `g` cicla la agrupación (equipo → destino → app → categoría → protocolo →
 proceso) y se guarda en `[ui].traffic_group`; `w` cicla la ventana (60 s → 5 min → 1 h → 24 h →
@@ -310,8 +402,21 @@ apps, destinos, organizaciones y países en un equipo (los destinos solo hasta 3
 equipo; `Enter` sobre un equipo o un evento abre su detalle.
 
 En el detalle de equipo, `w` alterna el histórico entre 24 h y 7 días: una fila de tráfico y otra de
-presencia sobre el mismo eje, la rejilla de presencia de 7 días × 24 horas y el bloque «Visto en
-este equipo» con recuentos, lo nuevo de los últimos 7 días y los puertos abiertos.
+presencia sobre el mismo eje, la rejilla de presencia de 7 días × 24 horas, el bloque «Visto en
+este equipo» con recuentos, lo nuevo de los últimos 7 días y los puertos abiertos (con «cerrado
+el …» si el puerto se cerró), y el bloque **Alertas** con las últimas 5, las que faltan por ver,
+si está `vigilado`, su aprendizaje y sus silencios.
+
+En **Alertas**, `Tab` recorre Alertas → Reglas → Silencios. En la lista, `Enter` abre el detalle
+inferior y marca la alerta como vista, `espacio` la marca sin abrirla, `T` marca todas las del
+filtro (pide confirmación si son más de 20), `f` cicla el nivel (todas → importantes → avisos →
+info), `u` deja solo las no vistas, `/` filtra por equipo, `m` silencia la regla para ese sujeto
+(1 día, 7 días o siempre) y `e` abre el equipo. En Reglas, `espacio` activa o apaga una regla y
+`n` cicla su nivel (en «con MAC privada», el nivel de las MAC privadas); el cambio se guarda al
+momento en `config.toml`. En Silencios, `x` quita el silencio seleccionado. `p` marca o desmarca
+el equipo seleccionado como vigilado en Equipos y en su detalle: solo los vigilados generan avisos
+de presencia. Las reglas que no pueden saltar lo dicen en su fila («necesita el histórico»,
+«necesita captura» o «sin escaneo de puertos»).
 
 | Tecla | Acción |
 |-------|--------|
@@ -333,6 +438,13 @@ este equipo» con recuentos, lo nuevo de los últimos 7 días y los puertos abie
 | `?` / `q` | ayuda / salir |
 | `Esc` | cerrar panel, detalle o búsqueda; volver a Equipos |
 | `a` / `n` | editar alias / notas del equipo |
+| `p` | Equipos y detalle: marcar o desmarcar el equipo como vigilado |
+| `Tab` (Alertas) | Alertas → Reglas → Silencios |
+| `Enter` / `espacio` (Alertas) | detalle de la alerta (la marca vista) / marcar como vista |
+| `T` / `f` / `u` / `/` (Alertas) | marcar todas las del filtro / filtro de nivel / solo sin ver / filtrar por equipo |
+| `m` / `e` (Alertas) | silenciar la regla para el sujeto (1 día, 7 días o siempre) / abrir el equipo |
+| `espacio` / `n` (Reglas) | activar o apagar la regla / ciclar su nivel |
+| `x` (Silencios) | quitar el silencio seleccionado |
 
 Iconos por tipo de dispositivo: `[⌂]` gateway, `[▣]` PC/servidor/NAS, `[▯]` móvil/tablet,
 `[▶]` TV/streaming, `[P]` impresora, `[C]` cámara, `[●]` IoT, `[?]` desconocido; `○` indica
@@ -349,8 +461,10 @@ etiquetas esperadas (TLS partido, QUIC, DNS, DHCP y ARP). La Fase 5 añade tests
 v4 → v5 sin pérdida de datos, acumuladores y topes de los rollups (con los totales cuadrando),
 consolidación de horas y días (incluidos los días de 23 y 25 horas de los cambios de hora), purga
 por resolución, sesiones y huecos, instancia única, eventos nuevos y presencia, inventario y
-consultas del lector con datos sintéticos. El replay condicional de la feature no default `pcap` se
-mantiene para la fase 7:
+consultas del lector con datos sintéticos. La Fase 6 añade tests del motor puro (catálogo, dedup,
+condiciones, silencios, aprendizaje, línea base, política de notificación, saneado y suspensión),
+la migración v5 → v6 sin pérdida de datos, los DAO de alertas, la cobertura con huecos y las vistas
+de alertas. El replay condicional de la feature no default `pcap` se mantiene para la fase 7:
 
 ```bash
 cargo test --features pcap
@@ -362,6 +476,13 @@ Las mediciones de la Fase 5 usan un histórico sintético determinista (30 equip
 ```bash
 cargo test --release -- --ignored medir_historial
 cargo test --release -- --ignored medir_minute_rollup
+```
+
+La Fase 6 añade `medir_alertas_motor`, `medir_alertas_hora`, `medir_alertas_aprendizaje`,
+`medir_alertas_consulta`, `medir_migracion_v6` y `medir_render_alertas`:
+
+```bash
+cargo test --release --bin almenara medir_ -- --ignored --nocapture --test-threads=1
 ```
 
 ## Datos y privacidad
@@ -393,7 +514,18 @@ para borrar el histórico basta con cerrar Almenara y borrar la BD o bajar las r
 desactiva entero con `[history].enabled = false`. La Ayuda de la TUI recuerda qué se guarda y
 cuánto tiempo.
 
-## Limitaciones (fases 3, 4 y 5)
+**Alertas (Fase 6).** Cada alerta guarda la regla, el sujeto (equipo, propio equipo, red o
+Almenara), la clave (app, categoría, país, organización, JA4, puerto…) y el porqué, nunca dominios
+ni contenido: salen del inventario de F5, que no guarda destinos. Se conservan 90 días y se borran
+solas (no hay borrado manual; para conservar menos, baja `[alerts].retention_days`). **Solo hay
+alertas de presencia de los equipos que marques como vigilados**; ninguno lo está por defecto. Las
+notificaciones de escritorio se ven en pantalla y **el servidor de notificaciones puede guardarlas
+en su historial**: por defecto solo notifican las importantes (equipo nuevo con MAC fija, puerto
+nuevo y captura parada), sin apps ni organizaciones, y se pueden apagar con
+`[alerts].desktop_notifications = false`. El texto que viene de la red se sanea (sin caracteres de
+control ni ANSI) y se escapa en las notificaciones.
+
+## Limitaciones (fases 3, 4, 5 y 6)
 
 - **Visibilidad parcial en red conmutada**: se ve el 100 % del tráfico propio y de
   broadcast/multicast, pero del unicast entre terceros solo lo que llegue a la interfaz (sin
@@ -409,7 +541,19 @@ cuánto tiempo.
 - `/proc/net/nf_conntrack` puede requerir root; su lectura es best-effort.
 - Los sparklines arrancan a cero y el último snapshot se usa como semilla; los números de la
   semilla no se mezclan con las series nuevas.
-- Alertas sigue siendo un placeholder (fase 6).
+- **Las alertas solo existen mientras Almenara está abierta**: no hay modo servicio todavía, así que
+  no avisan con la TUI cerrada (sub-fase 6.5). Los huecos de suspensión y de captura parada se
+  marcan para que el histórico, el aprendizaje y «más tráfico de lo habitual» no los cuenten.
+- **Presencia solo de equipos vigilados**: se marca a mano el router, el NAS o un servidor; no es un
+  control de personas.
+- **Las notificaciones de escritorio necesitan un servidor de notificaciones** en la sesión (mako,
+  dunst, GNOME Shell, KDE…). Sin él, el notificador queda NO DISPONIBLE, se avisa una vez en Config
+  y las alertas siguen en la pestaña. Lo que el servidor haga con el historial de notificaciones no
+  lo controla Almenara.
+- **Visibilidad de las reglas de tráfico**: en red conmutada, «más tráfico de lo habitual» y «lo
+  nuevo» funcionan sobre todo para el propio equipo y para la red entera; para los demás equipos
+  mandan las reglas del escaneo (equipo nuevo, puertos e identidad).
+- Las alertas nunca llevan dominios ni contenido y no hay borrado manual: solo la purga de 90 días.
 - **Visibilidad del nombre en Fase 4**: DoH/DoT y ECH ocultan una parte del tráfico; sin SNI/Host
   se etiqueta por caché DNS, ASN y puerto. En red conmutada el tráfico de terceros que no llega a
   la interfaz no se etiqueta; el porcentaje de tráfico sin identificar se muestra siempre en el pie
@@ -421,7 +565,8 @@ cuánto tiempo.
   con el nombre del servidor. Se puede ampliar con `apps.toml`.
 - La organización y el país proceden de DB-IP Lite: son aproximados (país del registro) y las IPs
  privadas/de enlace local no tienen información.
-- JA4 se calcula y se muestra, pero no hay base de firmas ni alertas por JA4 (fase 6).
+- JA4 se calcula y se muestra; la Fase 6 avisa de una huella JA4 nueva en un sujeto aprendido,
+  pero no hay base de firmas ni reputación de huellas.
 
 ## Datos embebidos y atribuciones
 

@@ -7,7 +7,7 @@
 //! (servicios conocidos y último evento de cada puerto) las resuelve el DAO, de
 //! modo que las reglas de aquí se pueden probar sin base de datos.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
@@ -65,35 +65,32 @@ impl Changes {
         })
     }
 
-    /// Eventos de servicios de un escaneo de puertos real (§7.7).
+    /// Eventos de servicios de un escaneo de puertos real (§7.7 y §7.12).
     ///
     /// Reglas:
     ///
     /// - Sin eventos en el primer escaneo del equipo (`ya_escaneado = false`:
     ///   es su línea base) ni con `passive_only` (no hay escaneo).
     /// - `service_new` al ver abierto un puerto que no estaba en
-    ///   DEVICE_SERVICES (`reopened = false`) o que estaba CERRADO
-    ///   (`reopened = true`).
-    /// - `service_gone` al ver cerrado un puerto que estaba abierto.
+    ///   DEVICE_SERVICES (`reopened = false`) o que estaba CERRADO, es decir,
+    ///   con `closed_at` no NULO (`reopened = true`, §7.12).
+    /// - `service_gone` al ver cerrado un puerto que estaba ABIERTO u OBSOLETO
+    ///   (`closed_at` NULL). Un puerto que ya estaba CERRADO no repite el aviso
+    ///   en los escaneos siguientes.
     /// - Un puerto que solo está STALE por tiempo no está en
     ///   `puertos_escaneados` (no se ha escaneado en este ciclo) y, por tanto,
     ///   nunca genera evento.
     ///
-    /// El estado CERRADO es el último evento de servicio del puerto: tras un
-    /// `service_gone` el puerto sigue cerrado hasta un `service_new`.
-    /// `ultimos_eventos` trae el tipo del último evento de cada puerto TCP (el
-    /// DAO lo consulta antes de escribir los servicios del ciclo) y así no se
-    /// duplica `service_gone` en escaneos sucesivos.
-    ///
     /// `puertos_escaneados` son los puertos TCP que ha intentado el escaneo y
     /// `abiertos` solo los que han respondido; la diferencia son los cerrados.
+    /// `conocidos` son los servicios persistidos antes del upsert del ciclo,
+    /// con su `closed_at` intacto: de ahí sale el estado CERRADO.
     pub fn services(
         ya_escaneado: bool,
         passive_only: bool,
         puertos_escaneados: &[u16],
         abiertos: &[DetectedService],
         conocidos: &[DeviceService],
-        ultimos_eventos: &HashMap<u16, EventType>,
     ) -> Vec<NewEvent> {
         if passive_only || !ya_escaneado {
             return Vec::new();
@@ -107,34 +104,33 @@ impl Changes {
         abiertos_ordenados.sort_by_key(|servicio| servicio.port);
         abiertos_ordenados.dedup_by_key(|servicio| servicio.port);
         for abierto in abiertos_ordenados {
-            let conocido = conocidos.iter().any(|servicio| {
+            let conocido = conocidos.iter().find(|servicio| {
                 servicio.port == abierto.port && servicio.protocol == Protocol::Tcp
             });
-            let estaba_cerrado =
-                ultimos_eventos.get(&abierto.port) == Some(&EventType::ServiceGone);
-            if !conocido {
-                eventos.push(evento_service_new(abierto, false));
-            } else if estaba_cerrado {
-                eventos.push(evento_service_new(abierto, true));
+            match conocido {
+                // Un puerto CERRADO visto abierto borra closed_at y se reabre.
+                Some(servicio) if servicio.is_closed() => {
+                    eventos.push(evento_service_new(abierto, true));
+                }
+                Some(_) => {}
+                None => eventos.push(evento_service_new(abierto, false)),
             }
         }
 
-        // Puertos cerrados: estaban abiertos y el escaneo no los ve abiertos.
+        // Puertos cerrados: estaban ABIERTOS u OBSOLETOS y el escaneo no los ve
+        // abiertos. Los CERRADOS ya avisados no repiten service_gone.
         let mut cerrados: Vec<&DeviceService> = conocidos
             .iter()
             .filter(|servicio| {
                 servicio.protocol == Protocol::Tcp
                     && escaneados.contains(&servicio.port)
+                    && !servicio.is_closed()
                     && !abiertos.iter().any(|abierto| abierto.port == servicio.port)
             })
             .collect();
         cerrados.sort_by_key(|servicio| servicio.port);
         cerrados.dedup_by_key(|servicio| servicio.port);
         for servicio in cerrados {
-            if ultimos_eventos.get(&servicio.port) == Some(&EventType::ServiceGone) {
-                // Ya se avisó del cierre: el puerto sigue cerrado.
-                continue;
-            }
             eventos.push(NewEvent {
                 tipo: EventType::ServiceGone,
                 details: json!({
@@ -223,4 +219,106 @@ fn tiene_override_manual(device: &Device) -> bool {
         .as_deref()
         .filter(|tipo| !tipo.trim().is_empty())
         .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::ServiceKind;
+    use crate::repo::Protocol;
+
+    fn detectado(port: u16, servicio: Option<ServiceKind>) -> DetectedService {
+        DetectedService {
+            port,
+            protocol: Protocol::Tcp,
+            service: servicio,
+            banner: None,
+        }
+    }
+
+    fn conocido(port: u16, cerrado: bool) -> DeviceService {
+        DeviceService {
+            id: i64::from(port),
+            device_id: 1,
+            port,
+            protocol: Protocol::Tcp,
+            service: Some("ssh".to_string()),
+            banner: None,
+            first_seen: "2026-11-01T10:00:00Z".to_string(),
+            last_seen: "2026-11-04T10:00:00Z".to_string(),
+            closed_at: cerrado.then(|| "2026-11-04T11:00:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn puerto_nuevo_y_reabierto_por_closed_at() {
+        // Puerto que no estaba: service_new sin reopened.
+        let eventos = Changes::services(
+            true,
+            false,
+            &[22],
+            &[detectado(22, Some(ServiceKind::Ssh))],
+            &[],
+        );
+        assert_eq!(eventos.len(), 1);
+        assert_eq!(eventos[0].tipo, EventType::ServiceNew);
+        assert_eq!(eventos[0].details["port"], 22);
+        assert_eq!(eventos[0].details["protocol"], "tcp");
+        assert_eq!(eventos[0].details["service"], "ssh");
+        assert_eq!(eventos[0].details["reopened"], false);
+
+        // Puerto CERRADO que vuelve a verse abierto: reopened = true (§7.12).
+        let eventos = Changes::services(
+            true,
+            false,
+            &[22],
+            &[detectado(22, Some(ServiceKind::Ssh))],
+            &[conocido(22, true)],
+        );
+        assert_eq!(eventos.len(), 1);
+        assert_eq!(eventos[0].tipo, EventType::ServiceNew);
+        assert_eq!(eventos[0].details["reopened"], true);
+
+        // Puerto ya ABIERTO: no hay evento.
+        assert!(Changes::services(
+            true,
+            false,
+            &[22],
+            &[detectado(22, None)],
+            &[conocido(22, false)]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn service_gone_solo_en_puertos_abiertos_u_obsoletos_escaneados() {
+        // 22 ABIERTO visto cerrado, 80 ya CERRADO y 443 no escaneado.
+        let eventos = Changes::services(
+            true,
+            false,
+            &[22, 80],
+            &[],
+            &[
+                conocido(22, false),
+                conocido(80, true),
+                conocido(443, false),
+            ],
+        );
+        assert_eq!(eventos.len(), 1, "solo el 22 genera service_gone");
+        assert_eq!(eventos[0].tipo, EventType::ServiceGone);
+        assert_eq!(eventos[0].details["port"], 22);
+        assert_eq!(eventos[0].details["protocol"], "tcp");
+        assert_eq!(eventos[0].details["service"], "ssh");
+
+        // Un puerto cerrado no repite el aviso en el escaneo siguiente.
+        assert!(Changes::services(true, false, &[80], &[], &[conocido(80, true)]).is_empty());
+    }
+
+    #[test]
+    fn sin_eventos_en_el_primer_escaneo_ni_en_modo_pasivo() {
+        // Primer escaneo: línea base.
+        assert!(Changes::services(false, false, &[22], &[], &[conocido(22, false)]).is_empty());
+        // Modo pasivo: no hay escaneo.
+        assert!(Changes::services(true, true, &[22], &[], &[conocido(22, false)]).is_empty());
+    }
 }

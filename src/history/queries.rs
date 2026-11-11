@@ -17,16 +17,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
+use crate::alerts::{AlertCounts, AlertRule, LearningState, Level, RuleId};
 use crate::error::Result;
 use crate::history::localtime::{self, LocalDay};
 use crate::history::{
-    DbStats, Dimension, EventFilter, Gap, HistRankRow, HistWindow, HistoryQuery, HistoryResponse,
-    Inventory, InventoryPort, Page, PresenceSpan, PresenceState, Range, RankingResult, SeenKind,
-    SeenRow, Series, SeriesPoint, SubjectSel, TimelineItem, TimelineKind, TopRow, KEY_UNIDENTIFIED,
+    AlertDetail, AlertFilter, AlertRow, AlertSummary, DbStats, Dimension, EventFilter, Gap,
+    HistRankRow, HistWindow, HistoryQuery, HistoryResponse, Inventory, InventoryPort, MuteRow,
+    Page, PresenceSpan, PresenceState, Range, RankingResult, RuleStat, SeenKind, SeenRow, Series,
+    SeriesPoint, SubjectSel, TimelineItem, TimelineKind, TopRow, KEY_UNIDENTIFIED,
 };
 use crate::rankings::DeviceShare;
 use crate::traffic::DEVICE_ID_HOST;
@@ -100,6 +103,19 @@ pub fn ejecutar(conexion: &Connection, consulta: &HistoryQuery) -> Result<Histor
             *window,
             *now_minute,
         )?),
+        HistoryQuery::Alerts { filter, page, .. } => {
+            HistoryResponse::Alerts(Queries::alerts(conexion, filter, *page)?)
+        }
+        HistoryQuery::AlertDetail { id } => {
+            HistoryResponse::AlertDetail(Box::new(Queries::alert_detail(conexion, *id)?))
+        }
+        HistoryQuery::Mutes { now } => HistoryResponse::Mutes(Queries::mutes(conexion, *now)?),
+        HistoryQuery::RuleStats { since } => {
+            HistoryResponse::RuleStats(Queries::rule_stats(conexion, *since)?)
+        }
+        HistoryQuery::AlertSummary { subject, now } => HistoryResponse::AlertSummary(Box::new(
+            Queries::alert_summary(conexion, *subject, *now)?,
+        )),
     })
 }
 
@@ -438,6 +454,9 @@ fn tramos_ventana(window: HistWindow, now_minute: i64) -> (Vec<Tramo>, i64, i64)
 // ---------------------------------------------------------------------------
 
 /// Sesiones con captura que solapan [desde, hasta), recortadas y fusionadas.
+///
+/// Desde F6 se restan los huecos de COVERAGE_GAPS (§7.10): ni la suspensión del
+/// equipo ni la captura parada son cobertura de tráfico.
 fn cobertura_trafico(conn: &Connection, desde: i64, hasta: i64) -> Result<Vec<Intervalo>> {
     if desde >= hasta {
         return Ok(Vec::new());
@@ -478,7 +497,15 @@ fn cobertura_trafico(conn: &Connection, desde: i64, hasta: i64) -> Result<Vec<In
             }),
         }
     }
-    Ok(intervalos)
+    let huecos = huecos_de_cobertura(conn, desde, hasta, false)?;
+    let quitar: Vec<Intervalo> = huecos
+        .into_iter()
+        .map(|hueco| Intervalo {
+            start: hueco.start,
+            end: hueco.end,
+        })
+        .collect();
+    Ok(restar_intervalos(&intervalos, &quitar))
 }
 
 /// Tiempo cubierto por los intervalos dentro de [desde, hasta).
@@ -521,6 +548,118 @@ fn huecos_de(intervalos: &[Intervalo], desde: i64, hasta: i64) -> Vec<Gap> {
         });
     }
     huecos
+}
+
+/// Hueco dentro de una sesión de Almenara (§7.10), en segundos Unix UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HuecoCobertura {
+    /// Inicio.
+    start: i64,
+    /// Fin.
+    end: i64,
+    /// La suspensión del equipo quita cobertura de tráfico y de presencia; la
+    /// captura parada solo de tráfico.
+    suspendido: bool,
+}
+
+/// Huecos de COVERAGE_GAPS que solapan [desde, hasta), recortados y ordenados.
+///
+/// Un hueco abierto (solo puede ser de captura parada) se cierra con `hasta`,
+/// que los llamadores pasan recortado al instante actual. Con
+/// `solo_suspension` se descartan los de captura: la presencia solo resta las
+/// suspensiones.
+fn huecos_de_cobertura(
+    conn: &Connection,
+    desde: i64,
+    hasta: i64,
+    solo_suspension: bool,
+) -> Result<Vec<HuecoCobertura>> {
+    if desde >= hasta {
+        return Ok(Vec::new());
+    }
+    let mut sentencia = conn.prepare(
+        "SELECT kind, started_at, ended_at
+           FROM COVERAGE_GAPS
+          WHERE started_at < ?1
+            AND (ended_at IS NULL OR ended_at > ?2)
+          ORDER BY started_at",
+    )?;
+    let filas = sentencia.query_map(params![unix_a_rfc(hasta), unix_a_rfc(desde)], |fila| {
+        let kind: String = fila.get(0)?;
+        let inicio: String = fila.get(1)?;
+        let fin: Option<String> = fila.get(2)?;
+        Ok((kind, inicio, fin))
+    })?;
+    let mut huecos = Vec::new();
+    for fila in filas {
+        let (kind, inicio, fin) = fila?;
+        let suspendido = kind == "suspend";
+        if solo_suspension && !suspendido {
+            continue;
+        }
+        let Some(inicio) = rfc_a_unix(&inicio) else {
+            continue;
+        };
+        let inicio = inicio.max(desde);
+        let fin = fin
+            .as_deref()
+            .and_then(rfc_a_unix)
+            .unwrap_or(hasta)
+            .min(hasta);
+        if inicio < fin {
+            huecos.push(HuecoCobertura {
+                start: inicio,
+                end: fin,
+                suspendido,
+            });
+        }
+    }
+    Ok(huecos)
+}
+
+/// Resta intervalos (ordenados y sin solapar) de una lista ordenada.
+fn restar_intervalos(base: &[Intervalo], quitar: &[Intervalo]) -> Vec<Intervalo> {
+    if quitar.is_empty() {
+        return base.to_vec();
+    }
+    let mut resultado = Vec::new();
+    for tramo in base {
+        let mut segmentos = vec![*tramo];
+        for hueco in quitar {
+            if hueco.end <= tramo.start {
+                continue;
+            }
+            if hueco.start >= tramo.end {
+                break;
+            }
+            let mut siguientes = Vec::new();
+            for segmento in segmentos {
+                if hueco.end <= segmento.start || hueco.start >= segmento.end {
+                    siguientes.push(segmento);
+                    continue;
+                }
+                if hueco.start > segmento.start {
+                    siguientes.push(Intervalo {
+                        start: segmento.start,
+                        end: hueco.start,
+                    });
+                }
+                if hueco.end < segmento.end {
+                    siguientes.push(Intervalo {
+                        start: hueco.end,
+                        end: segmento.end,
+                    });
+                }
+            }
+            segmentos = siguientes;
+        }
+        resultado.extend(
+            segmentos
+                .into_iter()
+                .filter(|segmento| segmento.end > segmento.start),
+        );
+    }
+    resultado
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +913,11 @@ impl Queries {
                 let (inicio, fin, motivo) = fila?;
                 items.extend(items_de_sesion(&inicio, fin.as_deref(), motivo.as_deref()));
             }
+            // El filtro Almenara muestra también las suspensiones y las capturas
+            // paradas dentro de una sesión (§7.10 y §6).
+            for hueco in huecos_de_cobertura(conn, desde, now, false)? {
+                items.push(item_de_hueco(&hueco));
+            }
         }
         items.sort_by_key(|item| std::cmp::Reverse(item.at_unix));
         let inicio = page.offset.min(items.len());
@@ -851,63 +995,67 @@ impl Queries {
                 }
             }
         }
-        Ok(rellenar_huecos(tramos, desde, hasta))
+        // Una suspensión del equipo es «sin datos» también en la presencia
+        // (§7.10): durante ella Almenara no escanea; la captura parada no quita
+        // presencia porque el escaneo sigue.
+        let huecos = huecos_de_cobertura(conn, desde, hasta, true)?;
+        let presence = aplicar_sin_datos(rellenar_huecos(tramos, desde, hasta), &huecos);
+        Ok(presence)
     }
 
-    /// Inventario de un equipo (§7.9).
+    /// Inventario de un equipo o del propio equipo (§7.9 y §7.11).
     ///
-    /// Los puertos salen de DEVICE_SERVICES. Como el lector no tiene la config
-    /// del escaneo, el estado CERRADO se materializa con el último evento de
-    /// servicio de cada (puerto, protocolo): si es service_gone, el puerto ya
-    /// no está abierto y no se muestra. Sin eventos, la fila de F2 se incluye.
+    /// Con `device_id` 0 se lee HOST_SEEN (el propio equipo no está en DEVICES);
+    /// para un equipo, las claves salen de DEVICE_SEEN y los puertos de
+    /// DEVICE_SERVICES, incluidos los cerrados con `closed_at` (§7.12) para que
+    /// el detalle de equipo diga «cerrado el …».
     pub fn inventory(conn: &Connection, device_id: i64) -> Result<Inventory> {
         let mut inventario = Inventory {
             device_id,
             ..Inventory::default()
         };
+        let mut since: Option<String> = None;
+        if device_id == 0 {
+            let mut sentencia = conn.prepare(
+                "SELECT kind, key, first_seen, last_seen
+                   FROM HOST_SEEN
+                  ORDER BY first_seen, key",
+            )?;
+            let filas = sentencia.query_map([], fila_de_inventario)?;
+            for fila in filas {
+                let (kind, key, first_seen, last_seen) = fila?;
+                acumular_entrada(
+                    &mut inventario,
+                    &mut since,
+                    &kind,
+                    key,
+                    first_seen,
+                    last_seen,
+                );
+            }
+            inventario.since = since;
+            return Ok(inventario);
+        }
         let mut sentencia = conn.prepare(
             "SELECT kind, key, first_seen, last_seen
                FROM DEVICE_SEEN
               WHERE device_id = ?1
               ORDER BY first_seen, key",
         )?;
-        let filas = sentencia.query_map(params![device_id], |fila| {
-            let kind: String = fila.get(0)?;
-            let key: String = fila.get(1)?;
-            let first_seen: String = fila.get(2)?;
-            let last_seen: String = fila.get(3)?;
-            Ok((kind, key, first_seen, last_seen))
-        })?;
-        let mut since: Option<String> = None;
+        let filas = sentencia.query_map(params![device_id], fila_de_inventario)?;
         for fila in filas {
             let (kind, key, first_seen, last_seen) = fila?;
-            let Some(kind) = SeenKind::from_str(&kind) else {
-                continue;
-            };
-            if since
-                .as_deref()
-                .is_none_or(|actual| first_seen.as_str() < actual)
-            {
-                since = Some(first_seen.clone());
-            }
-            let entrada = SeenRow {
-                key: key.clone(),
-                label: key,
+            acumular_entrada(
+                &mut inventario,
+                &mut since,
+                &kind,
+                key,
                 first_seen,
                 last_seen,
-            };
-            match kind {
-                SeenKind::App => inventario.apps.push(entrada),
-                SeenKind::Category => inventario.categories.push(entrada),
-                SeenKind::Org => inventario.orgs.push(entrada),
-                SeenKind::Country => inventario.countries.push(entrada),
-                SeenKind::Ja4 => inventario.ja4.push(entrada),
-            }
+            );
         }
-        // Último evento de servicio por (puerto, protocolo): manda el más reciente.
-        let cerrados = puertos_cerrados(conn, device_id)?;
         let mut sentencia = conn.prepare(
-            "SELECT port, protocol, service, first_seen
+            "SELECT port, protocol, service, first_seen, closed_at
                FROM DEVICE_SERVICES
               WHERE device_id = ?1
               ORDER BY port, protocol",
@@ -917,16 +1065,14 @@ impl Queries {
             let protocol: String = fila.get(1)?;
             let service: Option<String> = fila.get(2)?;
             let first_seen: String = fila.get(3)?;
-            Ok((port, protocol, service, first_seen))
+            let closed_at: Option<String> = fila.get(4)?;
+            Ok((port, protocol, service, first_seen, closed_at))
         })?;
         for fila in filas {
-            let (port, protocol, service, first_seen) = fila?;
+            let (port, protocol, service, first_seen, closed_at) = fila?;
             let Ok(port) = u16::try_from(port) else {
                 continue;
             };
-            if cerrados.contains(&(port, protocol.clone())) {
-                continue;
-            }
             if since
                 .as_deref()
                 .is_none_or(|actual| first_seen.as_str() < actual)
@@ -938,6 +1084,7 @@ impl Queries {
                 protocol,
                 service,
                 first_seen,
+                closed_at,
             });
         }
         inventario.since = since;
@@ -1016,40 +1163,548 @@ impl Queries {
             coverage_30d_pct,
         })
     }
+
+    /// Lista de la pestaña Alertas (§6), ordenada por última repetición.
+    pub fn alerts(conn: &Connection, filter: &AlertFilter, page: Page) -> Result<Vec<AlertRow>> {
+        let patron = filter.search.as_deref().and_then(patron_de_busqueda);
+        let nivel = filter.level.map(Level::as_str);
+        let sin_ver = i64::from(u8::from(filter.unseen_only));
+        let limite = match page.limit {
+            0 => -1,
+            limite => i64::try_from(limite).unwrap_or(i64::MAX),
+        };
+        let desplazamiento = i64::try_from(page.offset).unwrap_or(i64::MAX);
+        let sql = format!(
+            r#"SELECT {SQL_COLUMNAS_ALERTA}
+                 FROM ALERTS a
+                 LEFT JOIN DEVICES d ON d.id = a.device_id
+                WHERE (?1 IS NULL OR a.level = ?1)
+                  AND (?2 = 0 OR a.seen_at IS NULL)
+                  AND (?3 IS NULL OR a.device_id = ?3)
+                  AND (?4 IS NULL
+                       OR a.subject_label LIKE ?4 ESCAPE '\'
+                       OR d.alias LIKE ?4 ESCAPE '\'
+                       OR d.hostname LIKE ?4 ESCAPE '\'
+                       OR d.ip LIKE ?4 ESCAPE '\')
+                ORDER BY a.last_at DESC, a.id DESC
+                LIMIT ?5 OFFSET ?6"#
+        );
+        leer_alertas(
+            conn,
+            &sql,
+            params![
+                nivel,
+                sin_ver,
+                filter.device_id,
+                patron,
+                limite,
+                desplazamiento
+            ],
+        )
+    }
+
+    /// Detalle de una alerta (§6): el porqué, lo que agrupa, aprendizaje y silencios.
+    pub fn alert_detail(conn: &Connection, id: i64) -> Result<AlertDetail> {
+        let sql = format!(
+            r#"SELECT {SQL_COLUMNAS_ALERTA}
+                 FROM ALERTS a
+                 LEFT JOIN DEVICES d ON d.id = a.device_id
+                WHERE a.id = ?1"#
+        );
+        let mut filas = leer_alertas(conn, &sql, params![id])?;
+        let row = filas.pop().ok_or_else(|| {
+            crate::error::Error::History("La alerta ya no está en el histórico".to_string())
+        })?;
+        let details = conn
+            .query_row(
+                "SELECT details FROM ALERTS WHERE id = ?1",
+                params![id],
+                |fila| fila.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|texto| serde_json::from_str(&texto).ok())
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let grouped = if row.es_resumen() {
+            let sql = format!(
+                r#"SELECT {SQL_COLUMNAS_ALERTA}
+                     FROM ALERTS a
+                     LEFT JOIN DEVICES d ON d.id = a.device_id
+                    WHERE a.summary_id = ?1
+                    ORDER BY a.last_at DESC, a.id DESC"#
+            );
+            leer_alertas(conn, &sql, params![id])?
+        } else {
+            Vec::new()
+        };
+        let learned_at = aprendizaje_de_sujeto(conn, row.subject)?;
+        let mutes = mutes_de_sujeto(conn, row.subject, None)?;
+        Ok(AlertDetail {
+            row,
+            details,
+            grouped,
+            learned_at,
+            mutes,
+        })
+    }
+
+    /// Silencios vigentes de la vista Silencios (§6).
+    pub fn mutes(conn: &Connection, now: i64) -> Result<Vec<MuteRow>> {
+        let sql = format!(
+            "{SQL_MUTES}
+              WHERE m.until IS NULL OR m.until > ?1
+              ORDER BY m.created_at DESC, m.id DESC"
+        );
+        leer_mutes(conn, &sql, params![unix_a_rfc(now)])
+    }
+
+    /// Alertas desde `since` (7 días) y silencios de cada una de las 16 reglas (§6).
+    pub fn rule_stats(conn: &Connection, since: i64) -> Result<Vec<RuleStat>> {
+        let mut conteos: HashMap<RuleId, u32> = HashMap::new();
+        let mut sentencia =
+            conn.prepare("SELECT rule, COUNT(*) FROM ALERTS WHERE last_at >= ?1 GROUP BY rule")?;
+        let filas = sentencia.query_map(params![unix_a_rfc(since)], |fila| {
+            let regla: String = fila.get(0)?;
+            let total: i64 = fila.get(1)?;
+            Ok((regla, total))
+        })?;
+        for fila in filas {
+            let (regla, total) = fila?;
+            if let Some(regla) = RuleId::from_str(&regla) {
+                let contador = conteos.entry(regla).or_insert(0);
+                *contador =
+                    contador.saturating_add(u32::try_from(total.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        let mut silencios: HashMap<RuleId, u32> = HashMap::new();
+        let mut sentencia = conn.prepare("SELECT rule, COUNT(*) FROM ALERT_MUTES GROUP BY rule")?;
+        let filas = sentencia.query_map([], |fila| {
+            let regla: String = fila.get(0)?;
+            let total: i64 = fila.get(1)?;
+            Ok((regla, total))
+        })?;
+        for fila in filas {
+            let (regla, total) = fila?;
+            if let Some(regla) = RuleId::from_str(&regla) {
+                let contador = silencios.entry(regla).or_insert(0);
+                *contador =
+                    contador.saturating_add(u32::try_from(total.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        Ok(RuleId::ALL
+            .into_iter()
+            .map(|rule| RuleStat {
+                rule,
+                count_7d: conteos.get(&rule).copied().unwrap_or(0),
+                mutes: silencios.get(&rule).copied().unwrap_or(0),
+            })
+            .collect())
+    }
+
+    /// Últimas alertas, no vistas, silencios y aprendizaje de un sujeto (§6).
+    pub fn alert_summary(conn: &Connection, subject: SubjectSel, now: i64) -> Result<AlertSummary> {
+        let (sujeto_sql, device_id) = partes_de_sujeto(subject);
+        let mut resumen = AlertSummary {
+            subject,
+            recent: Vec::new(),
+            unseen: AlertCounts::default(),
+            mutes: Vec::new(),
+            learning: None,
+            inventory: None,
+        };
+        // La condición depende del sujeto para que el índice (device_id, last_at)
+        // se use en los equipos: con un OR parametrizado el plan lo descarta.
+        let (condicion, valores): (&str, Vec<Value>) = match subject {
+            SubjectSel::Device(_) => (
+                "a.subject = 'device' AND a.device_id = ?2",
+                vec![
+                    Value::Text(sujeto_sql.to_string()),
+                    Value::Integer(device_id),
+                ],
+            ),
+            _ => ("a.subject = ?1", vec![Value::Text(sujeto_sql.to_string())]),
+        };
+        let sql = format!(
+            r#"SELECT {SQL_COLUMNAS_ALERTA}
+                 FROM ALERTS a
+                 LEFT JOIN DEVICES d ON d.id = a.device_id
+                WHERE {condicion}
+                ORDER BY a.last_at DESC, a.id DESC
+                LIMIT 5"#
+        );
+        resumen.recent = leer_alertas(conn, &sql, params_from_iter(valores))?;
+        let (condicion, valores): (&str, Vec<Value>) = match subject {
+            SubjectSel::Device(_) => (
+                "subject = 'device' AND device_id = ?2",
+                vec![
+                    Value::Text(sujeto_sql.to_string()),
+                    Value::Integer(device_id),
+                ],
+            ),
+            _ => ("subject = ?1", vec![Value::Text(sujeto_sql.to_string())]),
+        };
+        let sql = format!(
+            "SELECT level, COUNT(*)
+               FROM ALERTS
+              WHERE {condicion} AND seen_at IS NULL
+              GROUP BY level"
+        );
+        let mut sentencia = conn.prepare(&sql)?;
+        let filas = sentencia.query_map(params_from_iter(valores), |fila| {
+            let nivel: String = fila.get(0)?;
+            let total: i64 = fila.get(1)?;
+            Ok((nivel, total))
+        })?;
+        for fila in filas {
+            let (nivel, total) = fila?;
+            let total = u32::try_from(total.max(0)).unwrap_or(u32::MAX);
+            match Level::from_str(&nivel) {
+                Some(Level::Important) => resumen.unseen.important = total,
+                Some(Level::Warning) => resumen.unseen.warning = total,
+                Some(Level::Info) => resumen.unseen.info = total,
+                None => {}
+            }
+        }
+        let Some(subject_alertas) = crate::alerts::Subject::from_parts(sujeto_sql, device_id)
+        else {
+            return Ok(resumen);
+        };
+        resumen.mutes = mutes_de_sujeto(conn, subject_alertas, Some(now))?;
+        if subject != SubjectSel::Network {
+            resumen.learning = leer_aprendizaje(conn, subject_alertas)?;
+        }
+        // El propio equipo lleva su inventario en el resumen (pestaña Config).
+        if subject == SubjectSel::Host {
+            resumen.inventory = Some(Queries::inventory(conn, 0)?);
+        }
+        Ok(resumen)
+    }
 }
 
-/// Puertos cuyo último evento de servicio es service_gone.
-fn puertos_cerrados(conn: &Connection, device_id: i64) -> Result<HashSet<(u16, String)>> {
-    let mut sentencia = conn.prepare(
-        "SELECT event_type, details
-           FROM DEVICE_EVENTS
-          WHERE device_id = ?1
-            AND event_type IN ('service_new', 'service_gone')
-          ORDER BY created_at DESC, id DESC",
-    )?;
-    let filas = sentencia.query_map(params![device_id], |fila| {
-        let tipo: String = fila.get(0)?;
-        let details: String = fila.get(1)?;
-        Ok((tipo, details))
-    })?;
-    let mut cerrados = HashSet::new();
-    let mut vistos: HashSet<(u16, String)> = HashSet::new();
-    for fila in filas {
-        let (tipo, details) = fila?;
-        let Some(puerto) = detalle_texto(&details, "port").and_then(|p| p.parse::<u16>().ok())
-        else {
-            continue;
-        };
-        let protocolo = detalle_texto(&details, "protocol").unwrap_or_else(|| "tcp".to_string());
-        let clave = (puerto, protocolo);
-        if !vistos.insert(clave.clone()) {
-            continue;
+/// Aprendizaje de un sujeto para el resumen (None si no tiene fila).
+fn leer_aprendizaje(
+    conn: &Connection,
+    subject: crate::alerts::Subject,
+) -> Result<Option<LearningState>> {
+    let fila: Option<(String, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT learning_from, data_days, learned_at
+               FROM ALERT_LEARNING
+              WHERE subject = ?1 AND device_id = ?2",
+            params![subject.as_str(), subject.device_id()],
+            |fila| Ok((fila.get(0)?, fila.get(1)?, fila.get(2)?)),
+        )
+        .optional()?;
+    let Some((desde, dias, aprendido)) = fila else {
+        return Ok(None);
+    };
+    let Some(desde) = rfc_a_unix(&desde) else {
+        return Ok(None);
+    };
+    Ok(Some(LearningState {
+        subject,
+        learning_from: unix_a_system_time(desde),
+        data_days: u32::try_from(dias.max(0)).unwrap_or(0),
+        learned_at: aprendido
+            .as_deref()
+            .and_then(rfc_a_unix)
+            .map(unix_a_system_time),
+    }))
+}
+
+/// Fila cruda del inventario (DEVICE_SEEN o HOST_SEEN).
+fn fila_de_inventario(fila: &Row<'_>) -> rusqlite::Result<(String, String, String, String)> {
+    let kind: String = fila.get(0)?;
+    let key: String = fila.get(1)?;
+    let first_seen: String = fila.get(2)?;
+    let last_seen: String = fila.get(3)?;
+    Ok((kind, key, first_seen, last_seen))
+}
+
+/// Coloca una entrada del inventario en su lista y actualiza el inicio.
+fn acumular_entrada(
+    inventario: &mut Inventory,
+    since: &mut Option<String>,
+    kind: &str,
+    key: String,
+    first_seen: String,
+    last_seen: String,
+) {
+    let Some(kind) = SeenKind::from_str(kind) else {
+        return;
+    };
+    if since
+        .as_deref()
+        .is_none_or(|actual| first_seen.as_str() < actual)
+    {
+        *since = Some(first_seen.clone());
+    }
+    let entrada = SeenRow {
+        key: key.clone(),
+        label: key,
+        first_seen,
+        last_seen,
+    };
+    match kind {
+        SeenKind::App => inventario.apps.push(entrada),
+        SeenKind::Category => inventario.categories.push(entrada),
+        SeenKind::Org => inventario.orgs.push(entrada),
+        SeenKind::Country => inventario.countries.push(entrada),
+        SeenKind::Ja4 => inventario.ja4.push(entrada),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alertas (F6): lista, detalle, silencios, reglas y resumen
+// ---------------------------------------------------------------------------
+
+/// Columnas de ALERTS que necesita el lector, con la etiqueta actual del equipo.
+const SQL_COLUMNAS_ALERTA: &str = "a.id, a.rule, a.level, a.subject, a.device_id, a.title,
+       a.subject_label, a.created_at, a.last_at, a.count, a.seen_at, a.resolved_at,
+       a.notified, a.summary_id, d.id, d.alias, d.hostname, d.ip";
+
+/// Patrón LIKE del filtro `/` de la pestaña Alertas (§6).
+///
+/// La búsqueda es una subcadena literal: se escapan la barra invertida, `%` y
+/// `_` y se rodea de `%`. Devuelve None si el texto está vacío. Lo comparte el
+/// DAO (`Repo::mark_seen`) para que «marcar todas» use el mismo conjunto.
+pub fn patron_de_busqueda(search: &str) -> Option<String> {
+    let texto = search.trim();
+    if texto.is_empty() {
+        return None;
+    }
+    let mut patron = String::with_capacity(texto.len() + 2);
+    patron.push('%');
+    for caracter in texto.chars() {
+        if matches!(caracter, '\\' | '%' | '_') {
+            patron.push('\\');
         }
-        if tipo == "service_gone" {
-            cerrados.insert(clave);
+        patron.push(caracter);
+    }
+    patron.push('%');
+    Some(patron)
+}
+
+/// Fila cruda de ALERTS con la etiqueta actual del equipo.
+struct AlertaCruda {
+    id: i64,
+    rule: String,
+    level: String,
+    subject: String,
+    device_id: Option<i64>,
+    title: String,
+    subject_label: String,
+    created_at: String,
+    last_at: String,
+    count: i64,
+    seen_at: Option<String>,
+    resolved_at: Option<String>,
+    notified: i64,
+    summary_id: Option<i64>,
+    equipo: Option<i64>,
+    alias: Option<String>,
+    hostname: Option<String>,
+    ip: Option<String>,
+}
+
+fn fila_a_cruda(fila: &Row<'_>) -> rusqlite::Result<AlertaCruda> {
+    Ok(AlertaCruda {
+        id: fila.get(0)?,
+        rule: fila.get(1)?,
+        level: fila.get(2)?,
+        subject: fila.get(3)?,
+        device_id: fila.get(4)?,
+        title: fila.get(5)?,
+        subject_label: fila.get(6)?,
+        created_at: fila.get(7)?,
+        last_at: fila.get(8)?,
+        count: fila.get(9)?,
+        seen_at: fila.get(10)?,
+        resolved_at: fila.get(11)?,
+        notified: fila.get(12)?,
+        summary_id: fila.get(13)?,
+        equipo: fila.get(14)?,
+        alias: fila.get(15)?,
+        hostname: fila.get(16)?,
+        ip: fila.get(17)?,
+    })
+}
+
+/// Convierte una fila cruda en la fila de la lista; None si trae una
+/// enumeración desconocida (no debería pasar: se valida en el código).
+fn alerta_de_cruda(cruda: AlertaCruda) -> Option<AlertRow> {
+    let rule = AlertRule::from_str(&cruda.rule)?;
+    let level = Level::from_str(&cruda.level)?;
+    let subject = crate::alerts::Subject::from_parts(&cruda.subject, cruda.device_id.unwrap_or(0))?;
+    let subject_label = match cruda.equipo {
+        Some(equipo) => etiqueta_de_equipo(
+            equipo,
+            cruda.alias.as_deref(),
+            cruda.hostname.as_deref(),
+            cruda.ip.as_deref(),
+        ),
+        None => {
+            let guardada = cruda.subject_label.trim();
+            if guardada.is_empty() {
+                subject.label().to_string()
+            } else {
+                guardada.to_string()
+            }
+        }
+    };
+    Some(AlertRow {
+        id: cruda.id,
+        rule,
+        level,
+        subject,
+        device_id: cruda.device_id,
+        title: cruda.title,
+        subject_label,
+        created_at: rfc_a_unix(&cruda.created_at).unwrap_or(0),
+        last_at: rfc_a_unix(&cruda.last_at).unwrap_or(0),
+        count: cruda.count,
+        seen: cruda.seen_at.is_some(),
+        resolved: cruda.resolved_at.is_some(),
+        notified: cruda.notified != 0,
+        summary_id: cruda.summary_id,
+    })
+}
+
+/// Ejecuta una sentencia de alertas y convierte sus filas.
+fn leer_alertas<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    valores: P,
+) -> Result<Vec<AlertRow>> {
+    let mut sentencia = conn.prepare(sql)?;
+    let filas = sentencia.query_map(valores, fila_a_cruda)?;
+    let mut alertas = Vec::new();
+    for fila in filas {
+        if let Some(alerta) = alerta_de_cruda(fila?) {
+            alertas.push(alerta);
         }
     }
-    Ok(cerrados)
+    Ok(alertas)
+}
+
+/// Fila cruda de ALERT_MUTES con la etiqueta actual del equipo.
+struct MuteCruda {
+    id: i64,
+    rule: String,
+    subject: String,
+    device_id: i64,
+    until: Option<String>,
+    created_at: String,
+    equipo: Option<i64>,
+    alias: Option<String>,
+    hostname: Option<String>,
+    ip: Option<String>,
+}
+
+fn fila_a_mute_cruda(fila: &Row<'_>) -> rusqlite::Result<MuteCruda> {
+    Ok(MuteCruda {
+        id: fila.get(0)?,
+        rule: fila.get(1)?,
+        subject: fila.get(2)?,
+        device_id: fila.get(3)?,
+        until: fila.get(4)?,
+        created_at: fila.get(5)?,
+        equipo: fila.get(6)?,
+        alias: fila.get(7)?,
+        hostname: fila.get(8)?,
+        ip: fila.get(9)?,
+    })
+}
+
+fn mute_de_cruda(cruda: MuteCruda) -> Option<MuteRow> {
+    let rule = RuleId::from_str(&cruda.rule)?;
+    let subject = crate::alerts::Subject::from_parts(&cruda.subject, cruda.device_id)?;
+    let device_label = if matches!(subject, crate::alerts::Subject::Device(_)) {
+        cruda.equipo.map(|equipo| {
+            etiqueta_de_equipo(
+                equipo,
+                cruda.alias.as_deref(),
+                cruda.hostname.as_deref(),
+                cruda.ip.as_deref(),
+            )
+        })
+    } else {
+        Some(subject.label().to_string())
+    };
+    Some(MuteRow {
+        id: cruda.id,
+        rule,
+        subject,
+        device_id: cruda.device_id,
+        device_label,
+        until: cruda.until.as_deref().and_then(rfc_a_unix),
+        created_at: rfc_a_unix(&cruda.created_at).unwrap_or(0),
+    })
+}
+
+/// Sentencia de silencios con las etiquetas de sus equipos.
+const SQL_MUTES: &str = "SELECT m.id, m.rule, m.subject, m.device_id, m.until, m.created_at,
+       d.id, d.alias, d.hostname, d.ip
+  FROM ALERT_MUTES m
+  LEFT JOIN DEVICES d ON d.id = m.device_id";
+
+fn leer_mutes<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    valores: P,
+) -> Result<Vec<MuteRow>> {
+    let mut sentencia = conn.prepare(sql)?;
+    let filas = sentencia.query_map(valores, fila_a_mute_cruda)?;
+    let mut mutes = Vec::new();
+    for fila in filas {
+        if let Some(mute) = mute_de_cruda(fila?) {
+            mutes.push(mute);
+        }
+    }
+    Ok(mutes)
+}
+
+/// Silencios de un sujeto, opcionalmente solo los vigentes en `ahora`.
+fn mutes_de_sujeto(
+    conn: &Connection,
+    subject: crate::alerts::Subject,
+    ahora: Option<i64>,
+) -> Result<Vec<MuteRow>> {
+    let sql = format!(
+        "{SQL_MUTES}
+  WHERE m.subject = ?1 AND m.device_id = ?2
+    AND (?3 IS NULL OR m.until IS NULL OR m.until > ?3)
+  ORDER BY m.created_at DESC, m.id DESC"
+    );
+    let desde = ahora.map(unix_a_rfc);
+    leer_mutes(
+        conn,
+        &sql,
+        params![subject.as_str(), subject.device_id(), desde],
+    )
+}
+
+/// Fin del aprendizaje de un sujeto, en segundos Unix UTC.
+fn aprendizaje_de_sujeto(
+    conn: &Connection,
+    subject: crate::alerts::Subject,
+) -> Result<Option<i64>> {
+    let aprendido: Option<Option<String>> = conn
+        .query_row(
+            "SELECT learned_at FROM ALERT_LEARNING WHERE subject = ?1 AND device_id = ?2",
+            params![subject.as_str(), subject.device_id()],
+            |fila| fila.get(0),
+        )
+        .optional()?;
+    Ok(aprendido.flatten().as_deref().and_then(rfc_a_unix))
+}
+
+/// Convierte segundos Unix UTC en un `SystemTime`.
+fn unix_a_system_time(segundos: i64) -> SystemTime {
+    if segundos >= 0 {
+        UNIX_EPOCH + Duration::from_secs(segundos.unsigned_abs())
+    } else {
+        UNIX_EPOCH - Duration::from_secs(segundos.unsigned_abs())
+    }
 }
 
 /// Clave de agrupación del ranking de ventana.
@@ -1750,6 +2405,33 @@ fn items_de_sesion(inicio: &str, fin: Option<&str>, motivo: Option<&str>) -> Vec
     items
 }
 
+/// Elemento de la línea de tiempo de un hueco de cobertura (§7.10).
+fn item_de_hueco(hueco: &HuecoCobertura) -> TimelineItem {
+    let descripcion = if hueco.suspendido {
+        "Equipo suspendido"
+    } else {
+        "Captura parada"
+    };
+    TimelineItem {
+        at: unix_a_rfc(hueco.start),
+        at_unix: hueco.start,
+        kind: TimelineKind::Event,
+        device_id: None,
+        device_label: None,
+        event_type: if hueco.suspendido {
+            "suspend".to_string()
+        } else {
+            "capture".to_string()
+        },
+        summary: format!(
+            "{descripcion} {}–{}",
+            localtime::format_hora_local(hueco.start),
+            localtime::format_hora_local(hueco.end)
+        ),
+        session_reason: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Presencia
 // ---------------------------------------------------------------------------
@@ -1915,6 +2597,65 @@ fn rellenar_huecos(mut tramos: Vec<PresenceSpan>, desde: i64, hasta: i64) -> Vec
     resultado
 }
 
+/// Sustituye por «sin datos» los tramos que caen dentro de un hueco.
+fn aplicar_sin_datos(tramos: Vec<PresenceSpan>, huecos: &[HuecoCobertura]) -> Vec<PresenceSpan> {
+    if huecos.is_empty() {
+        return tramos;
+    }
+    let mut resultado: Vec<PresenceSpan> = Vec::new();
+    for tramo in tramos {
+        let mut cursor = tramo.start;
+        for hueco in huecos {
+            if hueco.end <= cursor || hueco.start >= tramo.end {
+                continue;
+            }
+            let fin_dato = hueco.start.min(tramo.end);
+            if cursor < fin_dato {
+                resultado.push(PresenceSpan {
+                    start: cursor,
+                    end: fin_dato,
+                    state: tramo.state,
+                });
+            }
+            let inicio_hueco = hueco.start.max(cursor);
+            let fin_hueco = hueco.end.min(tramo.end);
+            if inicio_hueco < fin_hueco {
+                resultado.push(PresenceSpan {
+                    start: inicio_hueco,
+                    end: fin_hueco,
+                    state: PresenceState::NoData,
+                });
+            }
+            cursor = cursor.max(fin_hueco);
+        }
+        if cursor < tramo.end {
+            resultado.push(PresenceSpan {
+                start: cursor,
+                end: tramo.end,
+                state: tramo.state,
+            });
+        }
+    }
+    fusionar_tramos(resultado)
+}
+
+/// Fusiona tramos contiguos del mismo estado.
+fn fusionar_tramos(tramos: Vec<PresenceSpan>) -> Vec<PresenceSpan> {
+    let mut fusionados: Vec<PresenceSpan> = Vec::new();
+    for tramo in tramos {
+        if tramo.end <= tramo.start {
+            continue;
+        }
+        match fusionados.last_mut() {
+            Some(anterior) if anterior.state == tramo.state && anterior.end == tramo.start => {
+                anterior.end = tramo.end;
+            }
+            _ => fusionados.push(tramo),
+        }
+    }
+    fusionados
+}
+
 // ---------------------------------------------------------------------------
 // Pruebas
 // ---------------------------------------------------------------------------
@@ -1931,6 +2672,7 @@ mod tests {
     fn conexion() -> SqliteConnection {
         let mut conn = SqliteConnection::open_in_memory().expect("SQLite en memoria");
         migrations::apply_all(&mut conn).expect("aplicar migraciones");
+        crate::history::esquema_v6_de_pruebas(&conn).expect("esquema v6 de pruebas");
         conn
     }
 
@@ -2015,7 +2757,7 @@ mod tests {
         .expect("fila de rollup");
     }
 
-    fn sesion(conn: &SqliteConnection, inicio: i64, fin: Option<i64>, capture: bool) {
+    fn sesion(conn: &SqliteConnection, inicio: i64, fin: Option<i64>, capture: bool) -> i64 {
         conn.execute(
             "INSERT INTO APP_SESSIONS
                  (started_at, ended_at, last_beat, end_reason, mode, capture,
@@ -2030,6 +2772,7 @@ mod tests {
             ],
         )
         .expect("sesión");
+        conn.last_insert_rowid()
     }
 
     fn evento(conn: &SqliteConnection, device_id: i64, event_type: &str, details: &str, at: i64) {
@@ -2884,44 +3627,23 @@ mod tests {
             params![id, unix_a_rfc(T0 - 86_400), unix_a_rfc(T0)],
         )
         .expect("inventario");
+        // Desde la v6 el estado CERRADO vive en closed_at (§7.12): 445 cerrado,
+        // 443 reabierto (closed_at NULL) y 22 abierto.
         conn.execute(
             "INSERT INTO DEVICE_SERVICES
-                 (device_id, port, protocol, service, banner, first_seen, last_seen)
-             VALUES (?1, 445, 'tcp', 'microsoft-ds', NULL, ?2, ?3),
-                    (?1, 22, 'tcp', 'ssh', NULL, ?2, ?3),
-                    (?1, 443, 'tcp', 'https', NULL, ?2, ?3)",
-            params![id, unix_a_rfc(T0 - 200_000), unix_a_rfc(T0)],
+                 (device_id, port, protocol, service, banner, first_seen, last_seen,
+                  closed_at)
+             VALUES (?1, 445, 'tcp', 'microsoft-ds', NULL, ?2, ?3, ?4),
+                    (?1, 22, 'tcp', 'ssh', NULL, ?2, ?3, NULL),
+                    (?1, 443, 'tcp', 'https', NULL, ?2, ?3, NULL)",
+            params![
+                id,
+                unix_a_rfc(T0 - 200_000),
+                unix_a_rfc(T0),
+                unix_a_rfc(T0 - 1_000)
+            ],
         )
         .expect("servicios");
-        // 445 se cerró en el último evento; 443 se cerró y se reabrió; 22 no tiene eventos.
-        evento(
-            &conn,
-            id,
-            "service_new",
-            r#"{"port":445,"protocol":"tcp","service":"microsoft-ds"}"#,
-            T0 - 2_000,
-        );
-        evento(
-            &conn,
-            id,
-            "service_gone",
-            r#"{"port":445,"protocol":"tcp","service":"microsoft-ds"}"#,
-            T0 - 1_000,
-        );
-        evento(
-            &conn,
-            id,
-            "service_gone",
-            r#"{"port":443,"protocol":"tcp","service":"https"}"#,
-            T0 - 2_000,
-        );
-        evento(
-            &conn,
-            id,
-            "service_new",
-            r#"{"port":443,"protocol":"tcp","service":"https","reopened":true}"#,
-            T0 - 1_000,
-        );
         let inventario = Queries::inventory(&conn, id).expect("inventario");
         assert_eq!(inventario.apps.len(), 2);
         assert_eq!(inventario.countries.len(), 1);
@@ -2929,11 +3651,20 @@ mod tests {
         assert_eq!(inventario.apps[0].label, inventario.apps[0].key);
         assert_eq!(
             inventario.ports.len(),
-            2,
-            "445 está cerrado y no se muestra"
+            3,
+            "los cerrados se listan para decir «cerrado el …»"
         );
         assert_eq!(inventario.ports[0].port, 22, "ordenado por puerto");
         assert_eq!(inventario.ports[1].port, 443);
+        assert_eq!(inventario.ports[2].port, 445);
+        assert!(
+            inventario.ports[0].closed_at.is_none() && inventario.ports[1].closed_at.is_none(),
+            "22 y 443 están abiertos"
+        );
+        assert_eq!(
+            inventario.ports[2].closed_at.as_deref(),
+            Some(unix_a_rfc(T0 - 1_000).as_str())
+        );
         assert_eq!(
             inventario.since.as_deref(),
             Some(unix_a_rfc(T0 - 200_000).as_str()),
@@ -3019,5 +3750,821 @@ mod tests {
             stats.coverage_30d_pct > 0.0 && stats.coverage_30d_pct < 100.0,
             "un día de sesión sobre treinta"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Alertas, silencios, reglas, huecos e inventario del propio equipo (F6)
+    // -----------------------------------------------------------------------
+
+    fn rfc(segundos: i64) -> String {
+        unix_a_rfc(segundos)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn alerta(
+        conn: &SqliteConnection,
+        rule: &str,
+        level: &str,
+        subject: &str,
+        device_id: Option<i64>,
+        title: &str,
+        label: &str,
+        created: i64,
+        last: i64,
+        seen: bool,
+        resolved: bool,
+        notified: bool,
+        summary_id: Option<i64>,
+        details: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO ALERTS
+                 (rule, level, subject, device_id, title, subject_label, details,
+                  created_at, last_at, count, seen_at, resolved_at, notified, summary_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13)",
+            params![
+                rule,
+                level,
+                subject,
+                device_id,
+                title,
+                label,
+                details,
+                rfc(created),
+                rfc(last),
+                seen.then(|| rfc(last + 60)),
+                resolved.then(|| rfc(last + 120)),
+                notified,
+                summary_id,
+            ],
+        )
+        .expect("alerta");
+        conn.last_insert_rowid()
+    }
+
+    fn silencio(
+        conn: &SqliteConnection,
+        rule: &str,
+        subject: &str,
+        device_id: i64,
+        until: Option<i64>,
+        created: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO ALERT_MUTES (rule, subject, device_id, until, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![rule, subject, device_id, until.map(rfc), rfc(created)],
+        )
+        .expect("silencio");
+        conn.last_insert_rowid()
+    }
+
+    fn aprendizaje(
+        conn: &SqliteConnection,
+        subject: &str,
+        device_id: i64,
+        desde: i64,
+        dias: i64,
+        aprendido: Option<i64>,
+    ) {
+        // La migración v6 ya crea la fila del propio equipo: se sustituye.
+        conn.execute(
+            "INSERT OR REPLACE INTO ALERT_LEARNING
+                 (subject, device_id, learning_from, data_days, learned_at, updated_day)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![subject, device_id, rfc(desde), dias, aprendido.map(rfc)],
+        )
+        .expect("aprendizaje");
+    }
+
+    fn hueco(
+        conn: &SqliteConnection,
+        sesion_id: i64,
+        kind: &str,
+        desde: i64,
+        hasta: Option<i64>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO COVERAGE_GAPS (session_id, kind, started_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![sesion_id, kind, rfc(desde), hasta.map(rfc)],
+        )
+        .expect("hueco");
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn el_patron_de_busqueda_escapa_los_comodines() {
+        assert_eq!(patron_de_busqueda("   "), None);
+        assert_eq!(patron_de_busqueda("nas"), Some("%nas%".to_string()));
+        assert_eq!(
+            patron_de_busqueda("100%_x"),
+            Some("%100\\%\\_x%".to_string())
+        );
+    }
+
+    #[test]
+    fn la_lista_de_alertas_ordena_filtra_y_busca() {
+        let conn = conexion();
+        let interface_id = interfaz(&conn);
+        let portatil = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:21",
+            "192.168.1.50",
+            Some("portatil"),
+            None,
+            T0 - 10_000,
+        );
+        let nas = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:22",
+            "192.168.1.60",
+            Some("nas"),
+            None,
+            T0 - 10_000,
+        );
+        let a = alerta(
+            &conn,
+            "device_new",
+            "important",
+            "device",
+            Some(portatil),
+            "Equipo nuevo",
+            "portátil viejo",
+            T0 - 3_600,
+            T0 - 100,
+            false,
+            false,
+            true,
+            None,
+            "{}",
+        );
+        let b = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "host",
+            None,
+            "App nueva: Steam",
+            "[host]",
+            T0 - 3_000,
+            T0 - 200,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let c = alerta(
+            &conn,
+            "traffic_high",
+            "warning",
+            "device",
+            Some(nas),
+            "Más tráfico de lo habitual",
+            "nas",
+            T0 - 2_000,
+            T0 - 300,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let d = alerta(
+            &conn,
+            "catch_up",
+            "important",
+            "almenara",
+            None,
+            "Resumen al arrancar (2 alertas)",
+            "Almenara",
+            T0 - 4_000,
+            T0 - 50,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let todas = Queries::alerts(
+            &conn,
+            &AlertFilter::default(),
+            Page {
+                limit: 0,
+                offset: 0,
+            },
+        )
+        .expect("lista");
+        assert_eq!(
+            todas.iter().map(|fila| fila.id).collect::<Vec<_>>(),
+            vec![d, a, b, c]
+        );
+        assert_eq!(
+            todas[1].subject_label, "portatil",
+            "el nombre actual del equipo manda sobre el guardado"
+        );
+        assert!(matches!(todas[0].rule, AlertRule::CatchUp));
+        assert!(matches!(
+            todas[1].subject,
+            crate::alerts::Subject::Device(id) if id == portatil
+        ));
+        assert!(matches!(todas[2].subject, crate::alerts::Subject::Host));
+        assert!(todas[1].notified);
+        assert!(!todas[2].notified);
+        let importantes = Queries::alerts(
+            &conn,
+            &AlertFilter {
+                level: Some(Level::Important),
+                ..AlertFilter::default()
+            },
+            Page::default(),
+        )
+        .expect("nivel");
+        assert_eq!(importantes.len(), 2);
+        conn.execute(
+            "UPDATE ALERTS SET seen_at = ?1 WHERE id = ?2",
+            params![rfc(T0), c],
+        )
+        .expect("marcar vista");
+        let sin_ver = Queries::alerts(
+            &conn,
+            &AlertFilter {
+                unseen_only: true,
+                ..AlertFilter::default()
+            },
+            Page::default(),
+        )
+        .expect("sin ver");
+        assert_eq!(sin_ver.len(), 3);
+        let del_nas = Queries::alerts(
+            &conn,
+            &AlertFilter {
+                device_id: Some(nas),
+                ..AlertFilter::default()
+            },
+            Page::default(),
+        )
+        .expect("equipo");
+        assert_eq!(del_nas.len(), 1);
+        assert!(del_nas[0].seen);
+        // El filtro / es por nombre de equipo, no por el título de la alerta.
+        for (texto, esperado) in [("port", Some(a)), ("nas", Some(c)), ("[host]", Some(b))] {
+            let filas = Queries::alerts(
+                &conn,
+                &AlertFilter {
+                    search: Some(texto.to_string()),
+                    ..AlertFilter::default()
+                },
+                Page::default(),
+            )
+            .expect("búsqueda");
+            assert_eq!(filas.len(), 1, "búsqueda {texto}");
+            assert_eq!(
+                filas[0].id,
+                esperado.expect("id esperado"),
+                "búsqueda {texto}"
+            );
+        }
+        let sin_resultados = Queries::alerts(
+            &conn,
+            &AlertFilter {
+                search: Some("no-existe".to_string()),
+                ..AlertFilter::default()
+            },
+            Page::default(),
+        )
+        .expect("búsqueda vacía");
+        assert!(sin_resultados.is_empty());
+        let pagina = Queries::alerts(
+            &conn,
+            &AlertFilter::default(),
+            Page {
+                limit: 2,
+                offset: 1,
+            },
+        )
+        .expect("página");
+        assert_eq!(
+            pagina.iter().map(|fila| fila.id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn el_detalle_trae_el_porque_lo_agrupado_aprendizaje_y_silencios() {
+        let conn = conexion();
+        let interface_id = interfaz(&conn);
+        let nas = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:23",
+            "192.168.1.60",
+            Some("nas"),
+            None,
+            T0 - 10_000,
+        );
+        aprendizaje(&conn, "device", nas, T0 - 30 * 86_400, 8, Some(T0 - 86_400));
+        let mute = silencio(&conn, "new_app", "device", nas, None, T0 - 3_600);
+        let hijo_uno = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "device",
+            Some(nas),
+            "App nueva: Steam",
+            "nas",
+            T0 - 5_000,
+            T0 - 4_000,
+            true,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let hijo_dos = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "device",
+            Some(nas),
+            "App nueva: Discord",
+            "nas",
+            T0 - 4_500,
+            T0 - 3_500,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let resumen = alerta(
+            &conn,
+            "catch_up",
+            "important",
+            "almenara",
+            None,
+            "Resumen al arrancar (2 alertas)",
+            "Almenara",
+            T0 - 3_000,
+            T0 - 100,
+            false,
+            false,
+            true,
+            None,
+            "{\"grouped\":2}",
+        );
+        conn.execute(
+            "UPDATE ALERTS SET summary_id = ?1 WHERE id IN (?2, ?3)",
+            params![resumen, hijo_uno, hijo_dos],
+        )
+        .expect("agrupar");
+        let detalle = Queries::alert_detail(&conn, resumen).expect("detalle del resumen");
+        assert!(detalle.row.es_resumen());
+        assert_eq!(detalle.details["grouped"], 2);
+        assert_eq!(detalle.grouped.len(), 2);
+        assert_eq!(
+            detalle.grouped[0].id, hijo_dos,
+            "lo agrupado va por last_at"
+        );
+        assert!(
+            detalle.learned_at.is_none(),
+            "el resumen es de Almenara, que no aprende"
+        );
+        assert!(detalle.mutes.is_empty());
+        let normal = Queries::alert_detail(&conn, hijo_uno).expect("detalle normal");
+        assert!(normal.grouped.is_empty());
+        assert_eq!(
+            normal.learned_at,
+            Some(T0 - 86_400),
+            "el aprendizaje es del sujeto de la alerta"
+        );
+        assert_eq!(normal.mutes.len(), 1);
+        assert_eq!(normal.mutes[0].id, mute);
+        assert_eq!(normal.mutes[0].device_label.as_deref(), Some("nas"));
+        assert!(Queries::alert_detail(&conn, 99_999).is_err());
+        let despacho = ejecutar(&conn, &HistoryQuery::AlertDetail { id: resumen })
+            .expect("despacho del detalle");
+        assert!(matches!(despacho, HistoryResponse::AlertDetail(_)));
+    }
+
+    #[test]
+    fn silencios_vigentes_y_estadisticas_de_las_reglas() {
+        let conn = conexion();
+        let interface_id = interfaz(&conn);
+        let nas = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:24",
+            "192.168.1.60",
+            Some("nas"),
+            None,
+            T0 - 10_000,
+        );
+        let futuro = silencio(
+            &conn,
+            "new_app",
+            "device",
+            nas,
+            Some(T0 + 86_400),
+            T0 - 3_600,
+        );
+        let pasado = silencio(
+            &conn,
+            "traffic_high",
+            "device",
+            nas,
+            Some(T0 - 86_400),
+            T0 - 3_600,
+        );
+        let siempre = silencio(&conn, "new_ja4", "host", 0, None, T0 - 1_800);
+        let vigentes = Queries::mutes(&conn, T0).expect("silencios");
+        assert_eq!(
+            vigentes.iter().map(|mute| mute.id).collect::<Vec<_>>(),
+            vec![siempre, futuro]
+        );
+        assert!(vigentes.iter().all(|mute| mute.id != pasado));
+        let host = vigentes
+            .iter()
+            .find(|mute| mute.id == siempre)
+            .expect("silencio del host");
+        assert_eq!(host.device_label.as_deref(), Some("[host]"));
+        assert!(host.until.is_none());
+        let _ = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "device",
+            Some(nas),
+            "App nueva: Uno",
+            "nas",
+            T0 - 3 * 86_400,
+            T0 - 86_400,
+            true,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let _ = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "device",
+            Some(nas),
+            "App nueva: Dos",
+            "nas",
+            T0 - 3_600,
+            T0 - 3_600,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let _ = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "device",
+            Some(nas),
+            "App nueva: Vieja",
+            "nas",
+            T0 - 30 * 86_400,
+            T0 - 30 * 86_400,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let stats = Queries::rule_stats(&conn, T0 - 7 * 86_400).expect("reglas");
+        assert_eq!(stats.len(), 16, "las 16 reglas del catálogo");
+        let new_app = stats
+            .iter()
+            .find(|stat| stat.rule == RuleId::NewApp)
+            .expect("new_app");
+        assert_eq!(new_app.count_7d, 2, "la alerta de hace 30 días no cuenta");
+        assert_eq!(new_app.mutes, 1);
+        let ja4 = stats
+            .iter()
+            .find(|stat| stat.rule == RuleId::NewJa4)
+            .expect("new_ja4");
+        assert_eq!(ja4.count_7d, 0);
+        assert_eq!(ja4.mutes, 1);
+        let traffic = stats
+            .iter()
+            .find(|stat| stat.rule == RuleId::TrafficHigh)
+            .expect("traffic_high");
+        assert_eq!(
+            traffic.mutes, 1,
+            "el silencio caducado sigue contando hasta la purga"
+        );
+    }
+
+    #[test]
+    fn el_resumen_de_un_equipo_del_host_y_de_la_red() {
+        let conn = conexion();
+        let interface_id = interfaz(&conn);
+        let nas = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:25",
+            "192.168.1.60",
+            Some("nas"),
+            None,
+            T0 - 10_000,
+        );
+        aprendizaje(&conn, "device", nas, T0 - 30 * 86_400, 3, None);
+        aprendizaje(&conn, "host", 0, T0 - 10 * 86_400, 7, Some(T0 - 5 * 86_400));
+        silencio(&conn, "new_app", "device", nas, None, T0 - 3_600);
+        silencio(&conn, "new_ja4", "host", 0, None, T0 - 1_800);
+        let _ = alerta(
+            &conn,
+            "device_new",
+            "important",
+            "device",
+            Some(nas),
+            "Equipo nuevo",
+            "nas",
+            T0 - 5_000,
+            T0 - 4_000,
+            false,
+            false,
+            true,
+            None,
+            "{}",
+        );
+        for indice in 0..4 {
+            let _ = alerta(
+                &conn,
+                "new_app",
+                "warning",
+                "device",
+                Some(nas),
+                "App nueva",
+                "nas",
+                T0 - 9_000 - indice,
+                T0 - 3_000 - indice,
+                false,
+                false,
+                false,
+                None,
+                "{}",
+            );
+        }
+        let _ = alerta(
+            &conn,
+            "new_app",
+            "info",
+            "device",
+            Some(nas),
+            "App nueva: vista",
+            "nas",
+            T0 - 8_000,
+            T0 - 7_000,
+            true,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let _ = alerta(
+            &conn,
+            "capture_drops",
+            "warning",
+            "host",
+            None,
+            "Pérdidas de captura",
+            "[host]",
+            T0 - 2_000,
+            T0 - 2_000,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let _ = alerta(
+            &conn,
+            "traffic_high",
+            "info",
+            "network",
+            None,
+            "Más tráfico de lo habitual",
+            "Toda la red",
+            T0 - 1_500,
+            T0 - 1_500,
+            false,
+            false,
+            false,
+            None,
+            "{}",
+        );
+        let resumen =
+            Queries::alert_summary(&conn, SubjectSel::Device(nas), T0).expect("resumen del equipo");
+        assert_eq!(resumen.subject, SubjectSel::Device(nas));
+        assert_eq!(resumen.recent.len(), 5, "solo las 5 últimas");
+        assert_eq!(resumen.unseen.important, 1);
+        assert_eq!(resumen.unseen.warning, 4);
+        assert_eq!(
+            resumen.unseen.info, 0,
+            "la única info de ese equipo está vista"
+        );
+        assert_eq!(resumen.mutes.len(), 1);
+        let aprendido = resumen.learning.expect("aprendizaje del equipo");
+        assert_eq!(aprendido.subject, crate::alerts::Subject::Device(nas));
+        assert_eq!(aprendido.data_days, 3);
+        assert!(aprendido.learned_at.is_none());
+
+        let host = Queries::alert_summary(&conn, SubjectSel::Host, T0).expect("resumen del host");
+        assert_eq!(host.subject, SubjectSel::Host);
+        assert_eq!(host.recent.len(), 1);
+        assert_eq!(host.unseen.warning, 1);
+        assert_eq!(host.mutes.len(), 1);
+        let aprendido = host.learning.expect("aprendizaje del host");
+        assert_eq!(aprendido.subject, crate::alerts::Subject::Host);
+        assert_eq!(aprendido.data_days, 7);
+        assert!(aprendido.learned_at.is_some());
+
+        let red =
+            Queries::alert_summary(&conn, SubjectSel::Network, T0).expect("resumen de la red");
+        assert_eq!(red.subject, SubjectSel::Network);
+        assert_eq!(red.recent.len(), 1);
+        assert!(red.learning.is_none(), "la red entera no aprende");
+    }
+
+    #[test]
+    fn la_cobertura_resta_suspensiones_y_capturas_paradas() {
+        let conn = conexion();
+        let sesion_id = sesion(&conn, T0 - 3_600, Some(T0), true);
+        hueco(&conn, sesion_id, "suspend", T0 - 1_800, Some(T0 - 1_200));
+        hueco(&conn, sesion_id, "capture", T0 - 900, Some(T0 - 600));
+        let huecos = Queries::coverage(&conn, Range::Hours24, T0).expect("cobertura");
+        let total: i64 = huecos.iter().map(|hueco| hueco.dur()).sum();
+        assert_eq!(
+            total,
+            23 * 3_600 + 900,
+            "de la hora de sesión quedan 45 min cubiertos"
+        );
+        let despacho = ejecutar(
+            &conn,
+            &HistoryQuery::Coverage {
+                range: Range::Hours24,
+                now: T0,
+            },
+        )
+        .expect("despacho de la cobertura");
+        assert!(matches!(despacho, HistoryResponse::Coverage(_)));
+    }
+
+    #[test]
+    fn la_presencia_marca_la_suspension_como_sin_datos() {
+        let conn = conexion();
+        let interface_id = interfaz(&conn);
+        let nas = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:26",
+            "192.168.1.60",
+            Some("nas"),
+            None,
+            T0 - 3_600,
+        );
+        evento(&conn, nas, "new", "{}", T0 - 3_600);
+        let sesion_id = sesion(&conn, T0 - 3_600, Some(T0), false);
+        hueco(&conn, sesion_id, "suspend", T0 - 1_800, Some(T0 - 1_200));
+        hueco(&conn, sesion_id, "capture", T0 - 900, Some(T0 - 600));
+        let tramos = Queries::presence(&conn, nas, Range::Hours24, T0).expect("presencia");
+        let estado = |at: i64| {
+            tramos
+                .iter()
+                .find(|tramo| tramo.start <= at && at < tramo.end)
+                .map(|tramo| tramo.state)
+        };
+        assert_eq!(estado(T0 - 2_000), Some(PresenceState::Present));
+        assert_eq!(
+            estado(T0 - 1_500),
+            Some(PresenceState::NoData),
+            "la suspensión es sin datos"
+        );
+        assert_eq!(estado(T0 - 1_000), Some(PresenceState::Present));
+        assert_eq!(
+            estado(T0 - 750),
+            Some(PresenceState::Present),
+            "la captura parada no quita presencia"
+        );
+    }
+
+    #[test]
+    fn la_linea_de_tiempo_muestra_suspensiones_y_capturas_paradas() {
+        let conn = conexion();
+        let sesion_id = sesion(&conn, T0 - 3_600, Some(T0), true);
+        hueco(&conn, sesion_id, "suspend", T0 - 1_800, Some(T0 - 1_200));
+        hueco(&conn, sesion_id, "capture", T0 - 900, Some(T0 - 600));
+        let items = Queries::timeline(
+            &conn,
+            EventFilter::Almanara,
+            Range::Hours24,
+            Page::default(),
+            T0,
+        )
+        .expect("línea de tiempo");
+        let suspendido = format!(
+            "Equipo suspendido {}–{}",
+            localtime::format_hora_local(T0 - 1_800),
+            localtime::format_hora_local(T0 - 1_200)
+        );
+        let parada = format!(
+            "Captura parada {}–{}",
+            localtime::format_hora_local(T0 - 900),
+            localtime::format_hora_local(T0 - 600)
+        );
+        assert!(
+            items.iter().any(|item| item.summary == suspendido),
+            "falta la suspensión en la línea de tiempo: {items:?}"
+        );
+        assert!(items.iter().any(|item| item.summary == parada));
+        let solo_presencia = Queries::timeline(
+            &conn,
+            EventFilter::Presence,
+            Range::Hours24,
+            Page::default(),
+            T0,
+        )
+        .expect("filtro de presencia");
+        assert!(solo_presencia
+            .iter()
+            .all(|item| item.event_type != "suspend" && item.event_type != "capture"));
+    }
+
+    #[test]
+    fn inventario_del_propio_equipo_y_puertos_cerrados() {
+        let conn = conexion();
+        let interface_id = interfaz(&conn);
+        let nas = equipo(
+            &conn,
+            interface_id,
+            "aa:bb:cc:dd:ee:27",
+            "192.168.1.60",
+            Some("nas"),
+            None,
+            T0 - 10_000,
+        );
+        conn.execute(
+            "INSERT INTO HOST_SEEN (kind, key, first_seen, last_seen)
+             VALUES ('app', 'steam', ?1, ?2)",
+            params![rfc(T0 - 7_200), rfc(T0 - 3_600)],
+        )
+        .expect("inventario del host");
+        let host = Queries::inventory(&conn, 0).expect("inventario del propio equipo");
+        assert_eq!(host.device_id, 0);
+        assert_eq!(host.apps.len(), 1);
+        assert_eq!(host.apps[0].key, "steam");
+        assert!(host.ports.is_empty(), "el propio equipo no tiene puertos");
+        let inicio_esperado = rfc(T0 - 7_200);
+        assert_eq!(host.since.as_deref(), Some(inicio_esperado.as_str()));
+
+        conn.execute(
+            "INSERT INTO DEVICE_SEEN (device_id, kind, key, first_seen, last_seen)
+             VALUES (?1, 'app', 'youtube', ?2, ?3)",
+            params![nas, rfc(T0 - 7_200), rfc(T0 - 3_600)],
+        )
+        .expect("inventario del equipo");
+        conn.execute(
+            "INSERT INTO DEVICE_SERVICES
+                 (device_id, port, protocol, service, first_seen, last_seen, closed_at)
+             VALUES (?1, 22, 'tcp', 'ssh', ?2, ?2, NULL)",
+            params![nas, rfc(T0 - 30 * 86_400)],
+        )
+        .expect("puerto abierto");
+        let cierre = rfc(T0 - 86_400);
+        conn.execute(
+            "INSERT INTO DEVICE_SERVICES
+                 (device_id, port, protocol, service, first_seen, last_seen, closed_at)
+             VALUES (?1, 139, 'tcp', 'netbios', ?2, ?3, ?4)",
+            params![nas, rfc(T0 - 40 * 86_400), cierre, cierre],
+        )
+        .expect("puerto cerrado");
+        let inventario = Queries::inventory(&conn, nas).expect("inventario del equipo");
+        assert_eq!(inventario.apps.len(), 1);
+        assert_eq!(inventario.ports.len(), 2);
+        let abierto = inventario
+            .ports
+            .iter()
+            .find(|puerto| puerto.port == 22)
+            .expect("puerto 22");
+        assert!(abierto.closed_at.is_none());
+        let cerrado = inventario
+            .ports
+            .iter()
+            .find(|puerto| puerto.port == 139)
+            .expect("puerto 139");
+        assert_eq!(cerrado.closed_at.as_deref(), Some(cierre.as_str()));
+        let despacho = ejecutar(&conn, &HistoryQuery::Inventory { device_id: nas })
+            .expect("despacho del inventario");
+        assert!(matches!(despacho, HistoryResponse::Inventory(_)));
     }
 }

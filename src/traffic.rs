@@ -162,6 +162,8 @@ pub struct CaptureStatus {
     pub total: u64,
     /// Paquetes descartados.
     pub drops: u64,
+    /// Paquetes descartados por el límite `max_pps` (F6: regla de pérdidas).
+    pub limit_drops: u64,
     /// Paquetes con cabecera inválida.
     pub parse_errors: u64,
     /// Límite configurado (0 = sin límite).
@@ -187,6 +189,7 @@ impl Default for CaptureStatus {
             pps: 0,
             total: 0,
             drops: 0,
+            limit_drops: 0,
             parse_errors: 0,
             max_pps: 0,
             available: false,
@@ -872,6 +875,7 @@ async fn ejecutar(
     let mut drops_limite_previos = 0u64;
     let mut stats_previas = CaptureStats::default();
     let mut aviso_drops_hecho = false;
+    let mut ultimo_log_stats: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -914,11 +918,28 @@ async fn ejecutar(
                 estado.pps = stats.pps;
                 estado.total = stats.total;
                 estado.drops = stats.drops;
+                estado.limit_drops = captura.as_ref().map(Capture::limit_drops).unwrap_or(0);
                 estado.parse_errors = stats.parse_errors;
                 estado.inference = stats.inference;
                 estado.inference_enabled = config.inference.enabled;
                 estado.names_cached = resolver.names().len();
                 stats_previas = stats;
+
+                // Fase 6: muestra de diagnóstico para medir pps, pérdidas y CPU
+                // de la captura con tráfico real (una vez cada 30 s, nivel debug).
+                let toca_log = ultimo_log_stats
+                    .map(|ultimo| ahora.duration_since(ultimo) >= Duration::from_secs(30))
+                    .unwrap_or(true);
+                if toca_log && estado.active {
+                    ultimo_log_stats = Some(ahora);
+                    tracing::debug!(
+                        pps = estado.pps,
+                        total = estado.total,
+                        drops = estado.drops,
+                        limit_drops = estado.limit_drops,
+                        "estadísticas de captura"
+                    );
+                }
 
                 if let Some(activa) = captura.as_ref() {
                     let limite = activa.limit_drops();
@@ -1114,6 +1135,31 @@ async fn ejecutar(
                         if let Some(lote) = rankings.flush_rollup(std::time::SystemTime::now()) {
                             let _ = event_tx.send(AppEvent::Rollup(Box::new(lote)));
                         }
+                        // F5/F6: acumulado de la sesión por sujeto (evidencia de la
+                        // prueba con tráfico real: minutos vs acumulado de F4).
+                        let sesion = rankings.top(
+                            Dimension::Device,
+                            Window::Session,
+                            SortKey::Total,
+                            1000,
+                        );
+                        let (mut down, mut up) = (0u64, 0u64);
+                        let (mut host_down, mut host_up) = (0u64, 0u64);
+                        for fila in &sesion {
+                            down = down.saturating_add(fila.bytes_down);
+                            up = up.saturating_add(fila.bytes_up);
+                            if fila.device_id == Some(crate::traffic::DEVICE_ID_HOST) {
+                                host_down = host_down.saturating_add(fila.bytes_down);
+                                host_up = host_up.saturating_add(fila.bytes_up);
+                            }
+                        }
+                        tracing::debug!(
+                            bytes_down = down,
+                            bytes_up = up,
+                            host_bytes_down = host_down,
+                            host_bytes_up = host_up,
+                            "acumulado de la sesión de tráfico (F4)"
+                        );
                         let _ = event_tx.send(AppEvent::TrafficStopped);
                         break;
                     }

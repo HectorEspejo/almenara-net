@@ -4,7 +4,7 @@
 //! persistencia se devuelven como [Action] y el bucle de la TUI las ejecuta.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -26,6 +26,9 @@ use crate::tui::traffic_state::{
     dimension_de_grupo, ConnectionFilter, ConnectionSort, DetailState, FocusPanel, HeadersView,
     TrafficState,
 };
+
+/// Tiempo que se muestra el aviso de una línea de una alerta importante.
+pub const ALERT_NOTICE_TTL: Duration = Duration::from_secs(10);
 
 /// Ancho mínimo de terminal soportado.
 pub const MIN_WIDTH: u16 = 80;
@@ -111,11 +114,6 @@ impl Tab {
     /// Pestaña anterior (con vuelta).
     pub fn prev(self) -> Tab {
         Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
-    }
-
-    /// Pestañas que todavía son placeholder (Alertas llega en F6).
-    pub fn is_placeholder(self) -> bool {
-        matches!(self, Tab::Alertas)
     }
 }
 
@@ -310,6 +308,35 @@ pub enum Action {
         /// Ventana consultada.
         window: Window,
     },
+    /// Marcar como vistas una alerta (y lo que agrupa, si es un resumen).
+    MarkAlertSeen(crate::repo::SeenSel),
+    /// Marcar como vistas todas las alertas del filtro de la pestaña Alertas.
+    MarkAlertsSeen(crate::repo::AlertScope),
+    /// Silenciar una regla para el sujeto y el equipo de una alerta.
+    MuteAlert {
+        /// Regla silenciada.
+        rule: crate::alerts::RuleId,
+        /// Sujeto.
+        subject: crate::alerts::Subject,
+        /// Fin del silencio (None = siempre).
+        until: Option<std::time::SystemTime>,
+    },
+    /// Quitar un silencio.
+    DeleteMute(i64),
+    /// Guardar si una regla está activa y su nivel desde la vista Reglas.
+    SaveRuleSetting {
+        /// Regla.
+        rule: crate::alerts::RuleId,
+        /// Ajuste nuevo.
+        setting: crate::alerts::RuleSetting,
+    },
+    /// Marcar o desmarcar un equipo como vigilado (tecla p).
+    SetWatched {
+        /// Equipo.
+        device_id: i64,
+        /// Vigilado.
+        watched: bool,
+    },
 }
 
 /// Estado completo de la aplicación.
@@ -427,6 +454,42 @@ pub struct App {
     pub db_size_warned: bool,
     /// Ya se ha avisado del descarte de lotes del histórico.
     pub rollup_dropped_warned: bool,
+    /// Estado de la pestaña Alertas (F6).
+    pub alerts: crate::tui::alerts_state::AlertsState,
+    /// Motor de alertas (None en pruebas: lo crea el bucle con el snapshot de la BD).
+    pub alert_engine: Option<crate::alerts::AlertEngine>,
+    /// Notificador de escritorio (None en pruebas).
+    pub alert_notifier: Option<crate::notify::NotifierHandle>,
+    /// Acciones del motor que no se pudieron escribir y se reintentan por minuto.
+    pub pending_alert_actions: Vec<crate::alerts::AlertAction>,
+    /// Ya se avisó de que no se podían escribir las alertas (§7.5).
+    pub alert_write_warned: bool,
+    /// Detector de suspensión por CLOCK_BOOTTIME frente a CLOCK_MONOTONIC (§7.10).
+    pub suspend: crate::alerts::Suspend,
+    /// Hueco `capture` abierto de la sesión, si lo hay.
+    pub capture_gap: Option<i64>,
+    /// La captura estaba activa en el tick anterior (para abrir el hueco).
+    pub capture_was_active: bool,
+    /// Última muestra de salud de la captura y de la BD (cada minuto).
+    pub last_health: Option<Instant>,
+    /// Paquetes capturados en la muestra de salud anterior.
+    pub health_prev_total: u64,
+    /// Paquetes perdidos por el anillo en la muestra de salud anterior.
+    pub health_prev_drops: u64,
+    /// Paquetes descartados por `max_pps` en la muestra de salud anterior.
+    pub health_prev_limit_drops: u64,
+    /// Ya se avisó de que no se pudo guardar una regla en config.toml (§7.14).
+    pub alert_rule_save_warned: bool,
+    /// Último reintento de las acciones del motor que no se pudieron escribir.
+    pub last_alert_retry: Option<Instant>,
+    /// La pestaña Alertas estaba visible en el tick anterior (refresco al entrar).
+    pub alert_tab_active: bool,
+    /// Última actualización de los contadores de alertas no vistas.
+    pub last_alert_counts: Option<Instant>,
+    /// Último tick de las tareas de alertas (suspensión, huecos, motor): 1 s.
+    pub last_alert_tick: Option<Instant>,
+    /// Aviso de una línea de una alerta importante (texto y momento), 10 s (§6).
+    pub alert_notice: Option<(String, Instant)>,
 }
 
 impl App {
@@ -498,6 +561,24 @@ impl App {
             last_consolidation: None,
             db_size_warned: false,
             rollup_dropped_warned: false,
+            alerts: crate::tui::alerts_state::AlertsState::new(),
+            alert_engine: None,
+            alert_notifier: None,
+            pending_alert_actions: Vec::new(),
+            alert_write_warned: false,
+            suspend: crate::alerts::Suspend::new(),
+            capture_gap: None,
+            capture_was_active: false,
+            last_health: None,
+            health_prev_total: 0,
+            health_prev_drops: 0,
+            health_prev_limit_drops: 0,
+            alert_rule_save_warned: false,
+            last_alert_retry: None,
+            alert_tab_active: false,
+            last_alert_counts: None,
+            last_alert_tick: None,
+            alert_notice: None,
         }
     }
 
@@ -530,9 +611,19 @@ impl App {
         self.notifier.push(notification.level, notification.message);
     }
 
-    /// Avanza el reloj de las notificaciones.
+    /// Avanza el reloj de las notificaciones y del aviso de alerta importante.
     pub fn tick(&mut self) {
         self.notifier.tick();
+        if let Some((_, mostrado)) = &self.alert_notice {
+            if mostrado.elapsed() >= ALERT_NOTICE_TTL {
+                self.alert_notice = None;
+            }
+        }
+    }
+
+    /// Muestra durante 10 s el aviso de una línea de una alerta importante (§6).
+    pub fn push_alert_notice(&mut self, message: impl Into<String>) {
+        self.alert_notice = Some((message.into(), Instant::now()));
     }
 
     /// Indica si la aplicación está en modo degradado.
@@ -949,6 +1040,12 @@ impl App {
                 return accion;
             }
         }
+        // Pestaña Alertas (F6): Tab, Enter, espacio, T, f, u, /, m, e, n, x, 1-3.
+        if self.tab == Tab::Alertas {
+            if let Some(accion) = self.alerts.handle_key(key) {
+                return accion;
+            }
+        }
         if self.input.is_some() {
             return self.handle_input_key(key);
         }
@@ -1124,6 +1221,14 @@ impl App {
                 Action::None
             }
             KeyCode::Char('t') => self.cycle_device_type_manual(),
+            // F6: `p` marca o desmarca el equipo seleccionado como vigilado (§7.7).
+            KeyCode::Char('p') if self.tab == Tab::Equipos => match self.selected_device() {
+                Some(device) => Action::SetWatched {
+                    device_id: device.id,
+                    watched: !device.watched,
+                },
+                None => Action::None,
+            },
             KeyCode::Char('r') => Action::Rescan,
             KeyCode::Char('a') => {
                 self.begin_device_input(InputMode::Alias);
@@ -1252,6 +1357,19 @@ impl App {
                 self.history.history_refresh();
                 Action::None
             }
+            // F6: vigilar el equipo desde su detalle (§7.7).
+            KeyCode::Char('p') => match self.detail.as_ref().map(|detalle| detalle.device_id) {
+                Some(device_id) => Action::SetWatched {
+                    device_id,
+                    watched: !self
+                        .devices
+                        .iter()
+                        .find(|device| device.id == device_id)
+                        .map(|device| device.watched)
+                        .unwrap_or(false),
+                },
+                None => Action::None,
+            },
             // Desplazamiento del panel derecho cuando no cabe (F4).
             KeyCode::Down | KeyCode::Char('j') => {
                 self.scroll_detail(1);
@@ -1490,6 +1608,7 @@ mod tests {
             dhcp_hostname: None,
             user_agent: None,
             os_source: None,
+            watched: false,
         }
     }
 
@@ -1543,17 +1662,6 @@ mod tests {
         assert_eq!(Tab::from_number(1), Some(Tab::Equipos));
         assert_eq!(Tab::from_number(7), Some(Tab::Ayuda));
         assert_eq!(Tab::from_number(8), None);
-        assert!(!Tab::Trafico.is_placeholder(), "Tráfico está activa en F3");
-        assert!(
-            !Tab::Conexiones.is_placeholder(),
-            "Conexiones está activa en F3"
-        );
-        assert!(
-            !Tab::Historico.is_placeholder(),
-            "Histórico está activa en F5"
-        );
-        assert!(Tab::Alertas.is_placeholder(), "Alertas llega en F6");
-        assert!(!Tab::Config.is_placeholder());
         assert_eq!(Tab::ALL.len(), 7);
     }
 
@@ -2068,5 +2176,23 @@ mod tests {
         assert!(fuentes.contains(&"ARP"));
         assert!(fuentes.contains(&"ICMP"));
         assert!(fuentes.contains(&"puertos"));
+    }
+
+    #[test]
+    fn el_aviso_de_alerta_importante_dura_diez_segundos() {
+        let mut app = app_con(Vec::new());
+        app.push_alert_notice("▲ Alerta importante: Equipo nuevo · [5] para verla");
+        assert!(app.alert_notice.is_some());
+        app.tick();
+        assert!(
+            app.alert_notice.is_some(),
+            "el aviso debe seguir visible antes de 10 s"
+        );
+        app.alert_notice = Some((
+            "viejo".to_string(),
+            Instant::now() - ALERT_NOTICE_TTL - Duration::from_secs(1),
+        ));
+        app.tick();
+        assert!(app.alert_notice.is_none(), "el aviso caduca a los 10 s");
     }
 }

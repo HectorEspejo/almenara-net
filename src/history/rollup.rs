@@ -50,7 +50,8 @@ pub struct MinuteRollup {
     /// Número total de entradas de los acumuladores (tope de memoria).
     entradas: usize,
     flujos: HashMap<u64, FlujoNuevo>,
-    ja4: HashSet<(i64, String)>,
+    /// Huellas JA4 vistas del minuto, por sujeto (equipo o propio equipo).
+    ja4: HashSet<(Subject, String)>,
     overflow: u64,
 }
 
@@ -166,9 +167,11 @@ impl MinuteRollup {
                 self.sumar(subject, dimension, clave.as_ref(), bytes, dir);
             }
         }
-        if let Subject::Device(device_id) = subject {
+        // El inventario JA4 es el de los flujos en los que el sujeto es cliente:
+        // sirve tanto para un equipo como para el propio equipo (§7.11).
+        if matches!(subject, Subject::Device(_) | Subject::Host) {
             if let Some(ja4) = dims.ja4.as_ref().filter(|huella| !huella.is_empty()) {
-                self.ja4.insert((device_id, ja4.clone()));
+                self.ja4.insert((subject, ja4.clone()));
             }
         }
     }
@@ -234,12 +237,13 @@ impl MinuteRollup {
         }
 
         // Inventario antes de los topes: todas las claves normales vistas de las
-        // dimensiones de inventario para sujetos equipo.
+        // dimensiones de inventario, para los equipos y para el propio equipo
+        // (§7.11: HOST_SEEN guarda lo mismo bajo el sujeto host).
         let mut seen = Vec::new();
         for ((subject, dimension), claves) in self.acc.iter() {
-            let Subject::Device(device_id) = subject else {
+            if !matches!(subject, Subject::Device(_) | Subject::Host) {
                 continue;
-            };
+            }
             let Some(kind) = SeenKind::from_dimension(*dimension) else {
                 continue;
             };
@@ -250,22 +254,22 @@ impl MinuteRollup {
                     continue;
                 }
                 seen.push(SeenItem {
-                    device_id: *device_id,
+                    subject: *subject,
                     kind,
                     key: clave.clone(),
                 });
             }
         }
         seen.sort_by(|a, b| {
-            a.device_id
-                .cmp(&b.device_id)
+            a.subject
+                .cmp(&b.subject)
                 .then_with(|| a.kind.cmp(&b.kind))
                 .then_with(|| a.key.cmp(&b.key))
         });
-        seen.dedup_by(|a, b| a.device_id == b.device_id && a.kind == b.kind && a.key == b.key);
-        for (device_id, huella) in self.ja4.iter() {
+        seen.dedup_by(|a, b| a.subject == b.subject && a.kind == b.kind && a.key == b.key);
+        for (subject, huella) in self.ja4.iter() {
             seen.push(SeenItem {
-                device_id: *device_id,
+                subject: *subject,
                 kind: SeenKind::Ja4,
                 key: huella.clone(),
             });
@@ -783,6 +787,48 @@ mod tests {
         rollup.add(&subjects, &dims, 10, Dir::Down);
         let batch = rollup.flush(1_800_000_000);
         assert!(!batch.seen.iter().any(|item| item.kind == SeenKind::Ja4));
+    }
+
+    #[test]
+    fn el_lote_trae_el_inventario_del_propio_equipo() {
+        let mut rollup = MinuteRollup::new(true);
+        let mut label = etiqueta(Some("youtube"), "youtube.com", DestinationKind::Domain);
+        label.destination.org = Some("Google LLC".to_string());
+        label.destination.country = Some("US".to_string());
+        label.ja4 = Some("t13d1516h2".to_string());
+        let ctx = contexto(Some(DEVICE_ID_HOST));
+        let (subjects, dims) = sujetos_y_dims(&label, &ctx);
+        rollup.add(&subjects, &dims, 100, Dir::Down);
+        let batch = rollup.flush(1_800_000_000);
+        // Apps, categorías, organizaciones y países del minuto van al inventario
+        // del propio equipo, igual que en un equipo de DEVICES.
+        for kind in [
+            SeenKind::App,
+            SeenKind::Category,
+            SeenKind::Org,
+            SeenKind::Country,
+        ] {
+            assert!(
+                batch
+                    .seen
+                    .iter()
+                    .any(|item| item.subject == Subject::Host && item.kind == kind),
+                "falta la entrada {kind:?} del host"
+            );
+        }
+        assert!(batch.seen.iter().any(|item| item.subject == Subject::Host
+            && item.kind == SeenKind::Ja4
+            && item.key == "t13d1516h2"));
+        // Ni la red entera ni los sujetos sin atribuir tienen inventario.
+        assert!(!batch
+            .seen
+            .iter()
+            .any(|item| matches!(item.subject, Subject::Network | Subject::Other)));
+        // Las claves especiales no entran tampoco para el host.
+        assert!(!batch
+            .seen
+            .iter()
+            .any(|item| item.key.starts_with('~') && item.subject == Subject::Host));
     }
 
     #[test]

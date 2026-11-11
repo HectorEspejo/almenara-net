@@ -30,6 +30,7 @@ pub mod synthetic;
 
 pub use localtime::LocalDay;
 
+use crate::alerts::{AlertCounts, AlertRule, LearningState, Level, RuleId};
 use crate::rankings::Dir;
 
 /// Sujeto de un cubo del histórico (§7.1).
@@ -242,15 +243,52 @@ impl SeenKind {
     }
 }
 
-/// Entrada del inventario por equipo que viaja en el lote del minuto.
+/// Entrada del inventario que viaja en el lote del minuto (§7.11).
+///
+/// El sujeto es el equipo al que se atribuye la clave (`Device(id)`) o el propio
+/// equipo (`Host`); `Other` y `Network` nunca entran en el inventario. Las claves
+/// especiales (`~…`) y los destinos tampoco.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeenItem {
-    /// Equipo al que se le ha visto la clave.
-    pub device_id: i64,
+    /// Sujeto al que se le ha visto la clave (equipo o propio equipo).
+    pub subject: Subject,
     /// Tipo de clave.
     pub kind: SeenKind,
     /// Clave vista (app, categoría, organización, país o JA4).
     pub key: String,
+}
+
+impl SeenItem {
+    /// Entrada del inventario de un equipo de DEVICES.
+    pub fn de_equipo(device_id: i64, kind: SeenKind, key: impl Into<String>) -> Self {
+        Self {
+            subject: Subject::Device(device_id),
+            kind,
+            key: key.into(),
+        }
+    }
+
+    /// Entrada del inventario del propio equipo (HOST_SEEN).
+    pub fn del_host(kind: SeenKind, key: impl Into<String>) -> Self {
+        Self {
+            subject: Subject::Host,
+            kind,
+            key: key.into(),
+        }
+    }
+
+    /// Identificador del equipo, si la entrada es de un equipo de DEVICES.
+    pub fn device_id(&self) -> Option<i64> {
+        match self.subject {
+            Subject::Device(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Indica si la entrada es del propio equipo.
+    pub fn es_host(&self) -> bool {
+        self.subject.is_host()
+    }
 }
 
 /// Dimensiones resueltas de un flujo para el agregador del histórico.
@@ -794,7 +832,7 @@ pub struct SeenRow {
     pub last_seen: String,
 }
 
-/// Puerto abierto del inventario, leído de DEVICE_SERVICES.
+/// Puerto del inventario, leído de DEVICE_SERVICES (§7.12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryPort {
     /// Puerto.
@@ -805,12 +843,17 @@ pub struct InventoryPort {
     pub service: Option<String>,
     /// Primera detección (RFC 3339 UTC).
     pub first_seen: String,
+    /// Cuándo un escaneo lo vio cerrado (RFC 3339 UTC); None = abierto.
+    pub closed_at: Option<String>,
 }
 
-/// Inventario de un equipo.
+/// Inventario de un equipo o del propio equipo (§7.9 y §7.11).
+///
+/// Para el propio equipo, `device_id` es 0 (centinela de HOST_SEEN; los
+/// identificadores de DEVICES empiezan en 1) y no hay puertos.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inventory {
-    /// Equipo consultado.
+    /// Equipo consultado (0 = el propio equipo).
     pub device_id: i64,
     /// Fecha de inicio del inventario (primer first_seen del equipo).
     pub since: Option<String>,
@@ -849,6 +892,132 @@ impl Inventory {
             && self.ja4.is_empty()
             && self.ports.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Alertas (F6)
+// ---------------------------------------------------------------------------
+
+/// Filtro de la lista de la pestaña Alertas (§6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlertFilter {
+    /// Nivel exacto pedido con `f`; None = todos.
+    pub level: Option<Level>,
+    /// Solo las que no se han visto (`u`).
+    pub unseen_only: bool,
+    /// Solo las de un equipo concreto (detalle de equipo o `/`).
+    pub device_id: Option<i64>,
+    /// Texto libre del filtro `/` sobre el nombre del equipo.
+    pub search: Option<String>,
+}
+
+/// Fila de la lista de alertas (§6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertRow {
+    /// ALERTS.id.
+    pub id: i64,
+    /// Regla que la creó, o el resumen de la puesta al día (`catch_up`).
+    pub rule: AlertRule,
+    /// Nivel efectivo.
+    pub level: Level,
+    /// Sujeto (equipo, propio equipo, red o Almenara).
+    pub subject: crate::alerts::Subject,
+    /// DEVICES.id si el sujeto es un equipo; NULL si el equipo se borró.
+    pub device_id: Option<i64>,
+    /// Texto corto ya compuesto y saneado.
+    pub title: String,
+    /// Etiqueta visible: nombre actual del equipo o la guardada al crearla.
+    pub subject_label: String,
+    /// Creación, en segundos Unix UTC.
+    pub created_at: i64,
+    /// Última repetición, en segundos Unix UTC (ordena la lista).
+    pub last_at: i64,
+    /// Veces que ha saltado dentro del plazo de deduplicación.
+    pub count: i64,
+    /// Ya vista (`seen_at` no NULL).
+    pub seen: bool,
+    /// Condición resuelta (`resolved_at` no NULL).
+    pub resolved: bool,
+    /// Se notificó en el escritorio.
+    pub notified: bool,
+    /// Resumen de la puesta al día que la agrupa, si lo hay.
+    pub summary_id: Option<i64>,
+}
+
+impl AlertRow {
+    /// Indica si la fila es el resumen de la puesta al día.
+    pub fn es_resumen(&self) -> bool {
+        matches!(self.rule, AlertRule::CatchUp)
+    }
+
+    /// Indica si la alerta sigue sin ver.
+    pub fn es_nueva(&self) -> bool {
+        !self.seen
+    }
+}
+
+/// Silencio de una regla para un sujeto (§7.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuteRow {
+    /// ALERT_MUTES.id.
+    pub id: i64,
+    /// Regla silenciada.
+    pub rule: RuleId,
+    /// Sujeto del silencio.
+    pub subject: crate::alerts::Subject,
+    /// DEVICES.id si el sujeto es un equipo; 0 en otro caso.
+    pub device_id: i64,
+    /// Etiqueta del sujeto (`[host]`, el nombre del equipo…).
+    pub device_label: Option<String>,
+    /// Fin del silencio (None = siempre), en segundos Unix UTC.
+    pub until: Option<i64>,
+    /// Creación, en segundos Unix UTC.
+    pub created_at: i64,
+}
+
+/// Contadores de una regla para la vista Reglas (§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleStat {
+    /// Regla del catálogo.
+    pub rule: RuleId,
+    /// Alertas de la regla en los últimos 7 días.
+    pub count_7d: u32,
+    /// Silencios de la regla.
+    pub mutes: u32,
+}
+
+/// Resumen de un sujeto para el detalle de equipo y la pestaña Config (§6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertSummary {
+    /// Sujeto del resumen (la TUI distingue Host de Device con este campo).
+    pub subject: SubjectSel,
+    /// Últimas alertas del sujeto (5 como mucho).
+    pub recent: Vec<AlertRow>,
+    /// Alertas sin ver del sujeto por nivel.
+    pub unseen: AlertCounts,
+    /// Silencios vigentes del sujeto.
+    pub mutes: Vec<MuteRow>,
+    /// Aprendizaje del sujeto, si tiene fila (None en la red entera).
+    pub learning: Option<LearningState>,
+    /// Inventario del propio equipo (solo con `SubjectSel::Host`; la pestaña
+    /// Config lo pinta en el bloque «Propio equipo»). None en los equipos: su
+    /// detalle ya pide `Queries::inventory` aparte.
+    pub inventory: Option<Inventory>,
+}
+
+/// Detalle de una alerta (§6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertDetail {
+    /// La fila de la lista.
+    pub row: AlertRow,
+    /// El porqué guardado en `details` (JSON).
+    pub details: serde_json::Value,
+    /// Alertas que agrupa, si es el resumen de la puesta al día.
+    pub grouped: Vec<AlertRow>,
+    /// Fin del aprendizaje del sujeto (segundos Unix UTC), si ya aprendió.
+    pub learned_at: Option<i64>,
+    /// Silencios del sujeto.
+    pub mutes: Vec<MuteRow>,
 }
 
 /// Fila de un ranking de 1 h o 24 h (§7.5).
@@ -1086,6 +1255,38 @@ pub enum HistoryQuery {
         /// Inicio del minuto en curso (segundos Unix UTC).
         now_minute: i64,
     },
+    /// Lista de la pestaña Alertas (F6).
+    Alerts {
+        /// Filtro de la lista.
+        filter: AlertFilter,
+        /// Paginación.
+        page: Page,
+        /// Instante actual en segundos Unix UTC (reservado: la lista ordena por
+        /// `last_at` y no filtra por tiempo).
+        now: i64,
+    },
+    /// Detalle de una alerta (F6).
+    AlertDetail {
+        /// ALERTS.id.
+        id: i64,
+    },
+    /// Silencios vigentes de la vista Silencios (F6).
+    Mutes {
+        /// Instante actual en segundos Unix UTC (para descartar caducados).
+        now: i64,
+    },
+    /// Alertas y silencios por regla de la vista Reglas (F6).
+    RuleStats {
+        /// Inicio de la ventana de 7 días, en segundos Unix UTC.
+        since: i64,
+    },
+    /// Resumen de alertas, silencios y aprendizaje de un sujeto (F6).
+    AlertSummary {
+        /// Sujeto consultado (equipo, propio equipo o red).
+        subject: SubjectSel,
+        /// Instante actual en segundos Unix UTC.
+        now: i64,
+    },
 }
 
 /// Respuesta del lector del histórico.
@@ -1111,6 +1312,16 @@ pub enum HistoryResponse {
     WindowRanking(RankingResult),
     /// «¿Quién lo usa?» en una ventana del histórico.
     WhoUses(Vec<crate::rankings::DeviceShare>),
+    /// Lista de alertas.
+    Alerts(Vec<AlertRow>),
+    /// Detalle de una alerta.
+    AlertDetail(Box<AlertDetail>),
+    /// Silencios vigentes.
+    Mutes(Vec<MuteRow>),
+    /// Alertas y silencios por regla.
+    RuleStats(Vec<RuleStat>),
+    /// Resumen de un sujeto.
+    AlertSummary(Box<AlertSummary>),
 }
 
 impl HistoryResponse {
@@ -1127,6 +1338,11 @@ impl HistoryResponse {
             Self::DbStats(_) => HistoryView::DbStats,
             Self::WindowRanking(_) => HistoryView::WindowRanking,
             Self::WhoUses(_) => HistoryView::WhoUses,
+            Self::Alerts(_) => HistoryView::Alerts,
+            Self::AlertDetail(_) => HistoryView::AlertDetail,
+            Self::Mutes(_) => HistoryView::Mutes,
+            Self::RuleStats(_) => HistoryView::RuleStats,
+            Self::AlertSummary(_) => HistoryView::AlertSummary,
         }
     }
 }
@@ -1154,6 +1370,16 @@ pub enum HistoryView {
     WindowRanking,
     /// Tráfico: «¿Quién lo usa?».
     WhoUses,
+    /// Alertas: lista.
+    Alerts,
+    /// Alertas: detalle.
+    AlertDetail,
+    /// Alertas: vista Silencios.
+    Mutes,
+    /// Alertas: vista Reglas.
+    RuleStats,
+    /// Detalle de equipo o Config: resumen de alertas.
+    AlertSummary,
 }
 
 /// Estadísticas de los lotes del agregador para diagnóstico e informe.
@@ -1165,6 +1391,84 @@ pub struct RollupCounters {
     pub drops: u64,
     /// Lotes escritos con éxito.
     pub batches: u64,
+}
+
+/// Crea el esquema mínimo de la migración v6 para las pruebas de `history`.
+///
+/// Mientras el equipo de datos termina la migración v6, las consultas del lector
+/// se prueban contra este esquema, idéntico al §3 del informe. Con la migración
+/// ya aplicada las sentencias `IF NOT EXISTS` no hacen nada.
+#[cfg(test)]
+pub(crate) fn esquema_v6_de_pruebas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ALERTS (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule          TEXT NOT NULL,
+             level         TEXT NOT NULL,
+             subject       TEXT NOT NULL,
+             device_id     INTEGER NULL REFERENCES DEVICES(id) ON DELETE SET NULL,
+             key           TEXT NOT NULL DEFAULT '',
+             title         TEXT NOT NULL,
+             subject_label TEXT NOT NULL,
+             details       TEXT NOT NULL DEFAULT '{}',
+             event_id      INTEGER NULL,
+             summary_id    INTEGER NULL,
+             created_at    TIMESTAMP NOT NULL,
+             last_at       TIMESTAMP NOT NULL,
+             count         INTEGER NOT NULL DEFAULT 1,
+             seen_at       TIMESTAMP NULL,
+             resolved_at   TIMESTAMP NULL,
+             notified      BOOLEAN NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS IDX_ALERTS_LAST_AT ON ALERTS(last_at);
+         CREATE INDEX IF NOT EXISTS IDX_ALERTS_DEVICE ON ALERTS(device_id, last_at);
+         CREATE INDEX IF NOT EXISTS IDX_ALERTS_UNSEEN ON ALERTS(level)
+             WHERE seen_at IS NULL;
+         CREATE TABLE IF NOT EXISTS ALERT_MUTES (
+             id         INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule       TEXT NOT NULL,
+             subject    TEXT NOT NULL,
+             device_id  INTEGER NOT NULL DEFAULT 0,
+             until      TIMESTAMP NULL,
+             created_at TIMESTAMP NOT NULL,
+             UNIQUE (rule, subject, device_id)
+         );
+         CREATE TABLE IF NOT EXISTS ALERT_LEARNING (
+             subject       TEXT NOT NULL,
+             device_id     INTEGER NOT NULL DEFAULT 0,
+             learning_from TIMESTAMP NOT NULL,
+             data_days     INTEGER NOT NULL DEFAULT 0,
+             learned_at    TIMESTAMP NULL,
+             updated_day   INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (subject, device_id)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS HOST_SEEN (
+             kind       TEXT NOT NULL,
+             key        TEXT NOT NULL,
+             first_seen TIMESTAMP NOT NULL,
+             last_seen  TIMESTAMP NOT NULL,
+             PRIMARY KEY (kind, key)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS IDX_HOST_SEEN_LAST_SEEN ON HOST_SEEN(last_seen);
+         CREATE TABLE IF NOT EXISTS COVERAGE_GAPS (
+             id         INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id INTEGER NOT NULL REFERENCES APP_SESSIONS(id) ON DELETE CASCADE,
+             kind       TEXT NOT NULL,
+             started_at TIMESTAMP NOT NULL,
+             ended_at   TIMESTAMP NULL
+         );
+         CREATE INDEX IF NOT EXISTS IDX_GAPS_SESSION ON COVERAGE_GAPS(session_id);
+         CREATE INDEX IF NOT EXISTS IDX_GAPS_STARTED ON COVERAGE_GAPS(started_at);",
+    )?;
+    let tiene_closed_at: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('DEVICE_SERVICES') WHERE name = 'closed_at'",
+        [],
+        |fila| fila.get(0),
+    )?;
+    if tiene_closed_at == 0 {
+        conn.execute_batch("ALTER TABLE DEVICE_SERVICES ADD COLUMN closed_at TIMESTAMP NULL;")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1261,5 +1565,37 @@ mod tests {
         });
         assert_eq!(contador.up, 2);
         assert_eq!(contador.connections, 3);
+    }
+
+    #[test]
+    fn entradas_de_inventario_de_equipo_y_de_host() {
+        let equipo = SeenItem::de_equipo(7, SeenKind::App, "steam");
+        assert_eq!(equipo.subject, Subject::Device(7));
+        assert_eq!(equipo.device_id(), Some(7));
+        assert!(!equipo.es_host());
+        let host = SeenItem::del_host(SeenKind::Ja4, "t13d1516h2");
+        assert_eq!(host.subject, Subject::Host);
+        assert_eq!(host.device_id(), None);
+        assert!(host.es_host());
+    }
+
+    #[test]
+    fn filtros_y_resumenes_de_alertas_por_defecto() {
+        let filtro = AlertFilter::default();
+        assert!(filtro.level.is_none());
+        assert!(!filtro.unseen_only);
+        assert!(filtro.search.is_none());
+        let resumen = AlertSummary {
+            subject: SubjectSel::Host,
+            recent: Vec::new(),
+            unseen: AlertCounts::default(),
+            mutes: Vec::new(),
+            learning: None,
+            inventory: None,
+        };
+        assert_eq!(resumen.subject, SubjectSel::Host);
+        assert!(resumen.recent.is_empty());
+        assert!(resumen.mutes.is_empty());
+        assert!(resumen.learning.is_none());
     }
 }

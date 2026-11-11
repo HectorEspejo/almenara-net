@@ -1,9 +1,9 @@
 [package]
 name = "almenara"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Monitor de red en TUI para Linux: descubre los equipos de la red local, pone nombre al tráfico y guarda su histórico (rollups, eventos y presencia)"
+description = "Monitor de red en TUI para Linux: descubre los equipos de la red local, pone nombre al tráfico, guarda su histórico y avisa de lo que cambia"
 license = "MIT"
 
 [dependencies]
@@ -16,6 +16,7 @@ futures = "0.3"
 hickory-proto = { version = "0.26", features = ["mdns"] }
 hkdf = "0.12"
 maxminddb = "0.26"
+notify-rust = { version = "~4.17", default-features = false, features = ["z"] }
 libc = "0.2"
 psl = "2"
 nix = { version = "0.31", features = ["socket", "poll", "net", "fs", "time"] }

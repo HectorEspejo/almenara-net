@@ -21,6 +21,8 @@
 // (incluidas operaciones que la TUI todavía no consume); se permite dead_code en
 // el binario y quedan cubiertos por tests.
 #[allow(dead_code)]
+pub mod alerts;
+#[allow(dead_code)]
 pub mod connections;
 #[allow(dead_code)]
 pub mod device_services;
@@ -28,7 +30,11 @@ pub mod devices;
 #[allow(dead_code)]
 pub mod discovery_sources;
 pub mod events;
+#[allow(dead_code)]
+pub mod gaps;
 pub mod interfaces;
+#[allow(dead_code)]
+pub mod learning;
 pub mod migrations;
 #[allow(dead_code)]
 pub mod names;
@@ -54,12 +60,18 @@ use crate::error::{Error, Result};
 use crate::identify::OsSource;
 use crate::inference::names::NameEntry;
 
+pub use alerts::{AlertScope, SeenSel};
 pub use connections::{Connection, ConnectionProtocol, ConnectionUpdate};
 pub use device_services::{DeviceService, Protocol, ServiceUpsert};
 pub use devices::{ChangeSet, Device, DeviceUpsert, IdentityUpdate};
 pub use discovery_sources::{DiscoverySource, DiscoverySourceRow};
 pub use events::{DeviceEvent, EventType};
+pub use gaps::GapKind;
 pub use interfaces::Interface;
+#[allow(unused_imports)]
+pub use learning::LearningChange;
+#[allow(unused_imports)]
+pub use seen::{HostSeenEntry, SeenChange, SeenEntry};
 pub use traffic_snapshot::{SnapshotUpdate, TrafficSnapshot};
 
 /// Tiempo máximo que SQLite espera a que se libere un bloqueo (en milisegundos).
@@ -74,7 +86,7 @@ const SQL_SELECCION_DISPOSITIVO: &str =
     "SELECT id, mac, ip, hostname, vendor, interface_id, device_type, is_online,
             first_seen, last_seen, alias, notes, os_family, device_type_manual,
             last_fingerprint, model, dhcp_fingerprint, dhcp_vendor, dhcp_hostname,
-            user_agent, os_source FROM DEVICES";
+            user_agent, os_source, watched FROM DEVICES";
 
 /// Repositorio SQLite de Almenara.
 #[derive(Debug)]
@@ -106,6 +118,16 @@ impl Repo {
 
         conn.busy_timeout(Duration::from_millis(TIEMPO_ESPERA_BLOQUEO_MS))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Rendimiento de escritura (F6 §8: el lote del minuto con tráfico real
+        // debe escribirse en ≤ 10 ms): en WAL, synchronous = NORMAL evita un
+        // fsync por transacción y el autocheckpoint se desactiva (0); el
+        // checkpoint se hace en la purga horaria, fuera del cierre del minuto,
+        // para que el lote no pague el fsync periódico (picos de 11–20 ms con
+        // el automático). La base sigue siendo íntegra; ante un corte de energía
+        // se puede perder el último lote, nunca corromperse (compromiso habitual
+        // de WAL con lectores concurrentes).
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
 
         let modo_diario: String =
             conn.query_row("PRAGMA journal_mode = WAL", [], |fila| fila.get(0))?;
@@ -384,14 +406,29 @@ impl Repo {
     /// Añade un evento al histórico del dispositivo.
     ///
     /// El created_at se genera en el momento de la llamada (RFC 3339 UTC). La
-    /// clave foránea exige que el dispositivo exista.
+    /// clave foránea exige que el dispositivo exista. La reconciliación de F6
+    /// usa `append_event_id`, que devuelve el id; se conserva como API de F1.
+    #[allow(dead_code)]
     pub fn append_event(&mut self, device_id: i64, event: EventType, details: &str) -> Result<()> {
+        self.append_event_id(device_id, event, details).map(|_| ())
+    }
+
+    /// Igual que [`Repo::append_event`] pero devuelve el id del evento creado.
+    ///
+    /// La F6 lo guarda en `ALERTS.event_id` como referencia lógica del origen de
+    /// una alerta (§3).
+    pub fn append_event_id(
+        &mut self,
+        device_id: i64,
+        event: EventType,
+        details: &str,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO DEVICE_EVENTS (device_id, event_type, details, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![device_id, event.as_str(), details, ahora_rfc3339()],
         )?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// Elimina eventos más antiguos que retention_days y devuelve cuántos borró.
@@ -480,6 +517,16 @@ impl Repo {
     /// Versión actual del esquema aplicado.
     pub fn schema_version(&self) -> Result<u32> {
         migrations::current_version(&self.conn)
+    }
+
+    /// Fuerza un checkpoint del WAL.
+    ///
+    /// Se llama en la purga horaria, fuera del cierre del minuto, para que los
+    /// lotes del minuto no paguen el fsync del checkpoint automático (F6 §8).
+    pub fn wal_checkpoint(&mut self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     /// Número de dispositivos en la base de datos.
@@ -676,6 +723,7 @@ fn fila_a_dispositivo(fila: &Row<'_>) -> rusqlite::Result<Device> {
         dhcp_hostname: fila.get(18)?,
         user_agent: fila.get(19)?,
         os_source: fila.get(20)?,
+        watched: fila.get(21)?,
     })
 }
 
@@ -760,7 +808,7 @@ mod tests {
 
         assert!(ruta.exists(), "debe existir el fichero de base de datos");
         assert_eq!(repo.path(), ruta.as_path());
-        assert_eq!(repo.schema_version().expect("leer versión"), 5);
+        assert_eq!(repo.schema_version().expect("leer versión"), 6);
         assert_eq!(repo.count_devices().expect("contar dispositivos"), 0);
     }
 
@@ -770,11 +818,11 @@ mod tests {
         let ruta = directorio.path().join("data.db");
 
         let primera = Repo::init(&ruta).expect("primer init");
-        assert_eq!(primera.schema_version().expect("leer versión"), 5);
+        assert_eq!(primera.schema_version().expect("leer versión"), 6);
         drop(primera);
 
         let segunda = Repo::init(&ruta).expect("segundo init sobre el mismo fichero");
-        assert_eq!(segunda.schema_version().expect("leer versión"), 5);
+        assert_eq!(segunda.schema_version().expect("leer versión"), 6);
     }
 
     #[test]
@@ -1191,7 +1239,7 @@ mod tests {
 
         // El segundo repositorio se abre con el primero aún vivo (modo WAL).
         let mut segundo = Repo::init(&ruta).expect("segundo repositorio sobre el mismo fichero");
-        assert_eq!(segundo.schema_version().expect("leer versión"), 5);
+        assert_eq!(segundo.schema_version().expect("leer versión"), 6);
         assert_eq!(segundo.list_interfaces().expect("listar").len(), 1);
 
         segundo
@@ -1783,5 +1831,27 @@ mod tests {
             .expect("buscar")
             .expect("existe");
         assert_eq!(dispositivo.model.as_deref().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn la_conexion_usa_wal_con_synchronous_normal_y_autocheckpoint_desactivado() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&dir.path().join("data.db")).expect("repositorio");
+        let sincrono: i64 = repo
+            .connection()
+            .query_row("PRAGMA synchronous", [], |fila| fila.get(0))
+            .expect("leer synchronous");
+        assert_eq!(sincrono, 1, "synchronous debe ser NORMAL (1)");
+        let checkpoint: i64 = repo
+            .connection()
+            .query_row("PRAGMA wal_autocheckpoint", [], |fila| fila.get(0))
+            .expect("leer wal_autocheckpoint");
+        assert_eq!(
+            checkpoint, 0,
+            "el autocheckpoint se hace en la purga horaria, no en cada transacción"
+        );
+        // El checkpoint explícito de la purga no falla sobre una BD recién creada.
+        let mut repo = repo;
+        repo.wal_checkpoint().expect("checkpoint del WAL");
     }
 }

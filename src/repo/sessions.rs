@@ -79,13 +79,26 @@ pub(crate) fn close(conn: &Connection, id: i64, at: &str) -> Result<()> {
 }
 
 /// Cierra las sesiones sin cierre como interrumpidas (ended_at = last_beat).
-pub(crate) fn close_open(conn: &Connection) -> Result<usize> {
-    let cerradas = conn.execute(
+///
+/// Además cierra los huecos de `COVERAGE_GAPS` que quedaron abiertos en esas
+/// sesiones con el `ended_at` de su sesión (§7.10): tras una caída, un hueco de
+/// captura parada no puede quedarse abierto para siempre.
+pub(crate) fn close_open(conn: &mut Connection) -> Result<usize> {
+    let transaccion = conn.transaction()?;
+    let cerradas = transaccion.execute(
         "UPDATE APP_SESSIONS
             SET ended_at = last_beat, end_reason = 'interrupted'
           WHERE ended_at IS NULL",
         [],
     )?;
+    let huecos = crate::repo::gaps::close_of_closed_sessions(&transaccion)?;
+    transaccion.commit()?;
+    if huecos > 0 {
+        tracing::debug!(
+            huecos,
+            "huecos abiertos cerrados con su sesión interrumpida"
+        );
+    }
     Ok(cerradas)
 }
 
@@ -138,7 +151,7 @@ impl crate::repo::Repo {
 
     /// Cierra como interrumpidas las sesiones que quedaron abiertas.
     pub fn close_open_sessions(&mut self) -> crate::error::Result<usize> {
-        close_open(&self.conn)
+        close_open(&mut self.conn)
     }
 
     /// Lista las sesiones de Almenara ordenadas por arranque.
@@ -165,8 +178,8 @@ mod tests {
     #[test]
     fn abrir_latir_cerrar_y_listar() {
         let dir = tempdir().expect("directorio temporal");
-        let repo = Repo::init(&dir.path().join("data.db")).expect("repo");
-        let conn = repo.connection();
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repo");
+        let conn = repo.connection_mut();
         let id = open(conn, &info()).expect("abrir sesión");
         beat(conn, id, "2026-01-01T10:01:00Z").expect("latido");
         close(conn, id, "2026-01-01T10:02:00Z").expect("cerrar");
@@ -185,8 +198,8 @@ mod tests {
     #[test]
     fn las_sesiones_sin_cierre_se_cierran_como_interrumpidas() {
         let dir = tempdir().expect("directorio temporal");
-        let repo = Repo::init(&dir.path().join("data.db")).expect("repo");
-        let conn = repo.connection();
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repo");
+        let conn = repo.connection_mut();
         let id = open(conn, &info()).expect("abrir sesión");
         beat(conn, id, "2026-01-01T10:41:00Z").expect("latido");
         assert_eq!(close_open(conn).expect("cerrar abiertas"), 1);
@@ -203,8 +216,8 @@ mod tests {
     #[test]
     fn cerrar_una_sesion_ya_cerrada_no_la_pisa() {
         let dir = tempdir().expect("directorio temporal");
-        let repo = Repo::init(&dir.path().join("data.db")).expect("repo");
-        let conn = repo.connection();
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repo");
+        let conn = repo.connection_mut();
         let id = open(conn, &info()).expect("abrir sesión");
         close(conn, id, "2026-01-01T10:02:00Z").expect("cerrar");
         close(conn, id, "2026-01-01T11:00:00Z").expect("cerrar otra vez");
@@ -220,6 +233,42 @@ mod tests {
             sesiones[0].last_beat.as_str(),
             "2026-01-01T11:00:00Z",
             "una sesión cerrada no admite latidos"
+        );
+    }
+
+    #[test]
+    fn cerrar_las_sesiones_interrumpidas_cierra_sus_huecos_abiertos() {
+        let dir = tempdir().expect("directorio temporal");
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repo");
+        let conn = repo.connection_mut();
+        let id = open(conn, &info()).expect("abrir sesión");
+        let inicio = crate::repo::rfc3339_a_instante("2026-01-01T10:30:00Z").expect("inicio");
+        let abierto =
+            crate::repo::gaps::open(conn, id, crate::repo::GapKind::Capture, inicio, None)
+                .expect("abrir hueco");
+        crate::repo::gaps::open(
+            conn,
+            id,
+            crate::repo::GapKind::Suspend,
+            inicio,
+            Some(inicio + std::time::Duration::from_secs(600)),
+        )
+        .expect("guardar suspensión");
+        beat(conn, id, "2026-01-01T10:41:00Z").expect("latido");
+
+        assert_eq!(close_open(conn).expect("cerrar interrumpidas"), 1);
+        let (ended_at, kind): (Option<String>, String) = conn
+            .query_row(
+                "SELECT ended_at, kind FROM COVERAGE_GAPS WHERE id = ?1",
+                params![abierto],
+                |fila| Ok((fila.get(0)?, fila.get(1)?)),
+            )
+            .expect("leer hueco cerrado");
+        assert_eq!(kind, "capture");
+        assert_eq!(
+            ended_at.as_deref(),
+            Some("2026-01-01T10:41:00Z"),
+            "el hueco abierto se cierra con el ended_at de su sesión"
         );
     }
 }

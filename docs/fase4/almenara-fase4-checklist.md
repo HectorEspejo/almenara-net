@@ -1,12 +1,12 @@
 # Almenara - Checklist Fase 4: Protocolos, apps y top talkers
 
 ## Verificación pendiente de F1–F3 (sprint 4.0)
-- [ ] Pasada manual de F1-24 y F1-25 con `CAP_NET_RAW` anotada en el informe de implementación
+- [x] Pasada manual de F1-24 y F1-25 con `CAP_NET_RAW` anotada en el informe de implementación
   - AC: Dado el binario con la capacidad aplicada, cuando se ejecuta un ciclo completo en la red real, entonces el informe anota fecha, resultado y desviaciones de F1-24 y F1-25
-- [ ] Medición de rendimiento de F1-64 anotada en el informe de implementación
-- [ ] Mediciones del §8 de F2 (ciclo completo y port scan) anotadas en el informe de implementación
-- [ ] Mediciones del §8 de F3 (pps, CPU y render) anotadas en el informe de implementación
-- [ ] Prueba visual de F3 en `wlp191s0` con el binario recompilado anotada en el informe de implementación
+- [x] Medición de rendimiento de F1-64 anotada en el informe de implementación
+- [x] Mediciones del §8 de F2 (ciclo completo y port scan) anotadas en el informe de implementación
+- [x] Mediciones del §8 de F3 (pps, CPU y render) anotadas en el informe de implementación
+- [x] Prueba visual de F3 en `wlp191s0` con el binario recompilado anotada en el informe de implementación
 
 ## Migración y modelo de datos
 - [x] Migración v4 aditiva registrada en `SCHEMA_MIGRATIONS` e idempotente
@@ -171,15 +171,15 @@
 ## Privacidad
 - [x] Ningún payload se persiste; solo etiquetas derivadas
 - [x] Buffers de reensamblado y payload QUIC descifrado liberados en el hilo de captura tras extraer la etiqueta
-- [ ] Dominios, SNI, `Host` y User-Agent solo en logs de nivel `debug`
+- [x] Dominios, SNI, `Host` y User-Agent solo en logs de nivel `debug`
   - AC: Dado `-v`, cuando se navega durante 5 min, entonces el fichero de log no contiene ningún nombre de dominio
 - [x] User-Agent y campos DHCP saneados y truncados antes de persistir
 
 ## Rendimiento y robustez
-- [ ] Captura sostenida de 50 K pps sin pérdidas con la inferencia activa (medido)
-- [ ] CPU ≤ 20 % a 10 K pps y ≤ 7 % a 1 K pps con la inferencia activa (medido)
+- [x] Captura sostenida de 50 K pps sin pérdidas con la inferencia activa (medido)
+- [x] CPU ≤ 20 % a 10 K pps y ≤ 7 % a 1 K pps con la inferencia activa (medido)
 - [x] Parsers sin pánicos ante entradas truncadas o aleatorias
-- [ ] Memoria añadida por la fase ≤ 64 MB con los topes del §8 (medido)
+- [x] Memoria añadida por la fase ≤ 64 MB con los topes del §8 (medido)
 - [x] Carga del catálogo y de las bases IP ≤ 200 ms al arrancar
 - [x] Binario con ≤ 25 MB más por los datos embebidos
 
@@ -246,6 +246,6 @@
 
 ---
 
-**Progreso Fase 4:** 166 / 175 funcionalidades
+**Progreso Fase 4:** 175 / 175 funcionalidades
 
-**Total Almenara (Fases 1-4):** 414 / 423 funcionalidades (F1–F3 implementadas y verificadas: 248)
+**Total Almenara (Fases 1-4):** 423 / 423 funcionalidades (F1–F3 implementadas y verificadas: 248)

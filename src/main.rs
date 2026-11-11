@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use clap::{ArgAction, Parser};
 
+mod alerts;
 mod capabilities;
 mod capture;
 mod classify;
@@ -22,6 +23,7 @@ mod inference;
 mod instance;
 mod logging;
 mod notifier;
+mod notify;
 mod oui;
 mod rankings;
 mod repo;

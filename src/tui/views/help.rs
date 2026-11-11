@@ -19,7 +19,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let mut lineas: Vec<Line> = Vec::new();
     lineas.push(Line::from(Span::styled(
         format!(
-            "Almenara v{} — Fase 5: histórico, rollups y eventos",
+            "Almenara v{} — Fase 6: alertas locales y de escritorio",
             env!("CARGO_PKG_VERSION")
         ),
         app.theme.title,
@@ -53,8 +53,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.normal,
     )));
     lineas.push(Line::from(Span::styled(
-        "  Alertas       llegarán en la fase 6",
-        app.theme.dim,
+        "  Alertas       lo que cambia: lista y detalle, reglas y silencios",
+        app.theme.normal,
     )));
 
     lineas.push(Line::from(""));
@@ -133,6 +133,93 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     lineas.push(Line::from(Span::styled(
         "  ha pasado se deja en blanco.",
         app.theme.dim,
+    )));
+
+    lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled("Alertas (F6)", app.theme.accent)));
+    lineas.push(Line::from(Span::styled(
+        "  Tab    dentro de Alertas: lista → Reglas → Silencios y vuelve",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Niveles: !! IMP (importante), !  AVI (aviso) y   INF (info); solo",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  importantes y avisos cuentan en «Alertas N» de la barra. Una alerta no",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  vista lleva ●; la seleccionada, ▸. Nada depende solo del color.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Enter  detalle de la alerta (la marca como vista) · espacio  vista",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  T      marcar todas las del filtro como vistas (pide confirmar si >20)",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  f / u / /   filtro de nivel / solo sin ver / filtrar por equipo",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  m      silenciar la regla para ese sujeto: 1 día, 7 días o siempre",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  e      abrir el equipo de la alerta en Equipos (si no es de un equipo,",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "         no hace nada)",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  En Reglas: espacio activa o apaga y n cicla el nivel (importante → aviso",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  → info); se guarda en config.toml. Una regla que no puede saltar lo dice:",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  «necesita el histórico», «necesita captura» o «sin escaneo de puertos».",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  En Silencios: x quita el seleccionado; los caducados se borran solos.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Las 16 reglas configurables y sus alertas de 7 días se ven en Reglas.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Presencia: solo los equipos vigilados ([p] en Equipos y en su detalle)",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  avisan de ausencia o vuelta; ninguno está vigilado por defecto.",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Lo nuevo (apps, categorías, organizaciones, países y huellas JA4) aprende",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  durante learning_days (7 días con datos) antes de avisar; la suspensión",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  y la captura parada restan cobertura. Los silencios evitan crear alertas",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  nuevas, pero no cambian las que ya existen.",
+        app.theme.normal,
     )));
 
     lineas.push(Line::from(""));
@@ -258,6 +345,52 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         "  tener histórico continuo: solo se guarda mientras está abierta.",
         app.theme.dim,
     )));
+
+    lineas.push(Line::from(""));
+    lineas.push(Line::from(Span::styled(
+        "Privacidad de las alertas (F6)",
+        app.theme.accent,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  Las alertas se ven en la pestaña Alertas y solo las importantes se",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  notifican en el escritorio; el servidor de notificaciones puede",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  guardarlas en su historial. Para desactivarlas:",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(vec![
+        Span::styled("  [alerts] desktop_notifications = false", app.theme.accent),
+        Span::styled(" (las alertas siguen en la TUI)", app.theme.normal),
+    ]));
+    lineas.push(Line::from(Span::styled(
+        "  Las alertas no guardan dominios, SNI, Host ni contenido: solo la etiqueta",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  del cambio (equipo, app, categoría, organización, país o JA4). El texto",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  que viene de la red se sanea: sin caracteres de control ni ANSI. La",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  presencia solo se avisa de los equipos marcados como vigilados y todo es",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(Span::styled(
+        "  local: nada sale del equipo. Desactivar el motor con",
+        app.theme.normal,
+    )));
+    lineas.push(Line::from(vec![
+        Span::styled("  [alerts] enabled = false", app.theme.accent),
+        Span::styled(" deja ver las alertas guardadas.", app.theme.normal),
+    ]));
 
     lineas.push(Line::from(""));
     lineas.push(Line::from(Span::styled(
@@ -390,7 +523,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lineas.push(Line::from(Span::styled(
         format!(
-            "  Almenara v{} — Fase 5. Detalle de fuentes en data/FUENTES.md",
+            "  Almenara v{} — Fase 6. Detalle de fuentes en data/FUENTES.md",
             env!("CARGO_PKG_VERSION")
         ),
         app.theme.dim,
@@ -429,7 +562,7 @@ mod tests_f4 {
     }
 
     fn texto(app: &App) -> String {
-        let backend = TestBackend::new(200, 140);
+        let backend = TestBackend::new(200, 260);
         let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
         terminal
             .draw(|frame| super::draw(frame, app, frame.area()))
@@ -482,9 +615,9 @@ mod tests_f4 {
         assert!(contenido.contains("IP Geolocation by DB-IP (db-ip.com), CC BY 4.0"));
         assert!(contenido.contains("Public Suffix List"));
         assert!(contenido.contains("MPL 2.0"));
-        assert!(contenido.contains("Fase 5"));
-        assert!(contenido.contains("Fase 5: histórico, rollups y eventos"));
-        assert!(contenido.contains(" — Fase 5"));
+        assert!(contenido.contains("Fase 6"));
+        assert!(contenido.contains("Fase 6: alertas locales y de escritorio"));
+        assert!(contenido.contains(" — Fase 6"));
     }
 
     #[test]
@@ -525,5 +658,104 @@ mod tests_f4 {
         assert!(contenido.contains("[history] enabled = false"));
         assert!(contenido.contains("Todo es local"));
         assert!(contenido.contains("borra la base de datos"));
+    }
+}
+
+#[cfg(test)]
+mod tests_f6 {
+    use crate::capabilities::Capabilities;
+    use crate::config::Config;
+    use crate::tui::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn app_prueba() -> App {
+        App::new(
+            Config::default(),
+            PathBuf::from("/tmp/config.toml"),
+            PathBuf::from("/tmp/data.db"),
+            Capabilities {
+                raw_sockets: true,
+                detail: "CAP_NET_RAW detectada".to_string(),
+            },
+            None,
+        )
+    }
+
+    fn texto(app: &App) -> String {
+        let backend = TestBackend::new(200, 260);
+        let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
+        terminal
+            .draw(|frame| super::draw(frame, app, frame.area()))
+            .expect("dibujado de Ayuda");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn la_ayuda_documenta_las_alertas_de_f6() {
+        let contenido = texto(&app_prueba());
+        assert!(contenido.contains("Alertas (F6)"));
+        assert!(contenido.contains("!! IMP"));
+        assert!(contenido.contains("!  AVI"));
+        assert!(contenido.contains("   INF"));
+        assert!(contenido.contains("solo"));
+        assert!(contenido.contains("importantes y avisos cuentan en «Alertas N»"));
+        assert!(contenido.contains("Tab    dentro de Alertas"));
+        assert!(contenido.contains("m      silenciar la regla"));
+        assert!(contenido.contains("e      abrir el equipo de la alerta"));
+        assert!(contenido.contains("x quita el seleccionado"));
+        assert!(contenido.contains("Las 16 reglas configurables"));
+        assert!(contenido.contains("learning_days (7 días con datos)"));
+        assert!(contenido.contains("Presencia: solo los equipos vigilados"));
+        assert!(contenido.contains("espacio activa o apaga"));
+        assert!(contenido.contains("n cicla el nivel"));
+    }
+
+    #[test]
+    fn la_ayuda_explica_la_privacidad_de_las_notificaciones() {
+        let contenido = texto(&app_prueba());
+        assert!(contenido.contains("Privacidad de las alertas (F6)"));
+        assert!(contenido.contains("solo las importantes se"));
+        assert!(contenido.contains("el servidor de notificaciones puede"));
+        assert!(contenido.contains("guardarlas en su historial"));
+        assert!(contenido.contains("[alerts] desktop_notifications = false"));
+        assert!(contenido.contains("no guardan dominios, SNI, Host ni contenido"));
+        assert!(contenido.contains("sin caracteres de control ni ANSI"));
+        assert!(contenido.contains("presencia solo se avisa de los equipos marcados"));
+        assert!(contenido.contains("[alerts] enabled = false"));
+    }
+
+    #[test]
+    fn la_ayuda_se_dibuja_sin_panico_en_ochenta_por_veinticuatro() {
+        let app = app_prueba();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal de pruebas");
+        terminal
+            .draw(|frame| super::draw(frame, &app, frame.area()))
+            .expect("la Ayuda cabe en 80x24");
+        let contenido: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect();
+        assert!(contenido.contains("Almenara v"));
+    }
+
+    #[test]
+    fn la_ayuda_ya_no_anuncia_la_pestana_de_alertas() {
+        let contenido = texto(&app_prueba());
+        assert!(!contenido.contains("llegarán en la fase 6"));
+        assert!(contenido.contains("lo que cambia: lista y detalle, reglas y silencios"));
+        assert!(contenido.contains("Fase 6: alertas locales y de escritorio"));
+        assert!(contenido.contains(" — Fase 6."));
     }
 }

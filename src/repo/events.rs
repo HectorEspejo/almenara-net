@@ -108,12 +108,10 @@ pub struct DeviceEvent {
 
 /// Último evento de servicio (`service_new` o `service_gone`) de un puerto.
 ///
-/// Lo usa la reconciliación antes de escribir los servicios del ciclo para no
-/// duplicar `service_gone` en escaneos sucesivos y para marcar `reopened`
-/// cuando el último estado conocido del puerto era cerrado. El puerto y el
-/// protocolo se comparan contra los detalles JSON en Rust: el SQL solo filtra
-/// por dispositivo y tipo, así que no se concatena ninguna clave ni se depende
-/// de las funciones JSON de SQLite.
+/// API de F5 que la F6 ya no usa: desde la v6 el estado CERRADO de un puerto es
+/// `DEVICE_SERVICES.closed_at` (§7.12), no su último evento. Se conserva para
+/// el detalle histórico y sus pruebas; se permite código muerto.
+#[allow(dead_code)]
 pub(crate) fn last_service_event(
     conn: &Connection,
     device_id: i64,
@@ -158,6 +156,7 @@ pub(crate) fn last_service_event(
 }
 
 /// Indica si los detalles JSON de un evento de servicio corresponden a un puerto.
+#[allow(dead_code)]
 fn es_evento_del_puerto(details: &str, port: u16, protocol: Protocol) -> bool {
     let Ok(valor) = serde_json::from_str::<serde_json::Value>(details) else {
         return false;
@@ -169,9 +168,9 @@ fn es_evento_del_puerto(details: &str, port: u16, protocol: Protocol) -> bool {
 impl Repo {
     /// Último evento de servicio de un puerto de un dispositivo (F5).
     ///
-    /// La reconciliación lo consulta antes de escribir los servicios del ciclo
-    /// para que el estado CERRADO (último evento `service_gone`) y la marca
-    /// `reopened` no dependan de `last_seen`, que F2 usa para derivar STALE.
+    /// La reconciliación ya no lo consulta: el estado CERRADO es
+    /// `DEVICE_SERVICES.closed_at` (§7.12). Se conserva por compatibilidad.
+    #[allow(dead_code)]
     pub fn last_service_event(
         &self,
         device_id: i64,

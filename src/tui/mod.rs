@@ -4,6 +4,7 @@
 //! de crossterm, eventos de la aplicación (resultados de escaneo) y un tick periódico
 //! para caducar notificaciones. La base de datos se usa solo desde este hilo.
 
+pub mod alerts_state;
 pub mod app;
 pub mod history_state;
 pub mod keys;
@@ -118,6 +119,8 @@ pub async fn run(
     mut event_rx: broadcast::Receiver<AppEvent>,
 ) -> Result<()> {
     let mut terminal = init_terminal()?;
+    // F6: motor de alertas, notificador y estado de la pestaña (antes del bucle).
+    preparar_alertas(&mut app, &repo);
     let mut tracker = OnlineTracker::new(app.config.scan.offline_after_cycles);
     let mut stream = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
@@ -160,6 +163,15 @@ pub async fn run(
     // Reintento final de los lotes pendientes (si falla, se pierde como mucho el
     // último minuto; la sesión se cierra igualmente).
     escribir_pendientes(&mut app, &mut repo);
+    // F6: al salir, los huecos abiertos se cierran con el cierre de la sesión (§7.10).
+    if let Some(id) = app.capture_gap.take() {
+        let _ = repo.close_gap(id, std::time::SystemTime::now());
+    }
+    if let Some(id) = app.session_id {
+        if let Err(err) = repo.close_open_gaps(id, std::time::SystemTime::now()) {
+            tracing::warn!(%err, "no se pudieron cerrar los huecos abiertos de la sesión");
+        }
+    }
     if let Some(id) = app.session_id {
         if let Err(err) = repo.close_session(id, std::time::SystemTime::now()) {
             tracing::warn!(%err, "no se pudo cerrar la sesión de Almenara");
@@ -197,9 +209,20 @@ async fn bucle(
             return Ok(());
         }
 
-        // Consultas del histórico visibles: el lector responde por AppEvent::History.
-        if let Some(lector) = &app.history_reader {
-            for (id, consulta) in app.history.history_pending_requests(Utc::now().timestamp()) {
+        // Consultas del histórico y de la pestaña Alertas: el lector responde por
+        // AppEvent::History con el identificador de la petición (F5 y F6).
+        if let Some(lector) = app.history_reader.clone() {
+            let ahora_unix = Utc::now().timestamp();
+            for (id, consulta) in app.history.history_pending_requests(ahora_unix) {
+                lector.query(id, consulta);
+            }
+            let ctx = crate::tui::alerts_state::AlertsRequestCtx {
+                active: app.tab == crate::tui::app::Tab::Alertas,
+                config_active: app.tab == crate::tui::app::Tab::Config,
+                detail_device: app.detail.as_ref().map(|detalle| detalle.device_id),
+                now: ahora_unix,
+            };
+            for (id, consulta) in app.alerts.pending_requests(&ctx) {
                 lector.query(id, consulta);
             }
         }
@@ -256,7 +279,11 @@ async fn bucle(
                         app.push_notification(level, message);
                     }
                     Ok(AppEvent::History { id, response }) => {
-                        app.history.apply_history_response(id, &response);
+                        // F6: las respuestas de la pestaña Alertas se aplican primero;
+                        // si no son suyas, las consume el histórico de F5.
+                        if !app.alerts.apply_response(id, &response) {
+                            app.history.apply_history_response(id, &response);
+                        }
                     }
                     Ok(AppEvent::Rollup(lote)) => {
                         escribir_lote_historico(app, repo, *lote);
@@ -287,6 +314,7 @@ async fn bucle(
                     consolidar_pendientes(app, repo);
                 }
                 latir_sesion(app, repo);
+                tick_alertas(app, repo);
                 purgar_si_toca(app, repo);
             }
         }
@@ -354,6 +382,9 @@ fn aplicar_accion(accion: Action, app: &mut App, repo: &mut Repo) {
         }
         Action::OpenDetail { device_id } => {
             let drill_down = app.tab == crate::tui::app::Tab::Trafico;
+            // `e` en Alertas abre el equipo en Equipos con su detalle (§6): hay que
+            // cambiar de pestaña, porque el master-detail solo se pinta en Equipos.
+            let desde_alertas = app.tab == crate::tui::app::Tab::Alertas;
             let servicios = match repo.list_services(device_id) {
                 Ok(servicios) => servicios,
                 Err(err) => {
@@ -364,7 +395,7 @@ fn aplicar_accion(accion: Action, app: &mut App, repo: &mut Repo) {
                     Vec::new()
                 }
             };
-            if drill_down {
+            if drill_down || desde_alertas {
                 app.tab = crate::tui::app::Tab::Equipos;
                 reseleccionar_por_id(app, device_id);
             }
@@ -391,6 +422,120 @@ fn aplicar_accion(accion: Action, app: &mut App, repo: &mut Repo) {
                 ),
             }
         }
+        Action::MarkAlertSeen(sel) => match repo.mark_seen(sel, std::time::SystemTime::now()) {
+            Ok(_) => {
+                refrescar_contadores_alertas(app, repo);
+                app.alerts.mark_dirty();
+            }
+            Err(err) => app.push_notification(
+                Level::Error,
+                format!("No se pudo marcar la alerta como vista: {err}"),
+            ),
+        },
+        Action::MarkAlertsSeen(scope) => {
+            let sel = crate::repo::SeenSel::Filter(scope);
+            match repo.mark_seen(sel, std::time::SystemTime::now()) {
+                Ok(marcadas) => {
+                    refrescar_contadores_alertas(app, repo);
+                    app.alerts.mark_dirty();
+                    app.push_notification(
+                        Level::Info,
+                        format!("{marcadas} alertas marcadas como vistas"),
+                    );
+                }
+                Err(err) => app.push_notification(
+                    Level::Error,
+                    format!("No se pudieron marcar las alertas como vistas: {err}"),
+                ),
+            }
+        }
+        Action::MuteAlert {
+            rule,
+            subject,
+            until,
+        } => match repo.upsert_mute(rule, subject, until) {
+            Ok(_) => {
+                recargar_silencios(app, repo);
+                app.push_notification(
+                    Level::Info,
+                    format!("Regla «{}» silenciada para este sujeto", rule.name()),
+                );
+            }
+            Err(err) => {
+                app.push_notification(Level::Error, format!("No se pudo crear el silencio: {err}"))
+            }
+        },
+        Action::DeleteMute(id) => match repo.delete_mute(id) {
+            Ok(()) => {
+                recargar_silencios(app, repo);
+                app.push_notification(Level::Info, "Silencio eliminado");
+            }
+            Err(err) => app.push_notification(
+                Level::Error,
+                format!("No se pudo quitar el silencio: {err}"),
+            ),
+        },
+        Action::SaveRuleSetting { rule, setting } => {
+            app.config.alerts.set_rule(rule, &setting);
+            if let Err(err) = crate::config::save_rule(&app.config_path, rule, &setting) {
+                if !app.alert_rule_save_warned {
+                    app.alert_rule_save_warned = true;
+                    app.push_notification(
+                        Level::Warn,
+                        format!(
+                            "No se pudo guardar [alerts.rules].{} en config.toml ({err}); el cambio vale para esta sesión",
+                            rule.as_str()
+                        ),
+                    );
+                }
+            }
+            app.alerts.set_rule_settings(&app.config.alerts.params());
+            if let Some(motor) = app.alert_engine.as_mut() {
+                let acciones = motor.set_rule(rule, setting, std::time::SystemTime::now());
+                aplicar_acciones_alertas(app, repo, acciones);
+            }
+            app.alerts.mark_dirty();
+            let estado = if setting.enabled {
+                format!("{} ({})", rule.name(), setting.level.label())
+            } else {
+                format!("{} apagada", rule.name())
+            };
+            app.push_notification(Level::Info, format!("Regla: {estado}"));
+        }
+        Action::SetWatched { device_id, watched } => match repo.set_watched(device_id, watched) {
+            Ok(()) => {
+                recargar_dispositivos(app, repo);
+                if let Some(motor) = app.alert_engine.as_mut() {
+                    let acciones =
+                        motor.set_watched(device_id, watched, std::time::SystemTime::now());
+                    aplicar_acciones_alertas(app, repo, acciones);
+                }
+                app.alerts.mark_dirty();
+                let mensaje = if watched {
+                    "Equipo vigilado ([p] para desmarcarlo)"
+                } else {
+                    "El equipo ya no está vigilado"
+                };
+                app.push_notification(Level::Info, mensaje);
+            }
+            Err(err) => app.push_notification(
+                Level::Error,
+                format!("No se pudo cambiar el estado vigilado: {err}"),
+            ),
+        },
+    }
+}
+
+/// Recarga los silencios vigentes en el motor tras crearlos o quitarlos (§7.6).
+fn recargar_silencios(app: &mut App, repo: &Repo) {
+    match repo.active_mutes(std::time::SystemTime::now()) {
+        Ok(mutes) => {
+            if let Some(motor) = app.alert_engine.as_mut() {
+                motor.set_mutes(mutes);
+            }
+            app.alerts.mark_dirty();
+        }
+        Err(err) => tracing::warn!(%err, "no se pudieron recargar los silencios"),
     }
 }
 
@@ -448,18 +593,34 @@ fn escribir_lote_historico(app: &mut App, repo: &mut Repo, lote: crate::history:
 /// Intenta escribir en orden todos los lotes pendientes; para al primer fallo.
 fn escribir_pendientes(app: &mut App, repo: &mut Repo) {
     while let Some(lote) = app.pending_rollups.first().cloned() {
+        let inicio_escritura = Instant::now();
         match repo.insert_minute_batch(&lote) {
-            Ok(_) => {
+            Ok(cambio) => {
+                // Medición de F5/F6: escritura del lote del minuto con tráfico real.
+                tracing::debug!(
+                    minuto = lote.minute,
+                    filas = lote.rows.len(),
+                    inventario = lote.seen.len(),
+                    duracion_ms = inicio_escritura.elapsed().as_millis(),
+                    "lote del minuto escrito"
+                );
                 app.pending_rollups.remove(0);
                 app.rollup_counters.batches = app.rollup_counters.batches.saturating_add(1);
                 app.rollup_counters.overflow =
                     app.rollup_counters.overflow.saturating_add(lote.overflow);
-                // Si el lote cierra una hora, se consolida en el acto (§4.1).
+                // F6: lo nuevo del inventario (equipos y propio equipo) va al motor.
+                let senales = senales_de_inventario(app, repo, &cambio);
+                procesar_senales_alertas(app, repo, senales);
+                // Si el lote cierra una hora, se consolida en el acto (§4.1) y se
+                // evalúa en vivo para «más tráfico de lo habitual» (§7.4).
                 if (lote.minute + 60).rem_euclid(3600) == 0 {
                     let hora = lote.minute - lote.minute.rem_euclid(3600);
                     let top_keys = app.config.history.top_keys;
-                    if let Err(err) = repo.build_hour(hora, top_keys) {
-                        tracing::warn!(%err, hora, "no se pudo consolidar la hora del histórico");
+                    match repo.build_hour(hora, top_keys) {
+                        Ok(_) => evaluar_hora_cerrada(app, repo, hora),
+                        Err(err) => {
+                            tracing::warn!(%err, hora, "no se pudo consolidar la hora del histórico");
+                        }
                     }
                     limpiar_destinos_si_apagados(app, repo);
                 }
@@ -518,7 +679,11 @@ fn consolidar_pendientes(app: &mut App, repo: &mut Repo) {
                     continue;
                 }
                 match repo.build_day(*dia, top_keys) {
-                    Ok(_) => consolidadas += 1,
+                    Ok(_) => {
+                        consolidadas += 1;
+                        // F6: al consolidar un día local se cuenta el aprendizaje (§7.3).
+                        actualizar_aprendizaje(app, repo, *dia);
+                    }
                     Err(err) => {
                         tracing::warn!(%err, dia = dia.aaaammdd(), "no se pudo consolidar un día");
                         break;
@@ -586,6 +751,12 @@ fn purgar_si_toca(app: &mut App, repo: &mut Repo) {
     }
     if let Err(err) = repo.prune_events(app.config.storage.events_retention_days) {
         tracing::warn!(%err, "no se pudieron podar los eventos");
+    }
+    // F6: alertas vencidas, silencios caducados, HOST_SEEN y tamaño de la BD.
+    purgar_alertas(app, repo);
+    // Checkpoint del WAL tras la purga horaria, fuera del cierre del minuto.
+    if let Err(err) = repo.wal_checkpoint() {
+        tracing::warn!(%err, "no se pudo hacer checkpoint del WAL tras la purga");
     }
 }
 
@@ -679,7 +850,34 @@ fn procesar_escaneo(
                     reconciliacion.pruned_services
                 ));
             }
+            // F6: señales del ciclo al motor y aprendizaje de los equipos nuevos
+            // (§4.1 y §7.3). La línea base termina tras el primer ciclo completo.
+            let senales = senales_de_escaneo(&reconciliacion);
+            for evento in &reconciliacion.events {
+                if evento.event_type == crate::repo::EventType::New {
+                    let desde = reconciliacion
+                        .devices
+                        .iter()
+                        .find(|device| device.id == evento.device_id)
+                        .and_then(|device| crate::repo::rfc3339_a_instante(&device.first_seen))
+                        .unwrap_or_else(std::time::SystemTime::now);
+                    if let Err(err) = repo.ensure_learning(
+                        crate::alerts::Subject::Device(evento.device_id),
+                        desde,
+                        app.config.alerts.learning_days,
+                    ) {
+                        tracing::warn!(%err, "no se pudo crear el aprendizaje del equipo nuevo");
+                    }
+                }
+            }
             app.apply_reconciliation(reconciliacion);
+            app.alerts.mark_dirty();
+            // La línea base termina DESPUÉS de pasar las señales del primer ciclo:
+            // así la red de partida de una BD nueva no genera «equipo nuevo» (§7.9).
+            procesar_senales_alertas(app, repo, senales);
+            if let Some(motor) = app.alert_engine.as_mut() {
+                motor.end_baseline();
+            }
             app.history.history_refresh();
             actualizar_mapa_dispositivos(app, repo);
             app.push_notification(Level::Info, resumen);
@@ -892,6 +1090,579 @@ async fn pedir_quien_lo_usa(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fase 6: alertas (motor puro, notificador y señales en vivo)
+// ---------------------------------------------------------------------------
+
+/// Prepara el motor de alertas, el notificador y el estado de la pestaña (§4.4).
+fn preparar_alertas(app: &mut App, repo: &Repo) {
+    app.alerts.set_rule_settings(&app.config.alerts.params());
+    app.alerts.mark_dirty();
+    if let Ok(counts) = repo.unseen_counts() {
+        app.alerts.set_counts(counts);
+    }
+    let params = app.config.alerts.params();
+    let snapshot = match repo.engine_snapshot(std::time::SystemTime::now()) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::warn!(%err, "no se pudo cargar el estado inicial del motor de alertas");
+            Default::default()
+        }
+    };
+    if snapshot.devices_empty {
+        tracing::debug!("línea base de alertas activa: la red de partida no avisa");
+    }
+    app.alert_engine = Some(crate::alerts::AlertEngine::new(params, snapshot));
+    app.alert_notifier = Some(crate::notify::spawn(crate::notify::NotifyConfig {
+        enabled: app.config.alerts.desktop_notifications,
+    }));
+}
+
+/// Pasa una tanda de señales al motor y aplica las acciones que devuelve.
+fn procesar_senales_alertas(app: &mut App, repo: &mut Repo, senales: Vec<crate::alerts::Signal>) {
+    if senales.is_empty() {
+        return;
+    }
+    let ahora = std::time::SystemTime::now();
+    let mut acciones = Vec::new();
+    if let Some(motor) = app.alert_engine.as_mut() {
+        for senal in senales {
+            acciones.extend(motor.handle(senal, ahora));
+        }
+    }
+    aplicar_acciones_alertas(app, repo, acciones);
+}
+
+/// Aplica las acciones que devuelve el motor de alertas (ADR-68).
+fn aplicar_acciones_alertas(
+    app: &mut App,
+    repo: &mut Repo,
+    acciones: Vec<crate::alerts::AlertAction>,
+) {
+    if acciones.is_empty() {
+        return;
+    }
+    for accion in acciones {
+        aplicar_accion_alerta(app, repo, accion);
+    }
+    refrescar_contadores_alertas(app, repo);
+}
+
+fn refrescar_contadores_alertas(app: &mut App, repo: &Repo) {
+    match repo.unseen_counts() {
+        Ok(counts) => app.alerts.set_counts(counts),
+        Err(err) => tracing::warn!(%err, "no se pudieron leer los contadores de alertas"),
+    }
+    match repo.unseen_device_ids() {
+        Ok(ids) => app.alerts.set_device_unseen(ids),
+        Err(err) => tracing::warn!(%err, "no se pudieron leer los equipos con alertas sin ver"),
+    }
+    app.last_alert_counts = Some(Instant::now());
+}
+
+/// Aplica una acción suelta del motor; si falla la escritura, la deja pendiente
+/// para reintentarla en el minuto siguiente (§7.5).
+fn aplicar_accion_alerta(app: &mut App, repo: &mut Repo, accion: crate::alerts::AlertAction) {
+    use crate::alerts::AlertAction;
+    let ahora = std::time::SystemTime::now();
+    match accion {
+        AlertAction::Insert { alert, notify } => match repo.insert_alert(&alert, ahora) {
+            Ok(id) => {
+                if let Some(clave) = alert.dedup_key() {
+                    if let Some(motor) = app.alert_engine.as_mut() {
+                        motor.inserted(&clave, id);
+                    }
+                }
+                if let Some(notice) = notify {
+                    notificar_alerta(app, repo, id, &alert.title, notice);
+                }
+                tracing::debug!(regla = alert.rule.as_str(), id, "alerta creada");
+                app.alerts.mark_dirty();
+            }
+            Err(err) => {
+                tracing::warn!(%err, "no se pudo escribir la alerta; se reintentará en el minuto siguiente");
+                if !app.alert_write_warned {
+                    app.alert_write_warned = true;
+                    app.push_notification(
+                        Level::Error,
+                        "No se pudieron guardar las alertas; se reintentará en el minuto siguiente",
+                    );
+                }
+                app.pending_alert_actions
+                    .push(AlertAction::Insert { alert, notify });
+            }
+        },
+        AlertAction::InsertSummary {
+            alert,
+            grouped,
+            notify,
+        } => match repo.insert_summary(&alert, &grouped, ahora) {
+            Ok(id) => {
+                if let Some(notice) = notify {
+                    notificar_alerta(app, repo, id, &alert.title, notice);
+                }
+                app.alerts.mark_dirty();
+            }
+            Err(err) => {
+                tracing::warn!(%err, "no se pudo escribir el resumen de alertas");
+                app.pending_alert_actions.push(AlertAction::InsertSummary {
+                    alert,
+                    grouped,
+                    notify,
+                });
+            }
+        },
+        AlertAction::Repeat {
+            id,
+            at,
+            details,
+            reactivate,
+        } => match repo.repeat_alert(id, at, &details, reactivate) {
+            Ok(()) => {
+                app.alerts.mark_dirty();
+            }
+            Err(err) => {
+                tracing::warn!(%err, id, "no se pudo repetir la alerta");
+                app.pending_alert_actions.push(AlertAction::Repeat {
+                    id,
+                    at,
+                    details,
+                    reactivate,
+                });
+            }
+        },
+        AlertAction::Resolve { id, at } => match repo.resolve_alert(id, at) {
+            Ok(()) => {
+                app.alerts.mark_dirty();
+            }
+            Err(err) => {
+                tracing::warn!(%err, id, "no se pudo resolver la alerta");
+                app.pending_alert_actions
+                    .push(AlertAction::Resolve { id, at });
+            }
+        },
+        AlertAction::Notify(notice) => {
+            if let Some(notificador) = app.alert_notifier.as_ref() {
+                notificador.notify(notice);
+            }
+        }
+    }
+}
+
+/// Encola una notificación de escritorio y marca notified solo si salió de
+/// verdad en una notificación propia (§7.2); deja el aviso de una línea de 10 s.
+fn notificar_alerta(
+    app: &mut App,
+    repo: &mut Repo,
+    id: i64,
+    titulo: &str,
+    notice: crate::alerts::Notice,
+) {
+    let entregada = app
+        .alert_notifier
+        .as_ref()
+        .map(|notificador| notificador.notify(notice))
+        .unwrap_or(false);
+    if entregada {
+        if let Err(err) = repo.mark_alert_notified(id) {
+            tracing::warn!(%err, id, "no se pudo marcar la alerta como notificada");
+        }
+        if app.tab != crate::tui::app::Tab::Alertas {
+            app.push_alert_notice(format!("▲ Alerta importante: {titulo} · [5] para verla"));
+        }
+    }
+}
+
+/// Reintenta las acciones del motor que no se pudieron escribir (una vez por minuto).
+fn reintentar_alertas(app: &mut App, repo: &mut Repo) {
+    if app.pending_alert_actions.is_empty() {
+        return;
+    }
+    let toca = app
+        .last_alert_retry
+        .map(|ultimo| ultimo.elapsed() >= std::time::Duration::from_secs(60))
+        .unwrap_or(true);
+    if !toca {
+        return;
+    }
+    app.last_alert_retry = Some(Instant::now());
+    let pendientes = std::mem::take(&mut app.pending_alert_actions);
+    aplicar_acciones_alertas(app, repo, pendientes);
+}
+
+/// Tareas periódicas de la F6 en cada tick de la TUI.
+fn tick_alertas(app: &mut App, repo: &mut Repo) {
+    let ahora = std::time::SystemTime::now();
+
+    // Contadores de la barra y marcas de Equipos: cada 5 s y tras entrar en la
+    // pestaña Alertas, se piden al escritor (consultas de agregación baratas).
+    let toca_contadores = app
+        .last_alert_counts
+        .map(|ultimo| ultimo.elapsed() >= std::time::Duration::from_secs(5))
+        .unwrap_or(true);
+    if toca_contadores {
+        refrescar_contadores_alertas(app, repo);
+    }
+    if app.tab == crate::tui::app::Tab::Alertas && !app.alert_tab_active {
+        app.alerts.mark_dirty();
+    }
+    app.alert_tab_active = app.tab == crate::tui::app::Tab::Alertas;
+
+    // El resto de tareas (suspensión, huecos, motor y reintentos) se ejecuta una
+    // vez por segundo, como pide §7.10; el tick de la TUI es de 100 ms.
+    let toca_tick = app
+        .last_alert_tick
+        .map(|ultimo| ultimo.elapsed() >= std::time::Duration::from_secs(1))
+        .unwrap_or(true);
+    if !toca_tick {
+        return;
+    }
+    app.last_alert_tick = Some(Instant::now());
+
+    // Suspensión del equipo: hueco suspend ya cerrado (§7.10).
+    if let Some(suspension) = app.suspend.detect() {
+        if let Some(session_id) = app.session_id {
+            match repo.open_gap(
+                session_id,
+                crate::repo::GapKind::Suspend,
+                suspension.from,
+                Some(suspension.to),
+            ) {
+                Ok(_) => {
+                    tracing::info!(
+                        desde = %crate::repo::instante_a_rfc3339(suspension.from),
+                        "suspensión del equipo detectada; hueco guardado"
+                    );
+                    app.history.history_refresh();
+                    app.alerts.mark_dirty();
+                }
+                Err(err) => tracing::warn!(%err, "no se pudo guardar el hueco de suspensión"),
+            }
+        }
+    }
+
+    // Captura parada dentro de la sesión: hueco capture abierto al pararse y
+    // cerrado al volver (§7.10). No se abre si la captura nunca debió empezar.
+    let deberia_capturar = app.config.capture.enabled && app.capabilities.raw_sockets;
+    let capturando = app.traffic.capture.active;
+    if deberia_capturar && !capturando && app.capture_gap.is_none() {
+        if let Some(session_id) = app.session_id {
+            match repo.open_gap(session_id, crate::repo::GapKind::Capture, ahora, None) {
+                Ok(id) => {
+                    app.capture_gap = Some(id);
+                    app.history.history_refresh();
+                }
+                Err(err) => tracing::warn!(%err, "no se pudo abrir el hueco de captura parada"),
+            }
+        }
+    } else if capturando {
+        if let Some(id) = app.capture_gap.take() {
+            match repo.close_gap(id, ahora) {
+                Ok(()) => {
+                    app.history.history_refresh();
+                    app.alerts.mark_dirty();
+                    // Resolver capture_stopped en el acto (§7.8).
+                    muestrear_salud(app, repo);
+                }
+                Err(err) => tracing::warn!(%err, "no se pudo cerrar el hueco de captura parada"),
+            }
+        }
+    }
+    app.capture_was_active = capturando;
+
+    // Salud de la captura y de la BD: una muestra por minuto (§7.8).
+    let toca_salud = app
+        .last_health
+        .map(|ultimo| ultimo.elapsed() >= std::time::Duration::from_secs(60))
+        .unwrap_or(true);
+    if toca_salud {
+        app.last_health = Some(Instant::now());
+        muestrear_salud(app, repo);
+    }
+
+    // Tareas del motor: fin de la puesta al día y liberación del tope de
+    // notificaciones (§7.2 y §7.9).
+    let acciones = app
+        .alert_engine
+        .as_mut()
+        .map(|motor| motor.tick(ahora))
+        .unwrap_or_default();
+    aplicar_acciones_alertas(app, repo, acciones);
+
+    reintentar_alertas(app, repo);
+}
+
+/// Toma una muestra de salud con lo que ya tiene el hilo de la TUI (§7.8).
+fn muestrear_salud(app: &mut App, repo: &mut Repo) {
+    let Some(motor) = app.alert_engine.as_mut() else {
+        return;
+    };
+    let captura = &app.traffic.capture;
+    let total = captura.total;
+    let drops = captura.drops;
+    let limit = captura.limit_drops;
+    let nuevos = total.saturating_sub(app.health_prev_total);
+    let perdidos = drops.saturating_sub(app.health_prev_drops);
+    let limitados = limit.saturating_sub(app.health_prev_limit_drops);
+    let perdidos_totales = perdidos.saturating_add(limitados);
+    let denominador = nuevos.saturating_add(perdidos_totales);
+    let drops_pct_minute = if denominador > 0 {
+        Some((perdidos_totales as f64 * 100.0 / denominador as f64) as f32)
+    } else {
+        None
+    };
+    app.health_prev_total = total;
+    app.health_prev_drops = drops;
+    app.health_prev_limit_drops = limit;
+
+    let stats = crate::alerts::CaptureStats {
+        enabled: app.config.capture.enabled,
+        privileged: app.capabilities.raw_sockets,
+        running: captura.active,
+        error: captura.disabled_reason.clone(),
+        drops_pct_minute,
+        kernel_drops: drops,
+        limit_drops: limit,
+        interface: captura.interfaces.join(","),
+    };
+    let db = crate::alerts::DbSize {
+        db_bytes: std::fs::metadata(&app.db_path)
+            .map(|metadatos| metadatos.len())
+            .unwrap_or(0),
+        wal_bytes: std::fs::metadata(format!("{}-wal", app.db_path.display()))
+            .map(|metadatos| metadatos.len())
+            .unwrap_or(0),
+        max_db_mb: app.config.history.max_db_mb,
+    };
+    let sample = crate::alerts::Health::sample(&stats, &db, std::time::SystemTime::now());
+    let acciones = motor.handle(
+        crate::alerts::Signal::Health(sample),
+        std::time::SystemTime::now(),
+    );
+    aplicar_acciones_alertas(app, repo, acciones);
+}
+
+/// Convierte el tipo de evento persistido en una señal del motor.
+fn tipo_de_senal(event_type: crate::repo::EventType) -> Option<crate::alerts::EventKind> {
+    use crate::alerts::EventKind;
+    use crate::repo::EventType;
+    Some(match event_type {
+        EventType::New => EventKind::New,
+        EventType::Disappeared => EventKind::Disappeared,
+        EventType::Reappeared => EventKind::Reappeared,
+        EventType::MacChanged => EventKind::MacChanged,
+        EventType::HostnameChanged => EventKind::HostnameChanged,
+        EventType::ServiceNew => EventKind::ServiceNew,
+        EventType::OsChanged => EventKind::OsChanged,
+        EventType::TypeChanged => EventKind::TypeChanged,
+        EventType::IpChanged | EventType::ServiceGone => return None,
+    })
+}
+
+/// Construye los datos del equipo que viajan en una señal de evento.
+fn datos_de_equipo(
+    device: &crate::repo::Device,
+    fuente: crate::alerts::DeviceSource,
+) -> crate::alerts::DeviceSignal {
+    crate::alerts::DeviceSignal {
+        device_id: device.id,
+        label: device.display_name().to_string(),
+        mac: device.mac.clone(),
+        mac_random: crate::identify::mac::is_private(&device.mac),
+        vendor: device.vendor.clone(),
+        ip: device.ip.clone(),
+        hostname: device.hostname.clone(),
+        watched: device.watched,
+        os_family: device.os_family.clone(),
+        device_type: device.effective_device_type().to_string(),
+        first_seen: crate::repo::rfc3339_a_instante(&device.first_seen)
+            .unwrap_or_else(std::time::SystemTime::now),
+        last_seen: crate::repo::rfc3339_a_instante(&device.last_seen)
+            .unwrap_or_else(std::time::SystemTime::now),
+        source: fuente,
+    }
+}
+
+/// Señales de evento de un ciclo de escaneo (§4.1 y §7.1).
+fn senales_de_escaneo(
+    reconciliacion: &crate::scanner::Reconciliation,
+) -> Vec<crate::alerts::Signal> {
+    let mut senales = Vec::new();
+    for evento in &reconciliacion.events {
+        let Some(tipo) = tipo_de_senal(evento.event_type) else {
+            continue;
+        };
+        let Some(device) = reconciliacion
+            .devices
+            .iter()
+            .find(|device| device.id == evento.device_id)
+        else {
+            continue;
+        };
+        let details: serde_json::Value =
+            serde_json::from_str(&evento.details).unwrap_or(serde_json::Value::Null);
+        let fuente = match details.get("source").and_then(serde_json::Value::as_str) {
+            Some("capture") => crate::alerts::DeviceSource::Capture,
+            _ => crate::alerts::DeviceSource::Scan,
+        };
+        senales.push(crate::alerts::Signal::Event(crate::alerts::EventSignal {
+            device: datos_de_equipo(device, fuente),
+            kind: tipo,
+            details,
+            event_id: evento.event_id,
+        }));
+    }
+    senales
+}
+
+/// Señales de inventario nuevo de un lote del minuto (§7.11).
+fn senales_de_inventario(
+    app: &App,
+    repo: &Repo,
+    cambio: &crate::repo::SeenChange,
+) -> Vec<crate::alerts::Signal> {
+    use crate::alerts::{SeenNew, SeenSignal, Subject};
+    use std::collections::BTreeMap;
+
+    let aprendizaje = repo.learning_rows().unwrap_or_default();
+    let mut por_sujeto: BTreeMap<Subject, Vec<SeenNew>> = BTreeMap::new();
+    for entrada in &cambio.new_items {
+        let Some(subject) = sujeto_de_alerta(entrada.subject) else {
+            continue;
+        };
+        let primera_vez = match entrada.subject {
+            crate::history::Subject::Device(id) => app
+                .devices
+                .iter()
+                .find(|device| device.id == id)
+                .and_then(|device| crate::repo::rfc3339_a_instante(&device.first_seen)),
+            _ => None,
+        };
+        let item = SeenNew {
+            kind: entrada.kind,
+            key: entrada.key.clone(),
+            label: etiqueta_de_inventario(entrada.kind, &entrada.key),
+            first_seen: primera_vez.unwrap_or_else(std::time::SystemTime::now),
+        };
+        por_sujeto.entry(subject).or_default().push(item);
+    }
+
+    let mut senales = Vec::new();
+    for (subject, items) in por_sujeto {
+        let (label, aprendido) = match subject {
+            Subject::Device(id) => (
+                app.devices
+                    .iter()
+                    .find(|device| device.id == id)
+                    .map(|device| device.display_name().to_string())
+                    .unwrap_or_else(|| format!("Equipo #{id}")),
+                aprendizaje
+                    .iter()
+                    .find(|fila| fila.subject == subject)
+                    .and_then(|fila| fila.learned_at),
+            ),
+            Subject::Host => (
+                "Este equipo".to_string(),
+                aprendizaje
+                    .iter()
+                    .find(|fila| fila.subject == subject)
+                    .and_then(|fila| fila.learned_at),
+            ),
+            _ => (subject.label().to_string(), None),
+        };
+        senales.push(crate::alerts::Signal::Seen(SeenSignal {
+            subject,
+            subject_label: label,
+            learned: aprendido.is_some() || app.config.alerts.learning_days == 0,
+            learned_at: aprendido,
+            items,
+        }));
+    }
+    senales
+}
+
+/// Traduce el sujeto del histórico al del motor de alertas.
+fn sujeto_de_alerta(subject: crate::history::Subject) -> Option<crate::alerts::Subject> {
+    Some(match subject {
+        crate::history::Subject::Device(id) => crate::alerts::Subject::Device(id),
+        crate::history::Subject::Host => crate::alerts::Subject::Host,
+        crate::history::Subject::Network => crate::alerts::Subject::Network,
+        crate::history::Subject::Other => return None,
+    })
+}
+
+/// Etiqueta visible de una clave del inventario (el motor la sanea y capitaliza).
+fn etiqueta_de_inventario(kind: crate::history::SeenKind, key: &str) -> String {
+    match kind {
+        crate::history::SeenKind::Country => key.to_ascii_uppercase(),
+        _ => key.to_string(),
+    }
+}
+
+/// Evalúa una hora recién consolidada en vivo para «más tráfico de lo habitual».
+fn evaluar_hora_cerrada(app: &mut App, repo: &mut Repo, hora: i64) {
+    if !app.config.history.enabled {
+        return;
+    }
+    let params = app.config.alerts.params();
+    let Some(motor) = app.alert_engine.as_mut() else {
+        return;
+    };
+    match repo.hour_baseline(hora, &params.traffic_high) {
+        Ok(subjects) if !subjects.is_empty() => {
+            let senal = crate::alerts::Signal::HourClosed(crate::alerts::HourClosedSignal {
+                hour_start: hora,
+                subjects,
+            });
+            let acciones = motor.handle(senal, std::time::SystemTime::now());
+            aplicar_acciones_alertas(app, repo, acciones);
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, hora, "no se pudo leer la línea base de la hora"),
+    }
+}
+
+/// Actualiza el aprendizaje al consolidar un día local (§4.3).
+fn actualizar_aprendizaje(app: &mut App, repo: &mut Repo, dia: crate::history::LocalDay) {
+    let params = crate::alerts::LearningParams {
+        learning_days: app.config.alerts.learning_days,
+    };
+    match repo.update_learning(dia, &params) {
+        Ok(cambios) if !cambios.is_empty() => match repo.learning_rows() {
+            Ok(filas) => {
+                if let Some(motor) = app.alert_engine.as_mut() {
+                    motor.set_learning(filas);
+                }
+                app.alerts.mark_dirty();
+            }
+            Err(err) => tracing::warn!(%err, "no se pudo recargar el aprendizaje"),
+        },
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(%err, dia = dia.aaaammdd(), "no se pudo actualizar el aprendizaje")
+        }
+    }
+}
+
+/// Purga las alertas, los silencios y el inventario del propio equipo (§7.15).
+fn purgar_alertas(app: &mut App, repo: &mut Repo) {
+    let ahora = std::time::SystemTime::now();
+    if let Err(err) = repo.purge_alerts(ahora, app.config.alerts.retention_days) {
+        tracing::warn!(%err, "no se pudieron purgar las alertas");
+    }
+    let corte = ahora
+        .checked_sub(std::time::Duration::from_secs(
+            u64::from(app.config.history.day_days) * 86_400,
+        ))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    if let Err(err) = repo.prune_host_seen(corte) {
+        tracing::warn!(%err, "no se pudo purgar el inventario del propio equipo");
+    }
+    app.alerts.mark_dirty();
+    // El tamaño tras la purga alimenta la regla db_size (§7.8).
+    muestrear_salud(app, repo);
 }
 
 #[cfg(test)]
@@ -1315,11 +2086,7 @@ mod tests {
                     connections: 1,
                 },
             }],
-            seen: vec![SeenItem {
-                device_id,
-                kind: SeenKind::App,
-                key: "youtube".to_string(),
-            }],
+            seen: vec![SeenItem::de_equipo(device_id, SeenKind::App, "youtube")],
             overflow: 0,
         }
     }
@@ -1419,6 +2186,19 @@ mod tests {
         assert!(
             app.rollup_dropped_warned,
             "se avisa una sola vez del descarte"
+        );
+    }
+
+    #[test]
+    fn abrir_equipo_desde_alertas_cambia_a_equipos_y_abre_el_detalle() {
+        let (_dir, mut repo, device_id) = repo_con_equipo();
+        let mut app = app_prueba();
+        app.tab = crate::tui::app::Tab::Alertas;
+        aplicar_accion(Action::OpenDetail { device_id }, &mut app, &mut repo);
+        assert_eq!(app.tab, crate::tui::app::Tab::Equipos);
+        assert_eq!(
+            app.detail.as_ref().map(|detalle| detalle.device_id),
+            Some(device_id)
         );
     }
 }

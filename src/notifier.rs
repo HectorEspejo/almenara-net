@@ -57,7 +57,7 @@ impl Notification {
 pub struct Notifier {
     buffer: VecDeque<Notification>,
     capacity: usize,
-    current: Option<(Notification, Instant)>,
+    current: Option<(Notification, Instant, Duration)>,
     ttl: Duration,
 }
 
@@ -85,6 +85,14 @@ impl Notifier {
 
     /// Añade una notificación. Si el buffer está lleno se descarta la más antigua.
     pub fn push(&mut self, level: Level, message: impl Into<String>) {
+        self.push_with_ttl(level, message, self.ttl);
+    }
+
+    /// Añade una notificación que permanece visible un tiempo concreto.
+    ///
+    /// La usa la F6 para el aviso de una línea de las alertas importantes
+    /// (10 s, §6); el resto siguen usando el TTL por defecto.
+    pub fn push_with_ttl(&mut self, level: Level, message: impl Into<String>, ttl: Duration) {
         if self.buffer.len() == self.capacity {
             self.buffer.pop_front();
         }
@@ -93,13 +101,13 @@ impl Notifier {
             .buffer
             .back()
             .cloned()
-            .map(|notification| (notification, Instant::now()));
+            .map(|notification| (notification, Instant::now(), ttl));
     }
 
     /// Elimina de la vista la notificación caducada.
     pub fn tick(&mut self) {
-        if let Some((_, shown_at)) = &self.current {
-            if shown_at.elapsed() >= self.ttl {
+        if let Some((_, shown_at, ttl)) = &self.current {
+            if shown_at.elapsed() >= *ttl {
                 self.current = None;
             }
         }
@@ -107,7 +115,9 @@ impl Notifier {
 
     /// Devuelve la notificación que debe mostrarse ahora, si la hay.
     pub fn current(&self) -> Option<&Notification> {
-        self.current.as_ref().map(|(notification, _)| notification)
+        self.current
+            .as_ref()
+            .map(|(notification, _, _)| notification)
     }
 
     /// Número de notificaciones guardadas en el buffer.

@@ -691,7 +691,14 @@ pub async fn run_scan(
         );
 
         let objetivos = state.select_for_active_scan(&hosts, manual);
+        let inicio_escaneo_activo = Instant::now();
         let escaneos = discovery::scan_hosts_active(&objetivos, &options.top_ports).await;
+        // Medición del §8 de F2 (port scan de TOP-20 sobre los hosts del ciclo).
+        tracing::debug!(
+            hosts = objetivos.len(),
+            duracion_ms = inicio_escaneo_activo.elapsed().as_millis(),
+            "port scan activo completado"
+        );
         for escaneo in escaneos {
             // Sin un port scan real no se pueden deducir cierres de servicios:
             // los puertos no escaneados no deben interpretarse como cerrados.
@@ -1396,6 +1403,12 @@ pub struct ReconciledEvent {
     pub ip: String,
     /// Etiqueta visible (alias/hostname o IP).
     pub label: String,
+    /// FK al equipo del evento (F6: señal para el motor de alertas).
+    pub device_id: i64,
+    /// Detalles JSON del evento, tal como se persistieron (F6).
+    pub details: String,
+    /// DEVICE_EVENTS.id del evento creado (referencia lógica de la alerta, F6).
+    pub event_id: Option<i64>,
 }
 
 /// Resultado de reconciliar un escaneo con la base de datos.
@@ -1508,11 +1521,15 @@ fn registrar_evento(
     events: &mut Vec<ReconciledEvent>,
     errors: &mut Vec<String>,
 ) {
-    match repo.append_event(device_id, evento.tipo, &evento.details.to_string()) {
-        Ok(()) => events.push(ReconciledEvent {
+    let details = evento.details.to_string();
+    match repo.append_event_id(device_id, evento.tipo, &details) {
+        Ok(event_id) => events.push(ReconciledEvent {
             event_type: evento.tipo,
             ip: host.ip.to_string(),
             label: etiqueta.to_string(),
+            device_id,
+            details,
+            event_id: Some(event_id),
         }),
         Err(err) => errors.push(format!(
             "No se pudo registrar {} de {}: {err}",
@@ -1564,31 +1581,12 @@ fn eventos_de_servicios(
         }
     };
 
-    let escaneados: HashSet<u16> = host.port_scan_ports.iter().copied().collect();
-    let mut ultimos_eventos: HashMap<u16, EventType> = HashMap::new();
-    for servicio in &conocidos {
-        if servicio.protocol != Protocol::Tcp || !escaneados.contains(&servicio.port) {
-            continue;
-        }
-        match repo.last_service_event(device_id, servicio.port, servicio.protocol) {
-            Ok(Some(evento)) => {
-                ultimos_eventos.insert(servicio.port, evento.event_type);
-            }
-            Ok(None) => {}
-            Err(err) => errores.push(format!(
-                "No se pudo leer el último evento del servicio {} de {}: {err}",
-                servicio.port, host.ip
-            )),
-        }
-    }
-
     Changes::services(
         ya_escaneado,
         passive_only,
         &host.port_scan_ports,
         &host.port_scan_services,
         &conocidos,
-        &ultimos_eventos,
     )
 }
 
@@ -1706,15 +1704,18 @@ pub fn reconcile(
                         "reason": motivo,
                     })
                     .to_string();
-                    if let Err(err) =
-                        repo.append_event(anterior.id, EventType::MacChanged, &details)
-                    {
-                        errors.push(format!("No se pudo registrar mac_changed: {err}"));
+                    let mut event_id = None;
+                    match repo.append_event_id(anterior.id, EventType::MacChanged, &details) {
+                        Ok(id) => event_id = Some(id),
+                        Err(err) => errors.push(format!("No se pudo registrar mac_changed: {err}")),
                     }
                     events.push(ReconciledEvent {
                         event_type: EventType::MacChanged,
                         ip: host.ip.to_string(),
                         label: anterior.display_name().to_string(),
+                        device_id: anterior.id,
+                        details,
+                        event_id,
                     });
                     fusionados.insert(anterior.id);
                     previos_por_mac.remove(&anterior.mac);
@@ -1835,39 +1836,54 @@ pub fn reconcile(
                         "mac_random": mac_random,
                     })
                     .to_string();
-                    if let Err(err) = repo.append_event(device_id, EventType::New, &details) {
-                        errors.push(format!("No se pudo registrar new: {err}"));
+                    let mut event_id = None;
+                    match repo.append_event_id(device_id, EventType::New, &details) {
+                        Ok(id) => event_id = Some(id),
+                        Err(err) => errors.push(format!("No se pudo registrar new: {err}")),
                     }
                     events.push(ReconciledEvent {
                         event_type: EventType::New,
                         ip: host.ip.to_string(),
                         label: etiqueta.clone(),
+                        device_id,
+                        details,
+                        event_id,
                     });
                 }
                 if let Some((antes, despues)) = &cambios.ip_changed {
                     let details =
                         serde_json::json!({"before": antes, "after": despues}).to_string();
-                    if let Err(err) = repo.append_event(device_id, EventType::IpChanged, &details) {
-                        errors.push(format!("No se pudo registrar ip_changed: {err}"));
+                    let mut event_id = None;
+                    match repo.append_event_id(device_id, EventType::IpChanged, &details) {
+                        Ok(id) => event_id = Some(id),
+                        Err(err) => errors.push(format!("No se pudo registrar ip_changed: {err}")),
                     }
                     events.push(ReconciledEvent {
                         event_type: EventType::IpChanged,
                         ip: despues.clone(),
                         label: etiqueta.clone(),
+                        device_id,
+                        details,
+                        event_id,
                     });
                 }
                 if let Some((antes, despues)) = &cambios.hostname_changed {
                     let details =
                         serde_json::json!({"before": antes, "after": despues}).to_string();
-                    if let Err(err) =
-                        repo.append_event(device_id, EventType::HostnameChanged, &details)
-                    {
-                        errors.push(format!("No se pudo registrar hostname_changed: {err}"));
+                    let mut event_id = None;
+                    match repo.append_event_id(device_id, EventType::HostnameChanged, &details) {
+                        Ok(id) => event_id = Some(id),
+                        Err(err) => {
+                            errors.push(format!("No se pudo registrar hostname_changed: {err}"));
+                        }
                     }
                     events.push(ReconciledEvent {
                         event_type: EventType::HostnameChanged,
                         ip: host.ip.to_string(),
                         label: etiqueta.clone(),
+                        device_id,
+                        details,
+                        event_id,
                     });
                 }
 
@@ -1986,7 +2002,7 @@ pub fn reconcile(
                 // repita en el siguiente escaneo.
                 for (port, protocol) in puertos_cerrados {
                     if let Err(err) =
-                        repo.mark_service_closed(device_id, port, protocol, stale_before)
+                        repo.mark_service_closed(device_id, port, protocol, ahora_sistema)
                     {
                         errors.push(format!(
                             "No se pudo marcar cerrado el servicio {port}/{}: {err}",
@@ -2108,13 +2124,18 @@ pub fn reconcile(
                     "last_seen": &device.last_seen,
                 })
                 .to_string();
-                if let Err(err) = repo.append_event(device.id, EventType::Disappeared, &details) {
-                    errors.push(format!("No se pudo registrar disappeared: {err}"));
+                let mut event_id = None;
+                match repo.append_event_id(device.id, EventType::Disappeared, &details) {
+                    Ok(id) => event_id = Some(id),
+                    Err(err) => errors.push(format!("No se pudo registrar disappeared: {err}")),
                 }
                 events.push(ReconciledEvent {
                     event_type: EventType::Disappeared,
                     ip: device.ip.clone(),
                     label: device.display_name().to_string(),
+                    device_id: device.id,
+                    details,
+                    event_id,
                 });
             }
             Err(err) => errors.push(format!(
@@ -3081,9 +3102,13 @@ mod tests {
             .into_iter()
             .find(|servicio| servicio.port == 22)
             .expect("el puerto cerrado sigue persistido");
-        assert_eq!(
+        assert!(
+            servicio_cerrado.is_closed(),
+            "el cierre se marca con closed_at (§7.12)"
+        );
+        assert_ne!(
             servicio_cerrado.last_seen, "2998-12-31T23:59:59Z",
-            "el cierre se materializa como STALE (un segundo bajo el umbral)"
+            "last_seen ya no se mueve al cerrar: sigue siendo la última vez abierto"
         );
 
         // Repetir el escaneo con el 22 cerrado no repite service_gone.
