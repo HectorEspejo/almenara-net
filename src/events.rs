@@ -2,11 +2,12 @@
 //!
 //! La tarea de escaneo publica [`AppEvent`] en un canal `tokio::sync::broadcast`
 //! (el bus de eventos); el bucle de la TUI los consume. Las órdenes de la TUI
-//! hacia el escáner viajan por un canal `mpsc`.
+//! hacia el escáner y hacia el agregador de tráfico viajan por canales `mpsc`.
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::notifier::Level;
+use crate::rankings::{DeviceShare, Dimension, Window};
 use crate::scanner::ScanReport;
 use crate::traffic::{DeviceRef, TrafficUpdate};
 
@@ -23,8 +24,8 @@ pub enum AppEvent {
     /// El payload es el informe de red; la reconciliación con la base de datos la
     /// hace el bucle de la TUI antes de actualizar la vista.
     Devices(Box<ScanReport>),
-    /// Actualización periódica del tráfico en vivo (agregados, caché de
-    /// conexiones y estado de la captura). Se publica una vez por segundo.
+    /// Actualización periódica del tráfico en vivo (agregados, conexiones,
+    /// rankings y estado de la captura). Se publica una vez por segundo.
     Traffic(Box<TrafficUpdate>),
     /// Aviso asíncrono del subsistema de captura (filtro BPF inválido, límite
     /// max_pps alcanzado, descartes...). Se muestra como notificación normal.
@@ -48,10 +49,23 @@ pub enum ScanCommand {
 }
 
 /// Órdenes que la TUI envía a la tarea de tráfico.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TrafficCommand {
-    /// Sustituye el mapa de dispositivos usado para atribuir tráfico por IP.
+    /// Sustituye el mapa de dispositivos usado para atribuir tráfico por IP,
+    /// junto con sus servicios de F2 (para el catálogo de red local).
     UpdateDevices(Vec<DeviceRef>),
+    /// Petición del panel «¿Quién lo usa?»: el agregador responde al momento
+    /// con los equipos que usan una clave y sus porcentajes.
+    WhoUses {
+        /// Dimensión del ranking.
+        dimension: Dimension,
+        /// Clave de la fila del ranking.
+        key: String,
+        /// Ventana consultada.
+        window: Window,
+        /// Canal de respuesta (la TUI espera el vector).
+        reply: oneshot::Sender<Vec<DeviceShare>>,
+    },
     /// Termina la tarea de tráfico y para la captura.
     Stop,
 }
@@ -108,7 +122,39 @@ mod tests {
             otro => panic!("orden inesperada: {otro:?}"),
         }
         assert!(tx.send(TrafficCommand::Stop).await.is_ok());
-        assert_eq!(rx.recv().await, Some(TrafficCommand::Stop));
+        match rx.recv().await {
+            Some(TrafficCommand::Stop) => {}
+            otro => panic!("orden inesperada: {otro:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn quien_lo_usa_responde_por_oneshot() {
+        let (tx, mut rx) = traffic_command_channel();
+        let (respuesta_tx, respuesta_rx) = oneshot::channel();
+        tx.send(TrafficCommand::WhoUses {
+            dimension: Dimension::App,
+            key: "youtube".to_string(),
+            window: Window::Sixty,
+            reply: respuesta_tx,
+        })
+        .await
+        .expect("enviar petición");
+        match rx.recv().await {
+            Some(TrafficCommand::WhoUses {
+                dimension,
+                key,
+                window,
+                reply,
+            }) => {
+                assert_eq!(dimension, Dimension::App);
+                assert_eq!(key, "youtube");
+                assert_eq!(window, Window::Sixty);
+                reply.send(Vec::new()).expect("responder");
+                assert!(respuesta_rx.await.expect("respuesta").is_empty());
+            }
+            otro => panic!("orden inesperada: {otro:?}"),
+        }
     }
 
     #[test]

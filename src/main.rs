@@ -16,9 +16,12 @@ mod config;
 mod discovery;
 mod error;
 mod events;
+mod identify;
+mod inference;
 mod logging;
 mod notifier;
 mod oui;
+mod rankings;
 mod repo;
 mod scanner;
 mod traffic;
@@ -41,8 +44,9 @@ use tui::theme::Theme;
     about = "Monitor de red en TUI para Linux: descubre los equipos de la red local",
     long_about = "Almenara descubre los equipos de la red local (ARP, ICMP, reverse DNS y OUI), \
                   guarda el inventario en SQLite y lo muestra en una TUI. \
-                  Fase 3: tráfico en vivo con AF_PACKET + TPACKET_V3, conexiones activas \
-                  y detalle de equipo.",
+                  Fase 4: captura en vivo con AF_PACKET + TPACKET_V3, inferencia de protocolos, \
+                  apps y names, rankings por destino/app/categoría/protocolo/proceso y \
+                  «¿Quién lo usa?».",
     disable_help_flag = true,
     disable_version_flag = true,
     help_template = "Ayuda de {name} — versión {version}\n\n{about-with-newline}\nUso: {usage}\n\nOpciones:\n{options}"
@@ -153,6 +157,17 @@ async fn ejecutar(cli: Cli) -> Result<()> {
         Ok(_) => {}
         Err(err) => tracing::warn!(%err, "no se pudieron purgar las conexiones caducadas"),
     }
+    // Arranque en caliente de la caché IP → nombre de Fase 4.
+    let nombres_cache = match repo.list_names(std::time::SystemTime::now()) {
+        Ok(entradas) => {
+            tracing::info!(entradas = entradas.len(), "caché de nombres cargada");
+            entradas
+        }
+        Err(err) => {
+            tracing::warn!(%err, "no se pudo leer NAME_CACHE");
+            Vec::new()
+        }
+    };
 
     // 5) Detección y persistencia inicial de interfaces, datos persistidos y poda.
     match scanner::persistir_interfaces_iniciales(&mut repo) {
@@ -217,7 +232,7 @@ async fn ejecutar(cli: Cli) -> Result<()> {
     if config.scan.passive_only {
         app.push_notification(
             Level::Warn,
-            "Modo pasivo: [scan].passive_only = true. Sin ARP scan, ICMP, mDNS browse, M-SEARCH, port scan ni banner grabbing",
+            "Modo pasivo: [scan].passive_only = true. Sin ARP scan, ICMP, mDNS browse, M-SEARCH, port scan, banner grabbing, NetBIOS ni DNS inverso; la captura pasiva sigue activa",
         );
     }
 
@@ -232,12 +247,12 @@ async fn ejecutar(cli: Cli) -> Result<()> {
         config::InterfacesSetting::Auto => interfaces_detectadas
             .iter()
             .filter(|iface| iface.is_up && iface.ipv4.is_some())
-            .map(|iface| capture::CaptureInterface::new(iface.name.clone(), iface.ipv4))
+            .map(interfaz_de_captura)
             .collect(),
         config::InterfacesSetting::Names(nombres) => interfaces_detectadas
             .iter()
             .filter(|iface| iface.is_up && iface.ipv4.is_some() && nombres.contains(&iface.name))
-            .map(|iface| capture::CaptureInterface::new(iface.name.clone(), iface.ipv4))
+            .map(interfaz_de_captura)
             .collect(),
     };
     let mut ips_propias: std::collections::HashSet<std::net::IpAddr> = interfaces_detectadas
@@ -250,30 +265,30 @@ async fn ejecutar(cli: Cli) -> Result<()> {
 
     // 6b) Monitor de tráfico en vivo (Fase 3). La captura de paquetes requiere
     // CAP_NET_RAW; las conexiones de /proc/net/* y conntrack funcionan igualmente.
-    let dispositivos_trafico: Vec<traffic::DeviceRef> = app
-        .devices
-        .iter()
-        .map(|device| traffic::DeviceRef::new(device.id, device.ip.clone()))
-        .collect();
-    let (traffic_handle, estado_captura, avisos_captura) = traffic::spawn(
+    let dispositivos_trafico = dispositivos_para_trafico(&app, &repo);
+    let inicio_trafico = traffic::spawn(
         &config,
         interfaces_captura,
         ips_propias,
         dispositivos_trafico.clone(),
+        nombres_cache,
         capabilities.raw_sockets,
         event_tx.clone(),
     );
-    app.traffic.capture = estado_captura;
+    app.traffic.capture = inicio_trafico.status;
     app.set_traffic_seed(snapshots_trafico);
-    app.traffic_command_tx = Some(traffic_handle.command_tx.clone());
-    for (nivel, mensaje) in avisos_captura {
+    app.traffic_command_tx = Some(inicio_trafico.handle.command_tx.clone());
+    for (nivel, mensaje) in inicio_trafico.notices {
         app.push_notification(nivel, mensaje);
     }
-    let _ = traffic_handle
-        .command_tx
-        .try_send(events::TrafficCommand::UpdateDevices(dispositivos_trafico));
-    let traffic_command_tx = traffic_handle.command_tx.clone();
-    let mut traffic_join = traffic_handle.join;
+    let catalog_counts = inicio_trafico.catalog;
+    let ipdb_date = inicio_trafico.ipdb_date;
+    app.catalog_counts = catalog_counts;
+    app.ipdb_date = ipdb_date;
+    let observado = inicio_trafico.observed;
+    let identidad = inicio_trafico.identity;
+    let traffic_command_tx = inicio_trafico.handle.command_tx.clone();
+    let mut traffic_join = inicio_trafico.handle.join;
     let scan_tx = event_tx.clone();
     let scan_task = tokio::spawn(async move {
         let mut command_rx = command_rx;
@@ -282,8 +297,15 @@ async fn ejecutar(cli: Cli) -> Result<()> {
         let mut manual = false;
         loop {
             let _ = scan_tx.send(AppEvent::ScanStarted);
-            let informe =
-                scanner::run_scan(&scan_options, &mut state, &mut discovery_state, manual).await;
+            let informe = scanner::run_scan(
+                &scan_options,
+                &mut state,
+                &mut discovery_state,
+                manual,
+                &observado,
+                &identidad,
+            )
+            .await;
             manual = false;
             // Los avisos no fatales del ciclo también van al log de fichero para
             // poder diagnosticar problemas de descubrimiento sin la TUI abierta.
@@ -321,6 +343,48 @@ async fn ejecutar(cli: Cli) -> Result<()> {
     }
     tracing::info!("Almenara finalizado");
     resultado
+}
+
+/// Construye la interfaz de captura con todos sus datos de red.
+fn interfaz_de_captura(
+    iface: &scanner::interfaces::DetectedInterface,
+) -> capture::CaptureInterface {
+    capture::CaptureInterface::with_details(
+        iface.name.clone(),
+        iface.ipv4,
+        iface.mac.clone(),
+        iface.netmask,
+        iface.gateway,
+    )
+}
+
+/// Referencias de dispositivo con sus servicios de F2 para el agregador de tráfico.
+fn dispositivos_para_trafico(app: &App, repo: &Repo) -> Vec<traffic::DeviceRef> {
+    app.devices
+        .iter()
+        .map(|device| {
+            let servicios = repo
+                .list_services(device.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|servicio| traffic::ServiceRef {
+                    port: servicio.port,
+                    protocol: match servicio.protocol {
+                        repo::Protocol::Tcp => capture::Protocol::Tcp,
+                        repo::Protocol::Udp => capture::Protocol::Udp,
+                    },
+                    service: servicio.service.clone(),
+                })
+                .collect();
+            traffic::DeviceRef::with_details(
+                device.id,
+                device.ip.clone(),
+                device.mac.clone(),
+                Some(device.display_name().to_string()),
+                servicios,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,16 +1,18 @@
 # Almenara
 
 Monitor de red en TUI para Linux: descubre los equipos conectados a la red local, qué servicios
-ofrecen y **qué tráfico generan en vivo**. **Fase 3: tráfico en vivo (pasivo + local)** — captura
-de paquetes con AF_PACKET + TPACKET_V3 (sin libpcap), agregación por dispositivo, conexiones
-activas con proceso local, snapshot persistente y pestañas Tráfico/Conexiones con detalle de
-equipo — sobre la base de las fases 1 y 2 (descubrimiento ARP/ICMP/DNS/OUI, mDNS, SSDP, DHCP,
-NetBIOS, port scan, fingerprint y clasificación).
+ofrecen, **qué tráfico generan en vivo** y **quién está detrás de cada conexión**. **Fase 4:
+protocolos, apps y top talkers** — un motor de inferencia identifica el protocolo de aplicación, el
+nombre del servidor (SNI de TLS y QUIC, `Host` de HTTP, respuestas DNS), la app y categoría del
+catálogo, la huella JA4 del cliente y el rol cliente/servidor, y añade rankings por destino, app,
+categoría, protocolo y proceso con el panel «¿Quién lo usa?» — sobre la base de las fases 1 a 3
+(descubrimiento ARP/ICMP/DNS/OUI, mDNS, SSDP, DHCP, NetBIOS, port scan, fingerprint,
+clasificación, captura AF_PACKET + TPACKET_V3 y tráfico en vivo).
 
 ## Estado del proyecto
 
-**Fase 1 implementada**, **Fase 2 implementada** y **Fase 3 implementada** (pendiente de entrega
-del informe de implementación al analista funcional). Documentación:
+**Fases 1 a 4 implementadas** (Fase 4 pendiente de entrega del informe de implementación al
+analista funcional). Documentación:
 
 - Fase 1: [informe de fase](docs/fase1/almenara-fase1-informe.md),
   [checklist](docs/fase1/almenara-fase1-checklist.md) e
@@ -21,6 +23,30 @@ del informe de implementación al analista funcional). Documentación:
 - Fase 3: [informe de fase](docs/fase3/almenara-fase3-informe.md),
   [checklist](docs/fase3/almenara-fase3-checklist.md) e
   [informe de implementación](docs/fase3/almenara-fase3-implementacion.md).
+- Fase 4: [informe de fase](docs/fase4/almenara-fase4-informe.md),
+  [checklist](docs/fase4/almenara-fase4-checklist.md) e
+  [informe de implementación](docs/fase4/almenara-fase4-implementacion.md).
+
+## Novedades de la Fase 4
+
+- **Etiqueta cada conexión**: protocolo de aplicación (TLS, QUIC, HTTP, DNS, SSH…), nombre del
+  servidor (SNI de TLS/QUIC, `Host` de HTTP o caché IP → nombre alimentada por las respuestas
+  DNS), app y categoría del catálogo, fuente de cada dato y JA4 del cliente.
+- **Rol cliente/servidor** deducido del SYN, de los sockets en escucha y de los puertos; las
+  etiquetas solo cambian a una evidencia más fuerte.
+- **Catálogo propio de 162 apps en 12 categorías** embebido, ampliable con `apps.toml`, con
+  reglas por dominio (sufijo más largo), ASN y puerto, y apps de red local para los servicios de
+  la fase 2.
+- **Destinos sin red**: dominio registrable (Public Suffix List embebida) y organización y país
+  con las bases DB-IP Lite embebidas (IPv4 e IPv6).
+- **Top talkers**: rankings por equipo, destino, app, categoría, protocolo y proceso local en
+  ventanas de 60 s, 5 min y sesión, con % de tráfico sin identificar y panel «¿Quién lo usa?».
+- **Identificación de equipos** con huella DHCP, modelo mDNS/UPnP, User-Agent de HTTP en claro,
+  MAC privadas y `mac_changed` v2; la **captura (ARP, DHCP, tramas) crea equipos** como fuente L2.
+- **Privacidad**: el payload nunca sale del hilo de captura ni se persiste; los dominios solo
+  viven en tablas calientes y fuera de los logs por encima de `debug`.
+- `passive_only` ahora significa **no consultar a nadie**: sin NetBIOS ni DNS inverso, y nunca se
+  hace DNS inverso de IPs de Internet.
 
 ## Novedades de la Fase 3
 
@@ -50,6 +76,8 @@ del informe de implementación al analista funcional). Documentación:
 - Linux con kernel 3.2 o superior (TPACKET_V3).
 - Rust 1.88 o superior con `cargo`.
 - Conexión a red en el primer `cargo build` para descargar y compilar las dependencias.
+- Datos embebidos en el binario (catálogo, Public Suffix List y ~18 MB de bases DB-IP Lite): la
+  aplicación **no descarga nada en ejecución**.
 - Terminal de al menos 80x24.
 - Para capturar paquetes: `CAP_NET_RAW` (ver más abajo). El resto de la aplicación funciona sin
   privilegios.
@@ -112,7 +140,7 @@ aplicación nunca eleva privilegios por sí misma.
 ## Configuración
 
 Si el fichero de configuración no existe, se crea una plantilla con los valores por defecto al
-arrancar (y se usan esos valores aunque la creación no sea posible). Ejemplo actualizado a Fase 3:
+arrancar (y se usan esos valores aunque la creación no sea posible). Ejemplo actualizado a Fase 4:
 
 ```toml
 [scan]
@@ -121,17 +149,18 @@ ranges = ["192.168.1.0/24"]      # rangos IPv4 CIDR a escanear (máx. 1024 IPs p
 interval_s = 60                  # intervalo entre escaneos (mínimo 10)
 icmp_timeout_ms = 500            # timeout ICMP y reverse DNS (100-5000)
 offline_after_cycles = 3         # ciclos sin ver un equipo antes de marcarlo offline
-passive_only = false             # true desactiva todo el tráfico activo (captura pasiva permitida)
+passive_only = false             # true = solo escuchar: sin escaneo, NetBIOS ni DNS inverso
 top_ports = [22, 23, 53, 80, 139, 443, 445, 515, 631, 1883, 3389, 5000, 5353, 5555, 8008, 8080, 8443, 9100, 32400]
 dhcp_lease_paths = []            # rutas manuales adicionales de ficheros de leases DHCP
 
 [capture]
 enabled = true                   # activa la captura de paquetes al arrancar
 filter = ""                      # BPF clásico (por ejemplo "not port 22"); vacío = sin filtro
-inspect_payload = false          # false: payload descartado al instante (por defecto)
 max_pps = 0                      # 0 = sin límite; aviso una vez por minuto al alcanzarlo
-dns_attribution = true           # extrae QNAME de DNS (puerto 53)
-sni_attribution = true           # extrae SNI de TLS ClientHello (puerto 443)
+
+[inference]
+enabled = true                   # inferencia activa (lee DNS/TLS/HTTP/QUIC; no guarda contenido)
+apps_file = "~/.config/almenara/apps.toml"  # reglas propias de apps (opcional)
 
 [storage]
 db_path = "~/.local/share/almenara/data.db"
@@ -141,57 +170,77 @@ events_retention_days = 90       # retención de DEVICE_EVENTS y de servicios ST
 theme = "default"
 no_color = false
 list_view = "flat"               # "flat" (plana) o "grouped" (agrupada por categoría)
+traffic_group = "device"         # device | destination | app | category | protocol | process
 ```
 
 - `capture.filter`: expresión de **BPF clásico** (estilo tcpdump): `tcp`, `udp`, `icmp`,
   `ip`, `ip6`, `arp`, `port N`, `portrange A-B`, `host IP`, `net CIDR`, con `and`/`or`/`not`
   y paréntesis. Se evalúa en el kernel; no hay filtros propios en userspace.
-- `capture.inspect_payload = true` activa la inspección acotada de payload (solo QNAME/SNI); el
-  payload nunca se guarda en SQLite.
 - `capture.max_pps`: 0 = sin límite. Al alcanzarlo se descartan paquetes y se avisa una vez por
   minuto; la barra muestra `límite N pps`.
+- `[inference].enabled = false` desactiva todo lo que lee por encima de las cabeceras de
+  transporte: solo quedan etiquetas por servicio de la fase 2, ASN, puerto y proceso.
+- `inference.apps_file`: fichero TOML con apps propias. Una app con la misma clave que una
+  embebida **la sustituye entera**; una clave nueva se añade; una entrada inválida se avisa y se
+  ignora sin afectar al resto (máximo 500 apps propias). Si el fichero no existe se ignora.
+- Las claves de la fase 3 `inspect_payload`, `dns_attribution` y `sni_attribution` ya no se
+  usan: si aparecen en el fichero se avisa una sola vez y se sigue el valor de
+  `[inference].enabled`.
 - Los valores inválidos se avisan y se sustituyen por los valores por defecto (la aplicación nunca
   deja de arrancar por un error de configuración).
 
 ## Modo pasivo
 
-Con `[scan].passive_only = true` la aplicación no emite tráfico activo, con independencia de si
-tiene `CAP_NET_RAW`:
+Con `[scan].passive_only = true` la aplicación **solo escucha: no consulta a nadie**, con
+independencia de si tiene `CAP_NET_RAW`:
 
 - **Desactiva**: ARP scan, barrido ICMP, browse mDNS activo, M-SEARCH SSDP, port scan, banner
-  grabbing y fingerprint de SO.
-- **Mantiene**: lectura de `/proc/net/arp`, escucha pasiva mDNS y SSDP, leases DHCP, NetBIOS,
-  reverse DNS y **captura pasiva de paquetes** (escuchar no emite tráfico).
+  grabbing, fingerprint de SO, **consultas NetBIOS** y **DNS inverso**.
+- **Mantiene**: lectura de `/proc/net/arp`, escucha pasiva mDNS y SSDP, leases DHCP, **captura
+  pasiva de paquetes** (escuchar no emite tráfico) y la captura como fuente L2 que crea equipos.
+- **Nunca**, ni en modo normal ni en pasivo, se hace DNS inverso de IPs de Internet.
+- Precedencia de hostname en pasivo: alias > mDNS > DHCP (lease o capturado) > último conocido.
 
 La barra de estado indica el modo en todo momento (`privilegiado`, `pasivo` o `degradado`) y, en
 terminales de 100 columnas o más, añade las líneas de captura y visibilidad
-(`visibilidad: propia + broadcast`).
+(`visibilidad: propia + broadcast`) y el estado de la inferencia (`inferencia: activa` /
+`inferencia: desactivada`).
 
 ## Uso de la TUI
 
-Pestañas: **Equipos · Tráfico · Conexiones · Histórico · Alertas · Config · Ayuda**. En Fase 3
-están operativas Equipos (plana o agrupada, con detalle master-detail), Tráfico (ranking top-10),
-Conexiones (tabla plana ordenable/filtrable con cabeceras), Config y Ayuda. Histórico (F5) y
-Alertas (F6) siguen mostrando su placeholder.
+Pestañas: **Equipos · Tráfico · Conexiones · Histórico · Alertas · Config · Ayuda**. En Fase 4
+están operativas Equipos (plana o agrupada, con detalle master-detail), Tráfico (rankings por
+dimensión y «¿Quién lo usa?»), Conexiones (tabla con protocolo, equipo, destino, app y panel de
+detalle), Config y Ayuda. Histórico (F5) y Alertas (F6) siguen mostrando su placeholder.
 
-En la pestaña Tráfico solo se listan equipos con actividad y se añade una fila **[host]** con el
-tráfico del propio equipo, que no pertenece al inventario: en una red conmutada lo normal es ver
-sobre todo tráfico propio y de difusión (mDNS/SSDP/broadcast), no el unicast entre terceros.
+En la pestaña Tráfico, `g` cicla la agrupación (equipo → destino → app → categoría → protocolo →
+proceso) y se guarda en `[ui].traffic_group`; `w` cicla la ventana (60 s → 5 min → sesión, sin
+persistir). `Enter` abre el panel **«¿Quién lo usa?»** sobre destino, app, categoría o protocolo;
+sobre un equipo abre su detalle y sobre un proceso abre Conexiones filtrada por ese proceso. El pie
+muestra siempre el total y el porcentaje de tráfico sin identificar. La agrupación por equipo
+mantiene la fila **[host]** con el tráfico del propio equipo, que no pertenece al inventario.
+
+En Conexiones, el destino es el lado servidor (con su nombre o, si no hay, la IP con organización y
+país) y el equipo es el lado cliente o el de la LAN; sin rol conocido la fila sale en orden canónico
+con `?` delante del destino. `i` alterna nombres ⇄ IPs y `v` abre el panel con las cabeceras y la
+identidad inferida (rol, fuentes, JA4 y proceso local).
 
 | Tecla | Acción |
 |-------|--------|
 | `h` `j` `k` `l` / flechas | mover la selección (j/k) o cambiar de pestaña (h/l) |
 | `Tab` / `Shift-Tab` | cambiar de pestaña; en el detalle, alternar el foco lista/detalle |
 | `1`-`7` | ir directamente a una pestaña |
-| `g` | alternar lista plana / agrupada por categoría (se persiste) |
+| `g` | Equipos: lista plana / agrupada. Tráfico: agrupar por equipo/destino/app/categoría/protocolo/proceso (se persiste) |
+| `w` | Tráfico: ventana 60 s → 5 min → sesión |
+| `Enter` | Equipos/Tráfico: detalle del equipo. Tráfico: «¿Quién lo usa?» en destino/app/categoría/protocolo; Conexiones filtradas en proceso |
+| `i` | Conexiones: alternar nombres ⇄ IPs |
+| `v` | Conexiones: panel con cabeceras, rol, fuentes, JA4 y proceso |
 | `t` | fijar o quitar el tipo de dispositivo manual (manda sobre el automático) |
-| `Enter` | detalle del equipo (Equipos) o drill-down desde el ranking (Tráfico) |
-| `v` | cabeceras IP/TCP de la conexión seleccionada (pestaña Conexiones) |
-| `s` / `f` | ordenar / filtrar (Equipos: columnas y filtro; Conexiones: columna y filtro) |
+| `s` / `f` | ordenar / filtrar (Equipos y Conexiones; en Tráfico `s` ordena el ranking) |
 | `r` | rescan manual |
-| `/` | buscar (Esc cierra la búsqueda) |
+| `/` | buscar (en Conexiones también por servidor, app y proceso; Esc cierra la búsqueda) |
 | `?` / `q` | ayuda / salir |
-| `Esc` | cerrar cabeceras, detalle o búsqueda; volver a Equipos |
+| `Esc` | cerrar panel, detalle o búsqueda; volver a Equipos |
 | `a` / `n` | editar alias / notas del equipo |
 
 Iconos por tipo de dispositivo: `[⌂]` gateway, `[▣]` PC/servidor/NAS, `[▯]` móvil/tablet,
@@ -201,8 +250,12 @@ multidifusión y `[?]` los extremos no inventariados (siempre en color atenuado)
 
 ## Tests y calidad
 
-Ejecuta `cargo test`, `cargo fmt --check` y `cargo clippy --all-targets -- -D warnings`. Los tests
-con replay de fichero pcap son condicionales a la feature no default `pcap` (preparada para F7):
+Ejecuta `cargo test`, `cargo fmt --check` y `cargo clippy --all-targets -- -D warnings`. La
+suite incluye tests unitarios de firmas, TLS, HTTP, DNS, JA4 (vectores oficiales de FoxIO), QUIC
+(apéndice A de RFC 9001 y RFC 9369), catálogo, dominio registrable, bases IP, caché de nombres,
+rankings, identificación de equipos y migración v3 → v4, además de replays de tráfico mixto con
+etiquetas esperadas (TLS partido, QUIC, DNS, DHCP y ARP). El replay condicional de la feature no
+default `pcap` se mantiene para la fase 7:
 
 ```bash
 cargo test --features pcap
@@ -211,13 +264,24 @@ cargo test --features pcap
 ## Datos y privacidad
 
 Se persisten datos técnicos de red: IP, MAC, hostname, fabricante, tipo de dispositivo, familia de
-SO estimada, puertos abiertos y banners saneados, además de los metadatos de tráfico de la Fase 3
-(agregados por dispositivo y conexiones con 5-tuple, estado y bytes). **El payload de los paquetes
-nunca se persiste** y no se envía información a terceros: todo el almacenamiento es local. Los
-eventos y servicios que dejan de verse se purgan según `events_retention_days`; las conexiones se
-purgan por timeout (TCP 300 s, TIME_WAIT/CLOSE_WAIT 60 s, UDP 60 s, ICMP 30 s).
+SO estimada y su fuente, modelo anunciado, huella y nombre DHCP, User-Agent truncado, puertos
+abiertos y banners saneados, además de los metadatos de tráfico (agregados por dispositivo y
+conexiones con 5-tuple, estado y bytes) y las **etiquetas derivadas** de la Fase 4 (protocolo de
+aplicación, nombre del servidor, app, categoría, fuentes y JA4).
 
-## Limitaciones de la Fase 3
+**El payload de los paquetes nunca se persiste** y no se envía información a terceros: todo el
+almacenamiento es local. La inferencia lee cabeceras DNS/TLS/HTTP/QUIC y los primeros bytes de cada
+flujo, pero los reensamblados y el payload descifrado se liberan en el hilo de captura en cuanto se
+extrae la etiqueta; se puede desactivar con `[inference].enabled = false`.
+
+Los nombres de dominio por equipo son, en la práctica, historial de navegación: solo viven en
+tablas calientes (`CONNECTIONS`, purgada por timeout, y `NAME_CACHE`, con caducidad de 1 h a 24 h)
+y en memoria (los rankings se pierden al cerrar). Los dominios, el SNI, el `Host` y el User-Agent
+solo aparecen en logs de nivel `debug` (no con `-v`). Los eventos y servicios que dejan de verse
+se purgan según `events_retention_days`; las conexiones se purgan por timeout (TCP 300 s,
+TIME_WAIT/CLOSE_WAIT 60 s, UDP 60 s, ICMP 30 s).
+
+## Limitaciones (fases 3 y 4)
 
 - **Visibilidad parcial en red conmutada**: se ve el 100 % del tráfico propio y de
   broadcast/multicast, pero del unicast entre terceros solo lo que llegue a la interfaz (sin
@@ -230,6 +294,34 @@ purgan por timeout (TCP 300 s, TIME_WAIT/CLOSE_WAIT 60 s, UDP 60 s, ICMP 30 s).
 - Los sparklines arrancan a cero y el último snapshot se usa como semilla; los números de la
   semilla no se mezclan con las series nuevas.
 - Histórico y Alertas siguen siendo placeholders (fases 5 y 6).
+- **Visibilidad del nombre en Fase 4**: DoH/DoT y ECH ocultan una parte del tráfico; sin SNI/Host
+  se etiqueta por caché DNS, ASN y puerto. En red conmutada el tráfico de terceros que no llega a
+  la interfaz no se etiqueta; el porcentaje de tráfico sin identificar se muestra siempre en el pie
+  de Tráfico.
+- **QUIC** solo se descifra para leer el ClientHello de los paquetes Initial (claves públicas
+  derivadas del DCID); el resto del flujo es opaco, como debe ser. Un Initial de versión
+  desconocida o corrupto se descarta con un contador.
+- El catálogo es propio y finito (162 apps): una app desconocida aparece como «Sin identificar» o
+  con el nombre del servidor. Se puede ampliar con `apps.toml`.
+- La organización y el país proceden de DB-IP Lite: son aproximados (país del registro) y las IPs
+ privadas/de enlace local no tienen información.
+- JA4 se calcula y se muestra, pero no hay base de firmas ni alertas por JA4 (fase 6).
+
+## Datos embebidos y atribuciones
+
+| Dato | Origen | Licencia |
+|------|--------|----------|
+| IP → ASN y organización | DB-IP Lite (IP to ASN Lite, 2026-11) | CC BY 4.0 — «IP Geolocation by DB-IP» ([db-ip.com](https://db-ip.com)) |
+| IP → país | DB-IP Lite (IP to Country Lite, 2026-11) | CC BY 4.0 — «IP Geolocation by DB-IP» ([db-ip.com](https://db-ip.com)) |
+| Dominio registrable | Public Suffix List vía el crate `psl` (Mozilla) | MPL 2.0 |
+| Catálogo de apps | Curación propia del proyecto (`data/catalogo.toml`) | MIT |
+| Firmas de protocolo, TLS, QUIC, DHCP y JA4 | Especificaciones públicas (RFC 9000/9001/9369, RFC 8446, RFC 1035, RFC 2131/2132, RFC 6762/6763) y JA4 de FoxIO | JA4 de cliente: BSD-3 |
+| OUI (fabricante de MAC) | `macaddr-ouidb` | Datos públicos IEEE |
+| Ordenación de OUI y bases IP | `scripts/actualizar-bases-ip.sh` (solo desarrollo) | — |
+
+Las bases DB-IP y la Public Suffix List van **embebidas en el binario**: la aplicación no descarga
+nada en tiempo de ejecución. Origen, fecha y licencia detallados en
+[`data/FUENTES.md`](data/FUENTES.md).
 
 ## Aviso legal
 

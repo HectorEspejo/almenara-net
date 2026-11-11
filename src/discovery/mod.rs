@@ -95,6 +95,8 @@ pub struct HostActiveScan {
     pub services: Vec<DetectedService>,
     /// Familia de SO estimada (None si no supera el umbral).
     pub os_family: Option<OsFamily>,
+    /// Puntuación de la huella TCP (0 si no se intentó el fingerprint).
+    pub os_score: u8,
     /// JSON del último fingerprint observado.
     pub last_fingerprint: Option<String>,
     /// Indica si se intentó fingerprint (para poder limpiar os_family si falla).
@@ -431,6 +433,7 @@ pub async fn scan_host_active(mac: &str, ip: Ipv4Addr, top_ports: &[u16]) -> Hos
         ip,
         services: servicios,
         os_family,
+        os_score: score,
         last_fingerprint,
         fingerprint_attempted,
         errors,

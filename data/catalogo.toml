@@ -1,0 +1,1565 @@
+# Catálogo de apps y categorías de Almenara (Fase 4, §7.9 del informe).
+#
+# Este fichero va embebido en el binario (include_str! en src/inference/catalog.rs).
+# El apps.toml del usuario (~/.config/almenara/apps.toml) usa la misma estructura:
+# una app con la misma "key" que una embebida la sustituye entera y una key nueva
+# se añade. Cada app embebida lleva un comentario "# origen:" con la procedencia
+# de la regla. Curación propia de Almenara (2026-11): no se copian listas públicas
+# de bloqueo ni de rastreo. Los dominios compartidos por varios servicios de un
+# proveedor (googleapis.com, gstatic.com, akamaized.net, cloudfront.net...) viven
+# en las apps genéricas de proveedor o CDN de la categoría "infrastructure".
+#
+# Formato:
+#   [[category]]  key, name, short
+#   [[app]]       key, name, category, domains, asn, ports, "# origen: ..."
+# Los dominios casan consigo mismos y con sus subdominios; gana el sufijo más
+# largo (music.youtube.com → YouTube Music antes que youtube.com → YouTube).
+
+[[category]]
+key = "streaming"
+name = "Vídeo y streaming"
+short = "Vídeo"
+
+[[category]]
+key = "music"
+name = "Música y audio"
+short = "Música"
+
+[[category]]
+key = "social"
+name = "Redes sociales"
+short = "Social"
+
+[[category]]
+key = "messaging"
+name = "Mensajería"
+short = "Mensajería"
+
+[[category]]
+key = "calls"
+name = "Videollamadas"
+short = "Llamadas"
+
+[[category]]
+key = "games"
+name = "Juegos"
+short = "Juegos"
+
+[[category]]
+key = "system"
+name = "Sistema y actualizaciones"
+short = "Sistema"
+
+[[category]]
+key = "cloud"
+name = "Nube y copias"
+short = "Nube"
+
+[[category]]
+key = "work"
+name = "Trabajo y desarrollo"
+short = "Trabajo"
+
+[[category]]
+key = "web"
+name = "Navegación, compras y banca"
+short = "Web"
+
+[[category]]
+key = "tracking"
+name = "Publicidad, rastreo y telemetría"
+short = "Rastreo"
+
+[[category]]
+key = "infrastructure"
+name = "Infraestructura"
+short = "Infraestr."
+
+[[category]]
+key = "lan"
+name = "Red local (especial: servicios de F2)"
+short = "Red local"
+
+# ── Vídeo y streaming (14) ──────────────────────────────────────────────────
+
+[[app]]
+key = "youtube"
+name = "YouTube"
+category = "streaming"
+domains = ["youtube.com", "googlevideo.com", "ytimg.com", "youtu.be", "youtube-nocookie.com"]
+asn = []
+ports = []
+# origen: dominios propios de YouTube (web, reproductor, CDN de vídeo y enlaces cortos); curación propia (2026-11)
+
+[[app]]
+key = "netflix"
+name = "Netflix"
+category = "streaming"
+domains = ["netflix.com", "nflxvideo.net", "nflxso.net", "nflximg.net", "nflxext.com"]
+asn = [2906]
+ports = []
+# origen: dominios y CDN propios de Netflix; ASN 2906 (Netflix Streaming Services), exclusivo del servicio; curación propia (2026-11)
+
+[[app]]
+key = "prime_video"
+name = "Prime Video"
+category = "streaming"
+domains = ["primevideo.com", "amazonvideo.com", "aiv-cdn.net"]
+asn = []
+ports = []
+# origen: dominios del servicio Prime Video y su CDN de vídeo; curación propia (2026-11)
+
+[[app]]
+key = "disney_plus"
+name = "Disney+"
+category = "streaming"
+domains = ["disneyplus.com", "dssott.com", "bamgrid.com"]
+asn = []
+ports = []
+# origen: dominios del servicio Disney+ (web, autenticación y entrega de vídeo); curación propia (2026-11)
+
+[[app]]
+key = "max"
+name = "Max"
+category = "streaming"
+domains = ["max.com", "hbomax.com", "hbomaxcdn.com"]
+asn = []
+ports = []
+# origen: dominios de Max y de su CDN heredada de HBO Max; curación propia (2026-11)
+
+[[app]]
+key = "twitch"
+name = "Twitch"
+category = "streaming"
+domains = ["twitch.tv", "ttvnw.net", "jtvnw.net", "ext-twitch.tv"]
+asn = []
+ports = []
+# origen: dominios de Twitch y sus redes de entrega ttvnw/jtvnw; curación propia (2026-11)
+
+[[app]]
+key = "movistar_plus"
+name = "Movistar Plus+"
+category = "streaming"
+domains = ["movistarplus.es", "movistarplus.com"]
+asn = []
+ports = []
+# origen: dominios del servicio Movistar Plus+; curación propia (2026-11)
+
+[[app]]
+key = "rtve_play"
+name = "RTVE Play"
+category = "streaming"
+domains = ["rtve.es", "rtveplay.com"]
+asn = []
+ports = []
+# origen: dominios de RTVE y su plataforma Play; curación propia (2026-11)
+
+[[app]]
+key = "atresplayer"
+name = "Atresplayer"
+category = "streaming"
+domains = ["atresplayer.com", "atresmedia.com"]
+asn = []
+ports = []
+# origen: dominios de Atresplayer y del grupo Atresmedia; curación propia (2026-11)
+
+[[app]]
+key = "mitele"
+name = "Mitele"
+category = "streaming"
+domains = ["mitele.es", "mitele.com"]
+asn = []
+ports = []
+# origen: dominios de la plataforma Mitele (Mediaset España); curación propia (2026-11)
+
+[[app]]
+key = "dazn"
+name = "DAZN"
+category = "streaming"
+domains = ["dazn.com", "dazn.es"]
+asn = []
+ports = []
+# origen: dominios de DAZN; curación propia (2026-11)
+
+[[app]]
+key = "filmin"
+name = "Filmin"
+category = "streaming"
+domains = ["filmin.es", "filmin.com"]
+asn = []
+ports = []
+# origen: dominios de Filmin; curación propia (2026-11)
+
+[[app]]
+key = "skyshowtime"
+name = "SkyShowtime"
+category = "streaming"
+domains = ["skyshowtime.com"]
+asn = []
+ports = []
+# origen: dominio del servicio SkyShowtime; curación propia (2026-11)
+
+[[app]]
+key = "apple_tv"
+name = "Apple TV+"
+category = "streaming"
+domains = ["tv.apple.com"]
+asn = []
+ports = []
+# origen: subdominio del reproductor de Apple TV+ (apple.com queda en Servicios de Apple); curación propia (2026-11)
+
+# ── Música y audio (8) ──────────────────────────────────────────────────────
+
+[[app]]
+key = "spotify"
+name = "Spotify"
+category = "music"
+domains = ["spotify.com", "scdn.co", "spotifycdn.com", "pscdn.co"]
+asn = []
+ports = []
+# origen: dominios de Spotify y sus CDN de audio scdn.co, spotifycdn.com y pscdn.co; curación propia (2026-11)
+
+[[app]]
+key = "apple_music"
+name = "Apple Music"
+category = "music"
+domains = ["music.apple.com"]
+asn = []
+ports = []
+# origen: subdominio del reproductor de Apple Music (apple.com queda en Servicios de Apple); curación propia (2026-11)
+
+[[app]]
+key = "amazon_music"
+name = "Amazon Music"
+category = "music"
+domains = ["music.amazon.com"]
+asn = []
+ports = []
+# origen: subdominio de Amazon Music (amazon.com queda en Amazon); curación propia (2026-11)
+
+[[app]]
+key = "youtube_music"
+name = "YouTube Music"
+category = "music"
+domains = ["music.youtube.com"]
+asn = []
+ports = []
+# origen: subdominio propio de YouTube Music; gana al sufijo youtube.com por ser más largo; curación propia (2026-11)
+
+[[app]]
+key = "deezer"
+name = "Deezer"
+category = "music"
+domains = ["deezer.com"]
+asn = []
+ports = []
+# origen: dominio de Deezer; curación propia (2026-11)
+
+[[app]]
+key = "tidal"
+name = "Tidal"
+category = "music"
+domains = ["tidal.com"]
+asn = []
+ports = []
+# origen: dominio de Tidal; curación propia (2026-11)
+
+[[app]]
+key = "soundcloud"
+name = "SoundCloud"
+category = "music"
+domains = ["soundcloud.com", "sndcdn.com"]
+asn = []
+ports = []
+# origen: dominios de SoundCloud y su CDN de audio; curación propia (2026-11)
+
+[[app]]
+key = "ivoox"
+name = "iVoox"
+category = "music"
+domains = ["ivoox.com"]
+asn = []
+ports = []
+# origen: dominio de iVoox; curación propia (2026-11)
+
+# ── Redes sociales (10) ─────────────────────────────────────────────────────
+
+[[app]]
+key = "facebook"
+name = "Facebook"
+category = "social"
+domains = ["facebook.com", "fb.me"]
+asn = []
+ports = []
+# origen: dominios propios de Facebook (el CDN compartido fbcdn.net queda en Servicios de Meta); curación propia (2026-11)
+
+[[app]]
+key = "instagram"
+name = "Instagram"
+category = "social"
+domains = ["instagram.com", "instagr.am"]
+asn = []
+ports = []
+# origen: dominios propios de Instagram (el CDN compartido cdninstagram.com queda en Servicios de Meta); curación propia (2026-11)
+
+[[app]]
+key = "tiktok"
+name = "TikTok"
+category = "social"
+domains = ["tiktok.com", "tiktokcdn.com", "tiktokv.com", "ibytedtos.com"]
+asn = []
+ports = []
+# origen: dominios de TikTok y su CDN (las rutas de analítica de TikTok tienen app propia en Rastreo); curación propia (2026-11)
+
+[[app]]
+key = "x"
+name = "X"
+category = "social"
+domains = ["x.com", "twitter.com", "twimg.com", "t.co"]
+asn = []
+ports = []
+# origen: dominios de X/Twitter y su CDN de imágenes; curación propia (2026-11)
+
+[[app]]
+key = "linkedin"
+name = "LinkedIn"
+category = "social"
+domains = ["linkedin.com", "licdn.com", "lnkd.in"]
+asn = []
+ports = []
+# origen: dominios de LinkedIn y su CDN; curación propia (2026-11)
+
+[[app]]
+key = "reddit"
+name = "Reddit"
+category = "social"
+domains = ["reddit.com", "redd.it", "redditmedia.com"]
+asn = []
+ports = []
+# origen: dominios de Reddit y sus enlaces cortos; curación propia (2026-11)
+
+[[app]]
+key = "pinterest"
+name = "Pinterest"
+category = "social"
+domains = ["pinterest.com", "pinimg.com", "pin.it"]
+asn = []
+ports = []
+# origen: dominios de Pinterest y su CDN de imágenes; curación propia (2026-11)
+
+[[app]]
+key = "snapchat"
+name = "Snapchat"
+category = "social"
+domains = ["snapchat.com", "sc-cdn.net"]
+asn = []
+ports = []
+# origen: dominios de Snapchat y su CDN; curación propia (2026-11)
+
+[[app]]
+key = "bluesky"
+name = "Bluesky"
+category = "social"
+domains = ["bsky.app", "bsky.social", "bsky.network"]
+asn = []
+ports = []
+# origen: dominios de la red social Bluesky (cliente, PDS y red); curación propia (2026-11)
+
+[[app]]
+key = "threads"
+name = "Threads"
+category = "social"
+domains = ["threads.net", "threads.com"]
+asn = []
+ports = []
+# origen: dominios propios de Threads (el CDN compartido de Meta queda en Servicios de Meta); curación propia (2026-11)
+
+# ── Mensajería (7) ──────────────────────────────────────────────────────────
+
+[[app]]
+key = "whatsapp"
+name = "WhatsApp"
+category = "messaging"
+domains = ["whatsapp.com", "whatsapp.net", "wa.me"]
+asn = []
+ports = []
+# origen: dominios de WhatsApp y sus enlaces de invitación; curación propia (2026-11)
+
+[[app]]
+key = "telegram"
+name = "Telegram"
+category = "messaging"
+domains = ["telegram.org", "telegram.me", "t.me"]
+asn = []
+ports = []
+# origen: dominios de Telegram y sus enlaces; curación propia (2026-11)
+
+[[app]]
+key = "signal"
+name = "Signal"
+category = "messaging"
+domains = ["signal.org", "whispersystems.org"]
+asn = []
+ports = []
+# origen: dominios de Signal y del proyecto Whisper Systems; curación propia (2026-11)
+
+[[app]]
+key = "messenger"
+name = "Messenger"
+category = "messaging"
+domains = ["messenger.com"]
+asn = []
+ports = []
+# origen: dominio web y de app de Messenger (facebook.com queda en Facebook); curación propia (2026-11)
+
+[[app]]
+key = "discord"
+name = "Discord"
+category = "messaging"
+domains = ["discord.com", "discordapp.com", "discordapp.net", "discord.gg", "discord.media"]
+asn = []
+ports = []
+# origen: dominios de Discord y sus enlaces de invitación; curación propia (2026-11)
+
+[[app]]
+key = "google_messages"
+name = "Google Messages"
+category = "messaging"
+domains = ["messages.google.com"]
+asn = []
+ports = []
+# origen: subdominio de Google Messages (google.com queda en Google búsqueda); curación propia (2026-11)
+
+[[app]]
+key = "viber"
+name = "Viber"
+category = "messaging"
+domains = ["viber.com"]
+asn = []
+ports = []
+# origen: dominio de Viber; curación propia (2026-11)
+
+# ── Videollamadas (6) ───────────────────────────────────────────────────────
+
+[[app]]
+key = "zoom"
+name = "Zoom"
+category = "calls"
+domains = ["zoom.us", "zoom.com", "zoomgov.com"]
+asn = []
+ports = ["udp/8801-8810"]
+# origen: dominios de Zoom; rango UDP 8801-8810 documentado por Zoom para multimedia; curación propia (2026-11)
+
+[[app]]
+key = "teams"
+name = "Microsoft Teams"
+category = "calls"
+domains = ["teams.microsoft.com", "teams.live.com"]
+asn = []
+ports = []
+# origen: subdominios de Microsoft Teams (microsoft.com queda en Servicios de Microsoft); curación propia (2026-11)
+
+[[app]]
+key = "google_meet"
+name = "Google Meet"
+category = "calls"
+domains = ["meet.google.com"]
+asn = []
+ports = []
+# origen: subdominio de Google Meet; curación propia (2026-11)
+
+[[app]]
+key = "facetime"
+name = "FaceTime"
+category = "calls"
+domains = ["facetime.apple.com"]
+asn = []
+ports = []
+# origen: subdominio de FaceTime (apple.com queda en Servicios de Apple); curación propia (2026-11)
+
+[[app]]
+key = "webex"
+name = "Webex"
+category = "calls"
+domains = ["webex.com", "wbx2.com"]
+asn = []
+ports = []
+# origen: dominios de Webex y de su CDN; curación propia (2026-11)
+
+[[app]]
+key = "jitsi"
+name = "Jitsi Meet"
+category = "calls"
+domains = ["meet.jit.si", "jitsi.org", "8x8.vc"]
+asn = []
+ports = []
+# origen: dominios de Jitsi Meet y del servicio alojado de 8x8; curación propia (2026-11)
+
+# ── Juegos (11) ─────────────────────────────────────────────────────────────
+
+[[app]]
+key = "steam"
+name = "Steam"
+category = "games"
+domains = ["steampowered.com", "steamcommunity.com", "steamstatic.com", "steamcontent.com", "steamserver.net", "valve.net"]
+asn = [32590]
+ports = ["tcp/27015-27050", "udp/27015-27050"]
+# origen: dominios de Steam/Valve; ASN 32590 de Valve; puertos 27015-27050 documentados para el juego; curación propia (2026-11)
+
+[[app]]
+key = "epic_games"
+name = "Epic Games"
+category = "games"
+domains = ["epicgames.com", "epicgames.dev", "unrealengine.com", "easyanticheat.net"]
+asn = []
+ports = []
+# origen: dominios de Epic Games, Unreal Engine y Easy Anti-Cheat; curación propia (2026-11)
+
+[[app]]
+key = "psn"
+name = "PlayStation Network"
+category = "games"
+domains = ["playstation.com", "playstation.net", "sonyentertainmentnetwork.com"]
+asn = []
+ports = []
+# origen: dominios de PlayStation Network; curación propia (2026-11)
+
+[[app]]
+key = "xbox"
+name = "Xbox Network"
+category = "games"
+domains = ["xbox.com", "xboxlive.com", "xboxservices.com"]
+asn = []
+ports = []
+# origen: dominios de Xbox Network; curación propia (2026-11)
+
+[[app]]
+key = "nintendo"
+name = "Nintendo"
+category = "games"
+domains = ["nintendo.com", "nintendo.net", "nintendo-europe.com"]
+asn = []
+ports = []
+# origen: dominios de Nintendo y de su red online; curación propia (2026-11)
+
+[[app]]
+key = "battlenet"
+name = "Battle.net"
+category = "games"
+domains = ["battle.net", "blizzard.com", "blzstatic.com"]
+asn = []
+ports = []
+# origen: dominios de Battle.net y Blizzard; curación propia (2026-11)
+
+[[app]]
+key = "riot_games"
+name = "Riot Games"
+category = "games"
+domains = ["riotgames.com", "riotcdn.net", "leagueoflegends.com", "valorant.com"]
+asn = []
+ports = []
+# origen: dominios de Riot Games y de sus juegos principales; curación propia (2026-11)
+
+[[app]]
+key = "ea"
+name = "EA"
+category = "games"
+domains = ["ea.com", "origin.com", "easports.com"]
+asn = []
+ports = []
+# origen: dominios de Electronic Arts y de su antigua tienda Origin; curación propia (2026-11)
+
+[[app]]
+key = "ubisoft"
+name = "Ubisoft Connect"
+category = "games"
+domains = ["ubisoft.com", "ubi.com", "ubisoftconnect.com"]
+asn = []
+ports = []
+# origen: dominios de Ubisoft y Ubisoft Connect; curación propia (2026-11)
+
+[[app]]
+key = "roblox"
+name = "Roblox"
+category = "games"
+domains = ["roblox.com", "rbxcdn.com", "robloxlabs.com"]
+asn = []
+ports = []
+# origen: dominios de Roblox y su CDN; curación propia (2026-11)
+
+[[app]]
+key = "minecraft"
+name = "Minecraft"
+category = "games"
+domains = ["minecraft.net", "mojang.com", "minecraftservices.com"]
+asn = []
+ports = ["tcp/25565", "udp/19132"]
+# origen: dominios de Mojang/Minecraft; puertos por defecto 25565 (Java) y 19132 (Bedrock); curación propia (2026-11)
+
+# ── Sistema y actualizaciones (12) ──────────────────────────────────────────
+
+[[app]]
+key = "windows_update"
+name = "Windows Update"
+category = "system"
+domains = ["windowsupdate.com", "update.microsoft.com", "delivery.mp.microsoft.com", "definitionupdates.microsoft.com"]
+asn = []
+ports = []
+# origen: dominios de Windows Update (subdominios de microsoft.com, que queda en Servicios de Microsoft); curación propia (2026-11)
+
+[[app]]
+key = "microsoft_store"
+name = "Microsoft Store"
+category = "system"
+domains = ["store.microsoft.com", "apps.microsoft.com", "displaycatalog.mp.microsoft.com"]
+asn = []
+ports = []
+# origen: subdominios de Microsoft Store (microsoft.com queda en Servicios de Microsoft); curación propia (2026-11)
+
+[[app]]
+key = "apple_updates"
+name = "Actualizaciones de Apple"
+category = "system"
+domains = ["mesu.apple.com", "swscan.apple.com", "swcdn.apple.com", "updates.cdn-apple.com"]
+asn = []
+ports = []
+# origen: subdominios de actualización de software de Apple (apple.com y cdn-apple.com quedan en Servicios de Apple); curación propia (2026-11)
+
+[[app]]
+key = "app_store"
+name = "App Store"
+category = "system"
+domains = ["apps.apple.com"]
+asn = []
+ports = []
+# origen: subdominio de la App Store (apple.com queda en Servicios de Apple); curación propia (2026-11)
+
+[[app]]
+key = "google_play"
+name = "Google Play"
+category = "system"
+domains = ["play.google.com"]
+asn = []
+ports = []
+# origen: subdominio de la tienda Google Play (google.com queda en Google búsqueda); curación propia (2026-11)
+
+[[app]]
+key = "play_services"
+name = "Servicios de Google Play"
+category = "system"
+domains = ["android.clients.google.com", "play.googleapis.com"]
+asn = []
+ports = []
+# origen: subdominios de los servicios de Google Play (googleapis.com queda en Servicios de Google); curación propia (2026-11)
+
+[[app]]
+key = "arch_linux"
+name = "Arch Linux"
+category = "system"
+domains = ["archlinux.org"]
+asn = []
+ports = []
+# origen: dominio del proyecto Arch Linux; curación propia (2026-11)
+
+[[app]]
+key = "debian_ubuntu"
+name = "Debian y Ubuntu"
+category = "system"
+domains = ["debian.org", "ubuntu.com", "canonical.com", "launchpad.net"]
+asn = []
+ports = []
+# origen: dominios de Debian, Ubuntu, Canonical y Launchpad; curación propia (2026-11)
+
+[[app]]
+key = "fedora"
+name = "Fedora"
+category = "system"
+domains = ["fedoraproject.org"]
+asn = []
+ports = []
+# origen: dominio del proyecto Fedora; curación propia (2026-11)
+
+[[app]]
+key = "flathub"
+name = "Flathub"
+category = "system"
+domains = ["flathub.org"]
+asn = []
+ports = []
+# origen: dominio de Flathub; curación propia (2026-11)
+
+[[app]]
+key = "snap_store"
+name = "Snap Store"
+category = "system"
+domains = ["snapcraft.io"]
+asn = []
+ports = []
+# origen: dominio de Snapcraft y la Snap Store; curación propia (2026-11)
+
+[[app]]
+key = "firefox_updates"
+name = "Actualizaciones de Firefox"
+category = "system"
+domains = ["aus5.mozilla.org", "download.mozilla.org"]
+asn = []
+ports = []
+# origen: subdominios de actualización de Firefox; no se usa mozilla.org como sufijo raíz para no confundir el resto del ecosistema; curación propia (2026-11)
+
+# ── Nube y copias (10) ──────────────────────────────────────────────────────
+
+[[app]]
+key = "icloud"
+name = "iCloud"
+category = "cloud"
+domains = ["icloud.com", "icloud-content.com"]
+asn = []
+ports = []
+# origen: dominios de iCloud y su CDN; curación propia (2026-11)
+
+[[app]]
+key = "google_drive"
+name = "Google Drive y Fotos"
+category = "cloud"
+domains = ["drive.google.com", "photos.google.com"]
+asn = []
+ports = []
+# origen: subdominios de Google Drive y Google Fotos; curación propia (2026-11)
+
+[[app]]
+key = "onedrive"
+name = "OneDrive"
+category = "cloud"
+domains = ["onedrive.com", "onedrive.live.com", "1drv.ms"]
+asn = []
+ports = []
+# origen: dominios de OneDrive y sus enlaces cortos (live.com queda en Servicios de Microsoft); curación propia (2026-11)
+
+[[app]]
+key = "dropbox"
+name = "Dropbox"
+category = "cloud"
+domains = ["dropbox.com", "dropboxstatic.com", "dropboxusercontent.com"]
+asn = []
+ports = []
+# origen: dominios de Dropbox y sus CDN; curación propia (2026-11)
+
+[[app]]
+key = "mega"
+name = "MEGA"
+category = "cloud"
+domains = ["mega.nz", "mega.io", "mega.co.nz"]
+asn = []
+ports = []
+# origen: dominios de MEGA; curación propia (2026-11)
+
+[[app]]
+key = "proton_drive"
+name = "Proton Drive"
+category = "cloud"
+domains = ["drive.proton.me"]
+asn = []
+ports = []
+# origen: subdominio de Proton Drive (proton.me queda en Proton Mail); curación propia (2026-11)
+
+[[app]]
+key = "backblaze_b2"
+name = "Backblaze B2"
+category = "cloud"
+domains = ["backblazeb2.com", "backblaze.com"]
+asn = []
+ports = []
+# origen: dominios de Backblaze y de su almacenamiento B2; curación propia (2026-11)
+
+[[app]]
+key = "synology"
+name = "Synology"
+category = "cloud"
+domains = ["synology.com", "synology.me", "quickconnect.to"]
+asn = []
+ports = []
+# origen: dominios de Synology y su servicio QuickConnect; curación propia (2026-11)
+
+[[app]]
+key = "cloudflare_r2"
+name = "Cloudflare R2"
+category = "cloud"
+domains = ["cloudflarestorage.com"]
+asn = []
+ports = []
+# origen: dominio de los endpoints S3 de Cloudflare R2 (cloudflare.com queda en CDN Cloudflare); curación propia (2026-11)
+
+[[app]]
+key = "hetzner_storage"
+name = "Hetzner Storage Box"
+category = "cloud"
+domains = ["your-storagebox.de", "your-backup.de"]
+asn = []
+ports = []
+# origen: dominios de los servicios Storage Box y Backup de Hetzner (hetzner.com queda en Hetzner); curación propia (2026-11)
+
+# ── Trabajo y desarrollo (17) ───────────────────────────────────────────────
+
+[[app]]
+key = "microsoft_365"
+name = "Microsoft 365"
+category = "work"
+domains = ["office.com", "office365.com", "sharepoint.com", "outlook.com", "microsoft365.com"]
+asn = []
+ports = []
+# origen: dominios de Microsoft 365, Office, SharePoint y Outlook; la identidad compartida queda en Servicios de Microsoft; curación propia (2026-11)
+
+[[app]]
+key = "google_workspace"
+name = "Google Workspace"
+category = "work"
+domains = ["docs.google.com", "mail.google.com", "calendar.google.com", "workspace.google.com"]
+asn = []
+ports = []
+# origen: subdominios de Google Workspace (docs, Gmail, Calendar); curación propia (2026-11)
+
+[[app]]
+key = "proton_mail"
+name = "Proton Mail"
+category = "work"
+domains = ["mail.proton.me", "protonmail.com", "proton.me"]
+asn = []
+ports = []
+# origen: dominios de Proton Mail y Proton (Drive tiene app propia con sufijo más largo); curación propia (2026-11)
+
+[[app]]
+key = "notion"
+name = "Notion"
+category = "work"
+domains = ["notion.so", "notion.com", "notion.site"]
+asn = []
+ports = []
+# origen: dominios de Notion y sus páginas publicadas; curación propia (2026-11)
+
+[[app]]
+key = "slack"
+name = "Slack"
+category = "work"
+domains = ["slack.com", "slack-edge.com", "slackb.com", "slack-imgs.com"]
+asn = []
+ports = []
+# origen: dominios de Slack y sus CDN; curación propia (2026-11)
+
+[[app]]
+key = "github"
+name = "GitHub"
+category = "work"
+domains = ["github.com", "githubusercontent.com", "githubassets.com", "github.io", "githubapp.com"]
+asn = [36459]
+ports = []
+# origen: dominios de GitHub y su ASN 36459; curación propia (2026-11)
+
+[[app]]
+key = "gitlab"
+name = "GitLab"
+category = "work"
+domains = ["gitlab.com", "gitlab.io", "gitlabstatic.com"]
+asn = []
+ports = []
+# origen: dominios de GitLab y sus páginas; curación propia (2026-11)
+
+[[app]]
+key = "codeberg"
+name = "Codeberg"
+category = "work"
+domains = ["codeberg.org", "codeberg.page"]
+asn = []
+ports = []
+# origen: dominios de Codeberg; curación propia (2026-11)
+
+[[app]]
+key = "atlassian"
+name = "Atlassian"
+category = "work"
+domains = ["atlassian.com", "atlassian.net", "atlassian.io", "bitbucket.org", "jira.com", "trello.com"]
+asn = []
+ports = []
+# origen: dominios de Atlassian y sus productos (Jira, Bitbucket, Trello); curación propia (2026-11)
+
+[[app]]
+key = "figma"
+name = "Figma"
+category = "work"
+domains = ["figma.com"]
+asn = []
+ports = []
+# origen: dominio de Figma; curación propia (2026-11)
+
+[[app]]
+key = "claude"
+name = "Claude"
+category = "work"
+domains = ["claude.ai", "anthropic.com", "claudeusercontent.com"]
+asn = []
+ports = []
+# origen: dominios de Claude y Anthropic; curación propia (2026-11)
+
+[[app]]
+key = "chatgpt"
+name = "ChatGPT"
+category = "work"
+domains = ["chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com"]
+asn = []
+ports = []
+# origen: dominios de ChatGPT y OpenAI; curación propia (2026-11)
+
+[[app]]
+key = "gemini"
+name = "Gemini"
+category = "work"
+domains = ["gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com"]
+asn = []
+ports = []
+# origen: subdominios del asistente Gemini y su API (googleapis.com queda en Servicios de Google); curación propia (2026-11)
+
+[[app]]
+key = "deepseek"
+name = "DeepSeek"
+category = "work"
+domains = ["deepseek.com"]
+asn = []
+ports = []
+# origen: dominio de DeepSeek; curación propia (2026-11)
+
+[[app]]
+key = "openrouter"
+name = "OpenRouter"
+category = "work"
+domains = ["openrouter.ai"]
+asn = []
+ports = []
+# origen: dominio de OpenRouter; curación propia (2026-11)
+
+[[app]]
+key = "docker_hub"
+name = "Docker Hub"
+category = "work"
+domains = ["docker.io", "docker.com", "registry-1.docker.io"]
+asn = []
+ports = []
+# origen: dominios de Docker y su registro; curación propia (2026-11)
+
+[[app]]
+key = "package_registries"
+name = "Registros de paquetes (crates.io, PyPI, npm)"
+category = "work"
+domains = ["crates.io", "pypi.org", "files.pythonhosted.org", "npmjs.com", "npmjs.org", "yarnpkg.com"]
+asn = []
+ports = []
+# origen: registros oficiales de crates.io, PyPI y npm; curación propia (2026-11)
+
+# ── Navegación, compras y banca (21) ────────────────────────────────────────
+
+[[app]]
+key = "google_search"
+name = "Google (búsqueda)"
+category = "web"
+domains = ["google.com", "google.es", "google.co.uk", "google.de", "google.fr", "google.it"]
+asn = []
+ports = []
+# origen: dominio raíz de Google con las búsquedas regionales más habituales; los subdominios de otros servicios de Google tienen app propia; curación propia (2026-11)
+
+[[app]]
+key = "bing"
+name = "Bing"
+category = "web"
+domains = ["bing.com", "bing.net"]
+asn = []
+ports = []
+# origen: dominios de Bing (las rutas de publicidad de Bing tienen app propia en Rastreo); curación propia (2026-11)
+
+[[app]]
+key = "duckduckgo"
+name = "DuckDuckGo"
+category = "web"
+domains = ["duckduckgo.com", "duck.com"]
+asn = []
+ports = []
+# origen: dominios de DuckDuckGo; curación propia (2026-11)
+
+[[app]]
+key = "wikipedia"
+name = "Wikipedia"
+category = "web"
+domains = ["wikipedia.org", "wikimedia.org", "wiktionary.org", "wikimediafoundation.org"]
+asn = []
+ports = []
+# origen: dominios de Wikipedia y la Wikimedia Foundation; curación propia (2026-11)
+
+[[app]]
+key = "amazon"
+name = "Amazon"
+category = "web"
+domains = ["amazon.com", "amazon.es", "amazon.co.uk", "amazon.de", "amazon.fr", "amazon.it", "media-amazon.com", "ssl-images-amazon.com"]
+asn = []
+ports = []
+# origen: dominios de la tienda de Amazon; los subdominios de servicios concretos (música, Alexa, AWS) tienen app propia o genérica; curación propia (2026-11)
+
+[[app]]
+key = "aliexpress"
+name = "AliExpress"
+category = "web"
+domains = ["aliexpress.com", "aliexpress.ru"]
+asn = []
+ports = []
+# origen: dominios de AliExpress; curación propia (2026-11)
+
+[[app]]
+key = "temu"
+name = "Temu"
+category = "web"
+domains = ["temu.com"]
+asn = []
+ports = []
+# origen: dominio de Temu; curación propia (2026-11)
+
+[[app]]
+key = "wallapop"
+name = "Wallapop"
+category = "web"
+domains = ["wallapop.com", "wallapop.es"]
+asn = []
+ports = []
+# origen: dominios de Wallapop; curación propia (2026-11)
+
+[[app]]
+key = "vinted"
+name = "Vinted"
+category = "web"
+domains = ["vinted.es", "vinted.com", "vinted.net"]
+asn = []
+ports = []
+# origen: dominios de Vinted; curación propia (2026-11)
+
+[[app]]
+key = "paypal"
+name = "PayPal"
+category = "web"
+domains = ["paypal.com", "paypalobjects.com", "paypal.me"]
+asn = []
+ports = []
+# origen: dominios de PayPal y sus enlaces de pago; curación propia (2026-11)
+
+[[app]]
+key = "bbva"
+name = "BBVA"
+category = "web"
+domains = ["bbva.es", "bbva.com"]
+asn = []
+ports = []
+# origen: dominios de BBVA; curación propia (2026-11)
+
+[[app]]
+key = "santander"
+name = "Santander"
+category = "web"
+domains = ["santander.es", "bancosantander.es", "santander.com"]
+asn = []
+ports = []
+# origen: dominios de Banco Santander; curación propia (2026-11)
+
+[[app]]
+key = "caixabank"
+name = "CaixaBank"
+category = "web"
+domains = ["caixabank.es", "caixabank.com"]
+asn = []
+ports = []
+# origen: dominios de CaixaBank; curación propia (2026-11)
+
+[[app]]
+key = "ing"
+name = "ING"
+category = "web"
+domains = ["ing.es", "ing.com"]
+asn = []
+ports = []
+# origen: dominios de ING (banca en España y grupo); curación propia (2026-11)
+
+[[app]]
+key = "sabadell"
+name = "Sabadell"
+category = "web"
+domains = ["bancsabadell.com"]
+asn = []
+ports = []
+# origen: dominio de Banco Sabadell; curación propia (2026-11)
+
+[[app]]
+key = "revolut"
+name = "Revolut"
+category = "web"
+domains = ["revolut.com"]
+asn = []
+ports = []
+# origen: dominio de Revolut; curación propia (2026-11)
+
+[[app]]
+key = "glovo"
+name = "Glovo"
+category = "web"
+domains = ["glovoapp.com", "glovo.es"]
+asn = []
+ports = []
+# origen: dominios de Glovo; curación propia (2026-11)
+
+[[app]]
+key = "just_eat"
+name = "Just Eat"
+category = "web"
+domains = ["just-eat.es", "just-eat.com", "justeattakeaway.com"]
+asn = []
+ports = []
+# origen: dominios de Just Eat y de su grupo Just Eat Takeaway; curación propia (2026-11)
+
+[[app]]
+key = "uber_eats"
+name = "Uber Eats"
+category = "web"
+domains = ["ubereats.com"]
+asn = []
+ports = []
+# origen: dominio de Uber Eats; curación propia (2026-11)
+
+[[app]]
+key = "booking"
+name = "Booking"
+category = "web"
+domains = ["booking.com", "bstatic.com"]
+asn = []
+ports = []
+# origen: dominios de Booking y su CDN estática; curación propia (2026-11)
+
+[[app]]
+key = "idealista"
+name = "Idealista"
+category = "web"
+domains = ["idealista.com", "idealista.it", "idealista.pt"]
+asn = []
+ports = []
+# origen: dominios de Idealista; curación propia (2026-11)
+
+# ── Publicidad, rastreo y telemetría (18) ───────────────────────────────────
+
+[[app]]
+key = "google_ads"
+name = "Google Ads"
+category = "tracking"
+domains = ["googleadservices.com", "googlesyndication.com", "doubleclick.net", "adservice.google.com"]
+asn = []
+ports = []
+# origen: dominios de publicidad de Google (AdSense, Ad Manager y DoubleClick); curación propia (2026-11)
+
+[[app]]
+key = "google_analytics"
+name = "Google Analytics"
+category = "tracking"
+domains = ["google-analytics.com", "analytics.google.com", "googletagmanager.com"]
+asn = []
+ports = []
+# origen: dominios de Google Analytics y de su gestor de etiquetas; curación propia (2026-11)
+
+[[app]]
+key = "meta_ads"
+name = "Meta (píxel y anuncios)"
+category = "tracking"
+domains = ["connect.facebook.net", "facebook.net", "business.facebook.com"]
+asn = []
+ports = []
+# origen: dominios del píxel y de la publicidad de Meta (facebook.com queda en Facebook); curación propia (2026-11)
+
+[[app]]
+key = "amazon_ads"
+name = "Amazon Ads"
+category = "tracking"
+domains = ["amazon-adsystem.com", "assoc-amazon.com"]
+asn = []
+ports = []
+# origen: dominios de Amazon Advertising; curación propia (2026-11)
+
+[[app]]
+key = "microsoft_ads"
+name = "Microsoft Ads y Clarity"
+category = "tracking"
+domains = ["clarity.ms", "bat.bing.com", "ads.microsoft.com"]
+asn = []
+ports = []
+# origen: dominios de Microsoft Advertising y Clarity (bing.com queda en Bing; microsoft.com en Servicios de Microsoft); curación propia (2026-11)
+
+[[app]]
+key = "criteo"
+name = "Criteo"
+category = "tracking"
+domains = ["criteo.com", "criteo.net"]
+asn = []
+ports = []
+# origen: dominios de Criteo; curación propia (2026-11)
+
+[[app]]
+key = "taboola"
+name = "Taboola"
+category = "tracking"
+domains = ["taboola.com", "taboolasyndication.com"]
+asn = []
+ports = []
+# origen: dominios de Taboola; curación propia (2026-11)
+
+[[app]]
+key = "tiktok_analytics"
+name = "TikTok (analítica)"
+category = "tracking"
+domains = ["analytics.tiktok.com", "business-api.tiktok.com"]
+asn = []
+ports = []
+# origen: subdominios de analítica y publicidad de TikTok (tiktok.com queda en TikTok); curación propia (2026-11)
+
+[[app]]
+key = "hotjar"
+name = "Hotjar"
+category = "tracking"
+domains = ["hotjar.com", "hotjar.io"]
+asn = []
+ports = []
+# origen: dominios de Hotjar; curación propia (2026-11)
+
+[[app]]
+key = "mobile_attribution"
+name = "Atribución móvil (Adjust, AppsFlyer, Branch)"
+category = "tracking"
+domains = ["adjust.com", "appsflyer.com", "branch.io", "adj.st"]
+asn = []
+ports = []
+# origen: dominios de los tres proveedores de atribución móvil indicados en la especificación (Adjust, AppsFlyer y Branch); curación propia (2026-11)
+
+[[app]]
+key = "firebase"
+name = "Firebase y Crashlytics"
+category = "tracking"
+domains = ["firebaseio.com", "firebase.google.com", "crashlytics.com", "app-measurement.com", "firebasestorage.googleapis.com"]
+asn = []
+ports = []
+# origen: dominios de Firebase, Crashlytics y su analítica (googleapis.com queda en Servicios de Google); curación propia (2026-11)
+
+[[app]]
+key = "sentry"
+name = "Sentry"
+category = "tracking"
+domains = ["sentry.io", "sentry-cdn.com"]
+asn = []
+ports = []
+# origen: dominios del servicio Sentry; curación propia (2026-11)
+
+[[app]]
+key = "windows_telemetry"
+name = "Telemetría de Windows"
+category = "tracking"
+domains = ["vortex.data.microsoft.com", "telemetry.microsoft.com", "settings-win.data.microsoft.com", "watson.telemetry.microsoft.com"]
+asn = []
+ports = []
+# origen: subdominios de telemetría de Windows (microsoft.com queda en Servicios de Microsoft); curación propia (2026-11)
+
+[[app]]
+key = "apple_telemetry"
+name = "Telemetría de Apple"
+category = "tracking"
+domains = ["metrics.apple.com", "gdmf.apple.com", "xp.apple.com", "diagnostics.apple.com"]
+asn = []
+ports = []
+# origen: subdominios de diagnóstico y métricas de Apple (apple.com queda en Servicios de Apple); curación propia (2026-11)
+
+[[app]]
+key = "samsung_tv_telemetry"
+name = "Telemetría de Samsung TV"
+category = "tracking"
+domains = ["samsungads.com", "samsungcloudsolution.com", "ospserver.net"]
+asn = []
+ports = []
+# origen: dominios de anuncios, nube y telemetría de los televisores Samsung; curación propia (2026-11)
+
+[[app]]
+key = "lg_tv_telemetry"
+name = "Telemetría de LG TV"
+category = "tracking"
+domains = ["lgappstv.com", "lgsmartad.com"]
+asn = []
+ports = []
+# origen: dominios de apps, anuncios y telemetría de los televisores LG; curación propia (2026-11)
+
+[[app]]
+key = "xiaomi_telemetry"
+name = "Telemetría de Xiaomi"
+category = "tracking"
+domains = ["xiaomi.com", "miui.com", "mi.com"]
+asn = []
+ports = []
+# origen: dominios de telemetría y servicios de los dispositivos Xiaomi/Redmi; curación propia (2026-11)
+
+[[app]]
+key = "amazon_telemetry"
+name = "Telemetría de Amazon (Alexa y Fire TV)"
+category = "tracking"
+domains = ["device-metrics-us.amazon.com", "avs-alexa-na.amazon.com", "alexa.amazon.com", "firetv.amazon.com"]
+asn = []
+ports = []
+# origen: subdominios de métricas, Alexa y Fire TV (amazon.com queda en Amazon); curación propia (2026-11)
+
+# ── Infraestructura (18) ────────────────────────────────────────────────────
+
+[[app]]
+key = "dns"
+name = "DNS"
+category = "infrastructure"
+domains = []
+asn = []
+ports = ["udp/53", "tcp/53"]
+# origen: puerto 53 estándar de DNS (RFC 1035); curación propia (2026-11)
+
+[[app]]
+key = "dns_encrypted"
+name = "DNS cifrado (DoH/DoT)"
+category = "infrastructure"
+domains = ["dns.google", "cloudflare-dns.com", "mozilla.cloudflare-dns.com", "dns.quad9.net", "dns.adguard-dns.com"]
+asn = []
+ports = ["tcp/853", "udp/853"]
+# origen: dominios de resolutores DoH conocidos y puerto 853 de DoT (RFC 7858); curación propia (2026-11)
+
+[[app]]
+key = "ntp"
+name = "NTP"
+category = "infrastructure"
+domains = ["pool.ntp.org"]
+asn = []
+ports = ["udp/123"]
+# origen: puerto 123 de NTP (RFC 5905) y dominio del pool público; curación propia (2026-11)
+
+[[app]]
+key = "connectivity_check"
+name = "Comprobación de conectividad"
+category = "infrastructure"
+domains = ["connectivitycheck.gstatic.com", "clients3.google.com", "captive.apple.com", "www.msftconnecttest.com", "msftconnecttest.com", "connectivity-check.ubuntu.com", "nmcheck.gnome.org"]
+asn = []
+ports = []
+# origen: dominios de comprobación de cautividad y conectividad de los principales sistemas; curación propia (2026-11)
+
+[[app]]
+key = "certificates"
+name = "Certificados (OCSP/CRL)"
+category = "infrastructure"
+domains = ["lencr.org", "pki.goog", "ocsp.digicert.com", "ocsp.sectigo.com", "ocsp.identrust.com", "ocsp.entrust.net"]
+asn = []
+ports = []
+# origen: dominios de respondedores OCSP y listas CRL de las CA más usadas; curación propia (2026-11)
+
+[[app]]
+key = "apns"
+name = "Notificaciones de Apple (APNs)"
+category = "infrastructure"
+domains = ["push.apple.com", "courier.push.apple.com"]
+asn = []
+ports = ["tcp/5223", "tcp/2197"]
+# origen: dominios y puertos de Apple Push Notification service; curación propia (2026-11)
+
+[[app]]
+key = "fcm"
+name = "Notificaciones de Google (FCM)"
+category = "infrastructure"
+domains = ["mtalk.google.com", "fcm.googleapis.com"]
+asn = []
+ports = ["tcp/5228-5230"]
+# origen: dominios de Firebase Cloud Messaging y sus puertos 5228-5230; curación propia (2026-11)
+
+[[app]]
+key = "cdn_cloudflare"
+name = "CDN Cloudflare"
+category = "infrastructure"
+domains = ["cloudflare.com", "cloudflare.net"]
+asn = [13335]
+ports = []
+# origen: dominios de Cloudflare y su ASN 13335 (genérico de CDN); curación propia (2026-11)
+
+[[app]]
+key = "cdn_akamai"
+name = "CDN Akamai"
+category = "infrastructure"
+domains = ["akamaized.net", "akamai.net", "akamaihd.net", "akamaiedge.net", "edgesuite.net", "edgekey.net", "akamaitechnologies.com"]
+asn = [20940, 16625]
+ports = []
+# origen: dominios de entrega de Akamai y sus ASN 20940/16625 (genéricos de CDN); curación propia (2026-11)
+
+[[app]]
+key = "cdn_fastly"
+name = "CDN Fastly"
+category = "infrastructure"
+domains = ["fastly.net", "fastlylb.net", "fastly.com"]
+asn = [54113]
+ports = []
+# origen: dominios de Fastly y su ASN 54113 (genérico de CDN); curación propia (2026-11)
+
+[[app]]
+key = "aws"
+name = "Amazon Web Services"
+category = "infrastructure"
+domains = ["amazonaws.com", "aws.amazon.com", "cloudfront.net", "awsstatic.com"]
+asn = [16509, 14618]
+ports = []
+# origen: dominios de AWS y de su CDN CloudFront, compartida por muchos servicios; ASN 16509/14618; curación propia (2026-11)
+
+[[app]]
+key = "gcp"
+name = "Google Cloud"
+category = "infrastructure"
+domains = ["googlecloud.com", "cloud.google.com", "appspot.com", "cloudfunctions.net", "run.app"]
+asn = [396982]
+ports = []
+# origen: dominios de Google Cloud y su ASN 396982; curación propia (2026-11)
+
+[[app]]
+key = "azure"
+name = "Microsoft Azure"
+category = "infrastructure"
+domains = ["azure.com", "azure.net", "windows.net", "azurewebsites.net"]
+asn = []
+ports = []
+# origen: dominios de Microsoft Azure y sus servicios de almacenamiento; curación propia (2026-11)
+
+[[app]]
+key = "hetzner"
+name = "Hetzner"
+category = "infrastructure"
+domains = ["hetzner.com", "hetzner.de", "hetzner.cloud", "your-server.de"]
+asn = []
+ports = []
+# origen: dominios de Hetzner (cloud, servidores dedicados y red); curación propia (2026-11)
+
+[[app]]
+key = "google_services"
+name = "Servicios de Google"
+category = "infrastructure"
+domains = ["googleapis.com", "gstatic.com", "googleusercontent.com", "ggpht.com", "1e100.net", "gvt1.com", "gvt2.com", "accounts.google.com", "clients4.google.com", "clients6.google.com"]
+asn = [15169]
+ports = []
+# origen: dominios compartidos por los servicios de Google, que no deben atribuirse a una app concreta; ASN 15169; curación propia (2026-11)
+
+[[app]]
+key = "meta_services"
+name = "Servicios de Meta"
+category = "infrastructure"
+domains = ["fbcdn.net", "fbsbx.com", "cdninstagram.com"]
+asn = [32934]
+ports = []
+# origen: CDN y dominios compartidos por Facebook, Instagram, Messenger y Threads; ASN 32934; curación propia (2026-11)
+
+[[app]]
+key = "microsoft_services"
+name = "Servicios de Microsoft"
+category = "infrastructure"
+domains = ["microsoft.com", "microsoft.net", "live.com", "microsoftonline.com", "office.net"]
+asn = [8075]
+ports = []
+# origen: dominios compartidos por los servicios de Microsoft; ASN 8075; curación propia (2026-11)
+
+[[app]]
+key = "apple_services"
+name = "Servicios de Apple"
+category = "infrastructure"
+domains = ["apple.com", "mzstatic.com", "cdn-apple.com"]
+asn = [714]
+ports = []
+# origen: dominios compartidos por los servicios de Apple; ASN 714; curación propia (2026-11)
+
+# ── Red local (10): apps especiales que se asignan por los servicios de Fase 2 ─
+
+[[app]]
+key = "lan_files"
+name = "Compartición de archivos (SMB/NFS)"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por los servicios SMB, AFP y NFS de F2; sin reglas de dominio, ASN ni puerto
+
+[[app]]
+key = "lan_printing"
+name = "Impresión (IPP/LPD)"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por los servicios de impresión IPP, LPD y JetDirect de F2
+
+[[app]]
+key = "lan_airplay"
+name = "AirPlay"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por el servicio AirPlay de F2 y el anuncio mDNS _airplay._tcp
+
+[[app]]
+key = "lan_cast"
+name = "Google Cast"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por el servicio Google Cast de F2 y el anuncio mDNS _googlecast._tcp
+
+[[app]]
+key = "lan_remote_desktop"
+name = "Escritorio remoto (RDP/VNC)"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por los servicios RDP y VNC de F2
+
+[[app]]
+key = "lan_ssh"
+name = "SSH"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por el servicio SSH de F2
+
+[[app]]
+key = "lan_domotica"
+name = "Domótica (MQTT/CoAP/Home Assistant)"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por los servicios MQTT y CoAP de F2 y el anuncio de Home Assistant
+
+[[app]]
+key = "lan_cameras"
+name = "Cámaras (RTSP/ONVIF)"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por el servicio RTSP de F2 y el anuncio ONVIF
+
+[[app]]
+key = "lan_upnp"
+name = "UPnP/DLNA"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por el servicio UPnP de F2 y los anuncios DLNA
+
+[[app]]
+key = "lan_media"
+name = "Servidor multimedia (Plex/Jellyfin)"
+category = "lan"
+domains = []
+asn = []
+ports = []
+# origen: app especial de red local: se asigna por el servicio Plex de F2 y el anuncio de Jellyfin

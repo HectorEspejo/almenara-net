@@ -1,5 +1,8 @@
 //! DAO de dispositivos (tabla DEVICES) y modelo de dominio asociado.
 
+use crate::classify::OsFamily;
+use crate::identify::OsSource;
+
 /// Dispositivo descubierto en la red local, tal como se persiste en SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -33,6 +36,18 @@ pub struct Device {
     pub device_type_manual: Option<String>,
     /// Último fingerprint observado en JSON (TTL, opciones TCP, puntuación...).
     pub last_fingerprint: Option<String>,
+    /// Modelo anunciado por mDNS o UPnP (máximo 64 caracteres).
+    pub model: Option<String>,
+    /// Huella DHCP: opción 55 en decimal separada por comas, en su orden.
+    pub dhcp_fingerprint: Option<String>,
+    /// Fabricante anunciado por DHCP: opción 60 saneada (máximo 64).
+    pub dhcp_vendor: Option<String>,
+    /// Hostname anunciado por DHCP: opción 12 saneada (máximo 64).
+    pub dhcp_hostname: Option<String>,
+    /// Último User-Agent HTTP en claro, saneado y truncado a 256 caracteres.
+    pub user_agent: Option<String>,
+    /// Señal que fijó os_family: tcp / dhcp / model / ua.
+    pub os_source: Option<String>,
 }
 
 impl Device {
@@ -77,6 +92,30 @@ pub struct DeviceUpsert {
     pub interface_id: i64,
     /// Tipo de dispositivo automático (taxonomía de Fase 2).
     pub device_type: String,
+}
+
+/// Identidad de un dispositivo que llega desde las señales de la captura (§7.12).
+///
+/// Cada campo es opcional porque las señales aparecen en momentos distintos
+/// (DHCP en un ciclo, User-Agent en otro): los valores None no pisan lo ya
+/// guardado. `os_family` y `os_source` se escriben juntos: cuando llega una
+/// familia nueva, la fuente que la justifica la acompaña (y puede ser NULL).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityUpdate {
+    /// Modelo de mDNS o UPnP (máximo 64 caracteres).
+    pub model: Option<String>,
+    /// Huella DHCP: opción 55 en decimal separada por comas.
+    pub dhcp_fingerprint: Option<String>,
+    /// Fabricante DHCP: opción 60 saneada (máximo 64).
+    pub dhcp_vendor: Option<String>,
+    /// Hostname DHCP: opción 12 saneada (máximo 64).
+    pub dhcp_hostname: Option<String>,
+    /// Último User-Agent HTTP en claro (máximo 256).
+    pub user_agent: Option<String>,
+    /// Familia de SO estimada por la puntuación combinada.
+    pub os_family: Option<OsFamily>,
+    /// Señal que más aportó a la familia ganadora.
+    pub os_source: Option<OsSource>,
 }
 
 /// Cambios detectados al hacer upsert de un dispositivo.

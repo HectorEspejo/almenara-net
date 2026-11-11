@@ -14,6 +14,7 @@ use ratatui::Frame;
 
 use crate::classify::DeviceGroup;
 use crate::config::ListView;
+use crate::identify::mac::is_private;
 use crate::repo::devices::Device;
 use crate::tui::app::{grupo_de, App, Filter};
 use crate::tui::theme::{device_icon, Theme};
@@ -230,8 +231,7 @@ fn draw_grouped(frame: &mut Frame, app: &mut App, indices: &[usize], area: Rect)
 /// Fila de la lista plana.
 fn fila(device: &Device, theme: &Theme) -> Row<'static> {
     let (icono, estilo_icono) = device_icon(device, theme);
-    let vendor = device.vendor.clone().unwrap_or_else(|| "?".to_string());
-    let fabricante = format!("{} {}", device.mac, vendor);
+    let fabricante = texto_fabricante(device);
     let hostname = device.display_name().to_string();
     let estilo_hostname = if device.alias.is_some() {
         theme.accent.add_modifier(Modifier::BOLD)
@@ -257,8 +257,7 @@ fn fila(device: &Device, theme: &Theme) -> Row<'static> {
 /// Fila de un equipo en la vista agrupada (línea formateada a mano).
 fn fila_agrupada(device: &Device, columnas: Columnas, theme: &Theme) -> Row<'static> {
     let (icono, estilo_icono) = device_icon(device, theme);
-    let vendor = device.vendor.clone().unwrap_or_else(|| "?".to_string());
-    let fabricante = format!("{} {}", device.mac, vendor);
+    let fabricante = texto_fabricante(device);
     let hostname = device.display_name().to_string();
     let estilo_hostname = if device.alias.is_some() {
         theme.accent.add_modifier(Modifier::BOLD)
@@ -301,6 +300,16 @@ fn fila_agrupada(device: &Device, columnas: Columnas, theme: &Theme) -> Row<'sta
     ]);
 
     Row::new(vec![Cell::from(linea)])
+}
+
+/// Texto de la columna Fabricante: MAC y OUI, o «MAC privada» si el bit U/L
+/// está activo (F4, §7.13).
+fn texto_fabricante(device: &Device) -> String {
+    if is_private(&device.mac) {
+        return format!("{} MAC privada", device.mac);
+    }
+    let vendor = device.vendor.clone().unwrap_or_else(|| "?".to_string());
+    format!("{} {}", device.mac, vendor)
 }
 
 /// Cabecera de sección de la vista agrupada: «── Etiqueta ──────».
@@ -357,7 +366,7 @@ mod tests {
     fn dispositivo(id: i64, ip: &str, online: bool, gateway: bool) -> Device {
         Device {
             id,
-            mac: format!("aa:bb:cc:dd:ee:0{id}"),
+            mac: format!("00:1a:2b:3c:4d:{:02x}", id % 256),
             ip: ip.to_string(),
             hostname: Some(format!("equipo-{id}")),
             vendor: Some("Apple".to_string()),
@@ -371,6 +380,12 @@ mod tests {
             os_family: None,
             device_type_manual: None,
             last_fingerprint: None,
+            model: None,
+            dhcp_fingerprint: None,
+            dhcp_vendor: None,
+            dhcp_hostname: None,
+            user_agent: None,
+            os_source: None,
         }
     }
 
@@ -498,9 +513,32 @@ mod tests {
         let contenido = dibujar(&mut app, 80, 24);
         assert!(contenido.contains("── Infraestructura"));
         assert!(
-            contenido.contains("aa:bb:cc:dd:ee:01 Apple"),
+            contenido.contains("00:1a:2b:3c:4d:01 Apple"),
             "el MAC y el fabricante deben verse completos a 80 columnas"
         );
+    }
+
+    #[test]
+    fn la_columna_fabricante_muestra_mac_privada() {
+        let mut device = dispositivo_de_tipo(1, "10.0.0.1", "mobile");
+        // 5a tiene el bit U/L (0x02) activo y el de grupo (0x01) a cero.
+        device.mac = "5a:1c:2d:3e:4f:9e".to_string();
+        let mut app = app_con(vec![device]);
+        let contenido = dibujar(&mut app, 100, 24);
+        assert!(
+            contenido.contains("5a:1c:2d:3e:4f:9e MAC privada"),
+            "una MAC con el bit U/L debe mostrarse como MAC privada"
+        );
+        assert!(
+            !contenido.contains("5a:1c:2d:3e:4f:9e Apple"),
+            "no se muestra el fabricante de una MAC privada"
+        );
+
+        // La vista agrupada usa el mismo texto.
+        let mut app = app_agrupada(vec![dispositivo_de_tipo(2, "10.0.0.2", "pc")]);
+        app.devices[0].mac = "5a:1c:2d:3e:4f:9e".to_string();
+        let contenido = dibujar(&mut app, 100, 24);
+        assert!(contenido.contains("MAC privada"));
     }
 
     #[test]

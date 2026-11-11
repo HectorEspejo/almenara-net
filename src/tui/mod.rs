@@ -165,8 +165,18 @@ async fn bucle(
             evento = stream.next() => {
                 match evento {
                     Some(Ok(CrosstermEvent::Key(key))) => {
+                        // «¿Quién lo usa?» necesita respuesta con oneshot y timeout:
+                        // se resuelve aquí, en el bucle async, no en handle_key.
                         let accion = app.handle_key(key);
-                        aplicar_accion(accion, app, repo);
+                        match accion {
+                            Action::WhoUses {
+                                dimension,
+                                key,
+                                label,
+                                window,
+                            } => pedir_quien_lo_usa(app, dimension, key, label, window).await,
+                            otra => aplicar_accion(otra, app, repo),
+                        }
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => {}
                     Some(Ok(_)) => {}
@@ -252,6 +262,24 @@ fn aplicar_accion(accion: Action, app: &mut App, repo: &mut Repo) {
                 Err(err) => app.push_notification(
                     Level::Error,
                     format!("No se pudo guardar [ui].list_view: {err}"),
+                ),
+            }
+        }
+        Action::WhoUses { .. } => {
+            // El bucle la resuelve con oneshot y timeout; ver pedir_quien_lo_usa.
+        }
+        Action::SetTrafficGroup(grupo) => {
+            // La preferencia se persiste en [ui].traffic_group, igual que
+            // [ui].list_view con el g de Equipos.
+            app.config.ui.traffic_group = grupo;
+            match crate::config::Config::save(&app.config, &app.config_path) {
+                Ok(()) => app.push_notification(
+                    Level::Info,
+                    format!("Ranking por {} ([ui].traffic_group)", grupo.label()),
+                ),
+                Err(err) => app.push_notification(
+                    Level::Error,
+                    format!("No se pudo guardar [ui].traffic_group: {err}"),
                 ),
             }
         }
@@ -397,7 +425,7 @@ fn procesar_escaneo(
                 ));
             }
             app.apply_reconciliation(reconciliacion);
-            actualizar_mapa_dispositivos(app);
+            actualizar_mapa_dispositivos(app, repo);
             app.push_notification(Level::Info, resumen);
             for notification in notificaciones {
                 app.push_notification_obj(notification);
@@ -415,11 +443,12 @@ fn procesar_escaneo(
     }
 }
 
-/// Persiste el snapshot por dispositivo y las conexiones activas cada 5 s.
+/// Persiste el snapshot por dispositivo, las conexiones con sus etiquetas y la
+/// caché de nombres cada 5 s.
 ///
 /// Es la única escritura de tráfico en SQLite y se ejecuta en el hilo de la TUI,
 /// respetando la regla de una única conexión de escritura.
-fn persistir_trafico(app: &App, repo: &mut Repo) {
+fn persistir_trafico(app: &mut App, repo: &mut Repo) {
     for estadisticas in &app.traffic.devices {
         let snapshot = SnapshotUpdate {
             device_id: estadisticas.device_id,
@@ -436,6 +465,9 @@ fn persistir_trafico(app: &App, repo: &mut Repo) {
         }
     }
     for conexion in &app.traffic.connections {
+        // Etiquetas de F4 resueltas por el motor de inferencia: rol, protocolo de
+        // app, nombre del servidor y su fuente, app, categoría, fuente y JA4.
+        let etiqueta = conexion.label.as_ref();
         let update = ConnectionUpdate {
             id: None,
             device_id: conexion.device_id,
@@ -447,6 +479,20 @@ fn persistir_trafico(app: &App, repo: &mut Repo) {
             state: conexion.state.clone(),
             bytes_in: conexion.bytes_in.min(i64::MAX as u64) as i64,
             bytes_out: conexion.bytes_out.min(i64::MAX as u64) as i64,
+            client_is_src: etiqueta.and_then(|valor| valor.client_is_src),
+            app_protocol: etiqueta
+                .and_then(|valor| valor.app_protocol)
+                .map(|protocolo| protocolo.as_str().to_string()),
+            server_name: etiqueta.and_then(|valor| valor.server_name.clone()),
+            name_source: etiqueta
+                .and_then(|valor| valor.name_source)
+                .map(|fuente| fuente.as_str().to_string()),
+            app: etiqueta.and_then(|valor| valor.app.clone()),
+            category: etiqueta.and_then(|valor| valor.category.clone()),
+            app_source: etiqueta
+                .and_then(|valor| valor.app_source)
+                .map(|fuente| fuente.as_str().to_string()),
+            ja4: etiqueta.and_then(|valor| valor.ja4.clone()),
         };
         if let Err(err) = repo.upsert_connection(&update) {
             tracing::warn!(%err, "no se pudo guardar la conexión");
@@ -459,6 +505,25 @@ fn persistir_trafico(app: &App, repo: &mut Repo) {
         }
         Ok(_) => {}
         Err(err) => tracing::warn!(%err, "no se pudieron purgar las conexiones"),
+    }
+
+    // NAME_CACHE: entradas nuevas o refrescadas del último ciclo y purga de las
+    // caducadas, en el mismo ciclo de 5 s.
+    if !app.traffic.pending_names.is_empty() {
+        let entradas = std::mem::take(&mut app.traffic.pending_names);
+        match repo.upsert_names(&entradas) {
+            Ok(guardadas) => {
+                tracing::debug!(guardadas, "caché de nombres persistida");
+            }
+            Err(err) => tracing::warn!(%err, "no se pudo persistir la caché de nombres"),
+        }
+    }
+    match repo.prune_names(std::time::SystemTime::now()) {
+        Ok(purgadas) if purgadas > 0 => {
+            tracing::debug!(purgadas, "nombres caducados purgados");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "no se pudieron purgar los nombres caducados"),
     }
 }
 
@@ -474,17 +539,103 @@ fn protocolo_repo(protocolo: crate::capture::Protocol) -> ConnectionProtocol {
     }
 }
 
-/// Envía a la tarea de tráfico el mapa actual de dispositivos (id e IP).
-fn actualizar_mapa_dispositivos(app: &App) {
+/// Envía a la tarea de tráfico el mapa de dispositivos con nombre y servicios.
+///
+/// El nombre visible y los servicios de F2 se usan para etiquetar destinos de la
+/// LAN (app por servicio) y para los rankings; sin ellos, la tarea de tráfico
+/// solo podría etiquetar por IP.
+fn actualizar_mapa_dispositivos(app: &App, repo: &Repo) {
     let Some(tx) = &app.traffic_command_tx else {
         return;
     };
     let devices: Vec<DeviceRef> = app
         .devices
         .iter()
-        .map(|device| DeviceRef::new(device.id, device.ip.clone()))
+        .map(|device| {
+            let servicios = repo
+                .list_services(device.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|servicio| crate::traffic::ServiceRef {
+                    port: servicio.port,
+                    protocol: match servicio.protocol {
+                        crate::repo::Protocol::Tcp => crate::capture::Protocol::Tcp,
+                        crate::repo::Protocol::Udp => crate::capture::Protocol::Udp,
+                    },
+                    service: servicio.service.clone(),
+                })
+                .collect();
+            DeviceRef::with_details(
+                device.id,
+                device.ip.clone(),
+                device.mac.clone(),
+                Some(device.display_name().to_string()),
+                servicios,
+            )
+        })
         .collect();
     let _ = tx.try_send(TrafficCommand::UpdateDevices(devices));
+}
+
+/// Resuelve «¿Quién lo usa?» con [TrafficCommand::WhoUses] y un timeout de 200 ms.
+///
+/// La consulta se calcula al momento en el agregador; si la tarea no responde a
+/// tiempo se avisa y se cierra el panel para no dejar la interfaz «Consultando…».
+async fn pedir_quien_lo_usa(
+    app: &mut App,
+    dimension: crate::rankings::Dimension,
+    key: String,
+    label: String,
+    window: crate::rankings::Window,
+) {
+    let Some(tx) = app.traffic_command_tx.clone() else {
+        app.close_who_uses();
+        app.push_notification(
+            Level::Info,
+            "La tarea de tráfico no está disponible en este momento",
+        );
+        return;
+    };
+    let (respuesta_tx, respuesta_rx) = tokio::sync::oneshot::channel();
+    let orden = TrafficCommand::WhoUses {
+        dimension,
+        key,
+        window,
+        reply: respuesta_tx,
+    };
+    if tx.send(orden).await.is_err() {
+        app.close_who_uses();
+        app.push_notification(
+            Level::Warn,
+            "No se pudo consultar «¿Quién lo usa?»: la tarea de tráfico no responde",
+        );
+        return;
+    }
+    match tokio::time::timeout(Duration::from_millis(200), respuesta_rx).await {
+        Ok(Ok(filas)) => {
+            if filas.is_empty() {
+                app.push_notification(
+                    Level::Info,
+                    format!("Ningún equipo usa «{label}» en esta ventana"),
+                );
+            }
+            app.set_who_uses(filas);
+        }
+        Ok(Err(_)) => {
+            app.close_who_uses();
+            app.push_notification(
+                Level::Warn,
+                "La tarea de tráfico cerró sin responder a «¿Quién lo usa?»",
+            );
+        }
+        Err(_) => {
+            app.close_who_uses();
+            app.push_notification(
+                Level::Warn,
+                "«¿Quién lo usa?» no respondió en 200 ms; inténtalo de nuevo",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -512,6 +663,9 @@ mod tests {
     fn persistir_trafico_guarda_snapshot_y_conexiones() {
         use crate::capture::aggregate::DeviceTraffic;
         use crate::capture::{ConnectionKey, Endpoint, HeaderSnapshot, Protocol};
+        use crate::inference::{
+            AppProtocol, AppSource, DestinationInfo, DestinationKind, FlowLabel, NameSource,
+        };
         use crate::repo::{DeviceUpsert, Interface};
         use crate::traffic::{ConnectionView, EndpointView};
         use std::time::Duration;
@@ -556,6 +710,22 @@ mod tests {
             series_5min_out: [0; 60],
             top_ports: Vec::new(),
         }];
+        let mut etiqueta = FlowLabel::empty("1.1.1.1".parse().unwrap());
+        etiqueta.client_is_src = Some(true);
+        etiqueta.app_protocol = Some(AppProtocol::Tls);
+        etiqueta.server_name = Some("github.com".to_string());
+        etiqueta.name_source = Some(NameSource::Sni);
+        etiqueta.app = Some("github".to_string());
+        etiqueta.category = Some("developer".to_string());
+        etiqueta.app_source = Some(AppSource::Domain);
+        etiqueta.ja4 = Some("t13d1516h2_8daaf6152771_02713d6af862".to_string());
+        etiqueta.destination = DestinationInfo {
+            key: "github.com".to_string(),
+            label: "github.com".to_string(),
+            org: Some("GitHub".to_string()),
+            country: Some("US".to_string()),
+            kind: DestinationKind::Domain,
+        };
         app.traffic.connections = vec![ConnectionView {
             key: ConnectionKey::from_endpoints(
                 Protocol::Tcp,
@@ -585,9 +755,12 @@ mod tests {
             headers: Some(HeaderSnapshot::default()),
             seen_capture: true,
             seen_kernel: true,
+            label: Some(etiqueta),
+            app_name: Some("GitHub".to_string()),
+            category_name: Some("Desarrollo".to_string()),
         }];
 
-        persistir_trafico(&app, &mut repo);
+        persistir_trafico(&mut app, &mut repo);
 
         let snapshots = repo.list_snapshots().expect("listar snapshots");
         assert_eq!(snapshots.len(), 1);
@@ -599,10 +772,171 @@ mod tests {
         assert_eq!(conexiones[0].protocol.as_str(), "tcp");
         assert_eq!(conexiones[0].state.as_deref(), Some("ESTABLISHED"));
         assert_eq!(conexiones[0].device_id, Some(device_id));
+        // Etiquetas de F4 persistidas desde ConnectionView.label.
+        assert_eq!(conexiones[0].client_is_src, Some(true));
+        assert_eq!(conexiones[0].app_protocol.as_deref(), Some("tls"));
+        assert_eq!(conexiones[0].server_name.as_deref(), Some("github.com"));
+        assert_eq!(conexiones[0].name_source.as_deref(), Some("sni"));
+        assert_eq!(conexiones[0].app.as_deref(), Some("github"));
+        assert_eq!(conexiones[0].category.as_deref(), Some("developer"));
+        assert_eq!(conexiones[0].app_source.as_deref(), Some("domain"));
+        assert_eq!(
+            conexiones[0].ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_02713d6af862")
+        );
 
         // Un segundo ciclo no duplica la conexión (upsert por 5-tuple).
-        persistir_trafico(&app, &mut repo);
+        persistir_trafico(&mut app, &mut repo);
         assert_eq!(repo.list_connections(None).expect("listar").len(), 1);
+    }
+
+    #[test]
+    fn persistir_trafico_guarda_y_purga_la_cache_de_nombres() {
+        use crate::inference::names::NameEntry;
+        use crate::inference::NameSource;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().expect("directorio temporal");
+        let mut repo = Repo::init(&dir.path().join("data.db")).expect("repositorio");
+        let mut app = app_prueba();
+        let ahora = SystemTime::now();
+        app.traffic.pending_names = vec![
+            NameEntry {
+                ip: "1.1.1.1".parse().unwrap(),
+                name: "one.one.one.one".to_string(),
+                source: NameSource::Dns,
+                first_seen: ahora,
+                last_seen: ahora,
+                expires_at: ahora + Duration::from_secs(3600),
+                requester: None,
+            },
+            NameEntry {
+                ip: "8.8.8.8".parse().unwrap(),
+                name: "dns.google".to_string(),
+                source: NameSource::Dns,
+                first_seen: ahora - Duration::from_secs(90_000),
+                last_seen: ahora - Duration::from_secs(90_000),
+                expires_at: ahora - Duration::from_secs(10),
+                requester: None,
+            },
+        ];
+        persistir_trafico(&mut app, &mut repo);
+        assert!(
+            app.traffic.pending_names.is_empty(),
+            "el buffer se vacía tras persistir"
+        );
+        let nombres = repo.list_names(SystemTime::now()).expect("listar nombres");
+        assert_eq!(nombres.len(), 1, "la entrada caducada no se conserva");
+        assert_eq!(nombres[0].name, "one.one.one.one");
+    }
+
+    #[test]
+    fn set_traffic_group_persiste_la_preferencia() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.db");
+        let mut repo = Repo::init(&db).unwrap();
+        let mut app = app_con_config(&dir);
+
+        aplicar_accion(
+            Action::SetTrafficGroup(crate::config::TrafficGroup::App),
+            &mut app,
+            &mut repo,
+        );
+        assert_eq!(
+            app.config.ui.traffic_group,
+            crate::config::TrafficGroup::App
+        );
+        let guardada = Config::load(Some(&app.config_path)).expect("recargar configuración");
+        assert_eq!(guardada.ui.traffic_group, crate::config::TrafficGroup::App);
+    }
+
+    #[tokio::test]
+    async fn pedir_quien_lo_usa_rellena_el_panel_con_la_respuesta() {
+        use crate::events::TrafficCommand;
+        use crate::rankings::{DeviceShare, Dimension, RankRow, Window};
+        use crate::traffic::RankingView;
+
+        let (tx, mut rx) = crate::events::traffic_command_channel();
+        let mut app = app_prueba();
+        app.traffic_command_tx = Some(tx);
+        app.traffic_group = Dimension::App;
+        app.tab = crate::tui::app::Tab::Trafico;
+        app.traffic.rankings = vec![RankingView {
+            dimension: Dimension::App,
+            window: Window::Sixty,
+            rows: vec![RankRow {
+                key: "youtube".to_string(),
+                label: "YouTube".to_string(),
+                subtitle: None,
+                device_id: None,
+                bytes_down: 900,
+                bytes_up: 10,
+                devices: 1,
+                connections: 2,
+                series_60s: [0; 60],
+            }],
+        }];
+        app.open_who_uses().expect("petición abierta");
+        let respondedor = tokio::spawn(async move {
+            if let Some(TrafficCommand::WhoUses { reply, .. }) = rx.recv().await {
+                let _ = reply.send(vec![DeviceShare {
+                    device_id: 1,
+                    label: "laptop-juan".to_string(),
+                    bytes: 900,
+                    pct: 90.0,
+                }]);
+            }
+        });
+        pedir_quien_lo_usa(
+            &mut app,
+            Dimension::App,
+            "youtube".to_string(),
+            "YouTube".to_string(),
+            Window::Sixty,
+        )
+        .await;
+        respondedor.await.expect("respondedor");
+        let panel = app.traffic.who_uses.as_ref().expect("panel");
+        assert!(!panel.pending);
+        assert_eq!(panel.rows.len(), 1);
+        assert_eq!(panel.rows[0].label, "laptop-juan");
+        assert_eq!(panel.rows[0].pct, 90.0);
+    }
+
+    #[tokio::test]
+    async fn pedir_quien_lo_usa_cierra_el_panel_si_no_hay_respuesta() {
+        use crate::rankings::{Dimension, Window};
+
+        let (tx, mut rx) = crate::events::traffic_command_channel();
+        let mut app = app_prueba();
+        app.traffic_command_tx = Some(tx);
+        app.traffic_group = Dimension::App;
+        app.traffic.who_uses = Some(crate::tui::traffic_state::WhoUsesState {
+            dimension: Dimension::App,
+            key: "youtube".to_string(),
+            label: "YouTube".to_string(),
+            window: Window::Sixty,
+            rows: Vec::new(),
+            selected: 0,
+            pending: true,
+        });
+        pedir_quien_lo_usa(
+            &mut app,
+            Dimension::App,
+            "youtube".to_string(),
+            "YouTube".to_string(),
+            Window::Sixty,
+        )
+        .await;
+        assert!(!app.who_uses_open(), "sin respuesta se cierra el panel");
+        assert!(app
+            .notifier
+            .current()
+            .expect("aviso de timeout")
+            .message
+            .contains("200 ms"));
+        // El receptor sigue vivo: la orden llegó pero nadie respondió.
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]
